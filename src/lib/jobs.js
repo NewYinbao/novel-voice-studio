@@ -93,6 +93,12 @@ export class JobManager {
     return job;
   }
 
+  findActive(predicate = () => true) {
+    return [...this.#jobs.values()].find((job) => (
+      ['queued', 'running'].includes(job.state) && predicate(job)
+    )) || null;
+  }
+
   list() {
     return [...this.#jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100);
   }

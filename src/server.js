@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -20,7 +21,9 @@ import {
   runCodexSession, runOllamaSession
 } from './lib/script-engine.js';
 import {
-  appendCodexTurn, COLLABORATION_PROVIDERS, createCodexSession, findCodexSession,
+  beginCodexSessionRun, COLLABORATION_PROVIDERS,
+  completeCodexSessionRun, createCodexSession, createCodexSessionId, createPendingCodexSession,
+  failCodexSessionRun, findCodexSession, interruptCodexSessionRun, markCodexSessionRunning,
   normalizeScriptSessionProvider, publicCodexSession, publicCodexSessions,
   saveCodexSession, scriptSessionProvider
 } from './lib/codex-sessions.js';
@@ -164,20 +167,16 @@ function codexChapterVersion(chapter) {
   });
 }
 
-function assertCodexChapterUnchanged(chapter, expectedVersion) {
-  if (codexChapterVersion(chapter) === expectedVersion) return;
-  throw Object.assign(new Error('Codex 处理期间本章剧本已被修改。为保护最新手工稿，本轮结果没有覆盖项目；请确认当前内容后重新发送。'), {
-    statusCode: 409,
-    code: 'CODEX_CHAPTER_CHANGED'
-  });
+function codexChapterHash(chapter) {
+  return `sha256:${crypto.createHash('sha256').update(codexChapterVersion(chapter)).digest('hex')}`;
 }
 
-function codexMode(value) {
-  return ['faithful', 'polished', 'drama'].includes(value) ? value : 'faithful';
-}
-
-function codexModel(value) {
-  return normalizeCodexModel(value);
+function strictScriptMode(value, fallback = 'faithful') {
+  const selected = value === undefined ? fallback : value;
+  if (typeof selected !== 'string' || !['faithful', 'polished', 'drama'].includes(selected)) {
+    throw Object.assign(new Error('剧本模式无效。'), { statusCode: 400, code: 'SCRIPT_MODE_INVALID' });
+  }
+  return selected;
 }
 
 function collaborationProvider(value, fallback = 'codex') {
@@ -268,12 +267,8 @@ async function assertNoCodexAuthOptions(req) {
 }
 
 function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES, provider = 'codex') {
-  const code = String(error?.code || 'CODEX_REQUEST_FAILED').toUpperCase();
+  const requestedCode = String(error?.code || 'CODEX_REQUEST_FAILED').toUpperCase();
   const safeTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
-  const statusCode = error?.statusCode
-    || (code.startsWith('CODEX_TIMEOUT') || code === 'OLLAMA_TIMEOUT'
-      ? 504
-      : ['CODEX_UNAVAILABLE', 'OLLAMA_UNAVAILABLE'].includes(code) ? 503 : 502);
   const messages = {
     CODEX_AUTH_REQUIRED: 'Codex CLI 尚未登录，请先完成本机登录。',
     CODEX_CANCELLED: 'Codex 请求已因服务关闭而取消。',
@@ -287,9 +282,25 @@ function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTE
     OLLAMA_UNAVAILABLE: '无法连接本机 Ollama 服务，请确认 Ollama 已启动且模型可用。',
     SCRIPT_SCHEMA_INVALID: `${provider === 'ollama' ? 'Ollama' : 'Codex'} 返回的剧本结构未通过校验，当前章节未被覆盖。`
   };
+  const safeCodes = new Set([
+    ...Object.keys(messages),
+    'CODEX_FAILED', 'CODEX_INPUT_INVALID', 'CODEX_JSONL_INVALID',
+    'CODEX_OUTPUT_TOO_LARGE', 'CODEX_PROGRESS_UNAVAILABLE', 'CODEX_RESPONSE_EMPTY',
+    'CODEX_RESPONSE_MISSING', 'CODEX_SESSION_MISSING', 'CODEX_STDIN_FAILED',
+    'CODEX_THREAD_MISSING', 'CODEX_TURN_FAILED', 'SCRIPT_SESSION_VERSION_LIMIT'
+  ]);
+  const code = safeCodes.has(requestedCode) ? requestedCode : 'CODEX_REQUEST_FAILED';
+  const statusCode = code === 'CODEX_REQUEST_FAILED'
+    ? 502
+    : error?.statusCode
+      || (code.startsWith('CODEX_TIMEOUT') || code === 'OLLAMA_TIMEOUT'
+        ? 504
+        : ['CODEX_UNAVAILABLE', 'OLLAMA_UNAVAILABLE', 'CODEX_PROGRESS_UNAVAILABLE'].includes(code)
+          ? 503
+          : 502);
   return Object.assign(new Error(messages[code] || 'Codex 本轮处理失败，请检查状态后重试。'), {
     statusCode,
-    code: /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'CODEX_REQUEST_FAILED'
+    code
   });
 }
 
@@ -303,8 +314,9 @@ function codexAsyncRequested(body) {
   return body?.stream === true;
 }
 
-function codexAccepted(progress) {
+function codexAccepted(progress, session = null) {
   return {
+    sessionId: session?.id || progress.sessionId || null,
     progressId: progress.progressId,
     provider: progress.provider,
     detailLevel: progress.detailLevel,
@@ -312,7 +324,8 @@ function codexAccepted(progress) {
     reasoningEffort: progress.reasoningEffort,
     timeoutMinutes: progress.timeoutMinutes,
     state: progress.state,
-    eventsUrl: progress.eventsUrl
+    eventsUrl: progress.eventsUrl,
+    ...(session ? { session: publicCodexSession(session) } : {})
   };
 }
 
@@ -325,9 +338,13 @@ function assertCodexRunActive(signal) {
 }
 
 function trackCodexOperation(progressManager, progress, scope, operation) {
-  const task = Promise.resolve().then(operation);
-  progressManager.track(progress.progressId, scope.projectId, scope.chapterId, task);
-  return task;
+  return progressManager.start(
+    progress.progressId,
+    scope.projectId,
+    scope.chapterId,
+    operation,
+    scope.sessionId
+  );
 }
 
 function runCodexInBackground(progressManager, progress, scope, operation) {
@@ -373,6 +390,144 @@ function publishCodexRunnerProgress(progressManager, progressId, event, redactio
     return;
   }
   progressManager.publish(progressId, { type: 'activity', phase: 'activity', category });
+}
+
+async function persistSessionRunFailure({ projectId, chapterId, sessionId, progressId, code }) {
+  try {
+    await mutateProject(projectId, (draft) => {
+      const chapter = findChapter(draft, chapterId);
+      const session = findCodexSession(chapter, sessionId);
+      failCodexSessionRun(session, { progressId, code });
+      saveCodexSession(chapter, session, { activate: false });
+    });
+  } catch (error) {
+    if (!['SCRIPT_SESSION_RUN_STALE', 'CODEX_SESSION_NOT_FOUND'].includes(error?.code)) throw error;
+  }
+}
+
+function executePersistedSessionRun({
+  projectId, chapterId, sessionId, progress, provider, model, reasoningEffort,
+  timeoutMinutes, timeoutMs, detailLevel, prompt, progressManager,
+  codexRunner, ollamaRunner, codexSettingsResolver
+}) {
+  const progressId = progress.progressId;
+  const signal = progressManager.signal(progressId, projectId, chapterId, sessionId);
+  const lockKey = `${projectId}:${chapterId}:${sessionId}`;
+  return withCodexSessionLock(lockKey, async () => {
+    try {
+      assertCodexRunActive(signal);
+      const project = await mutateProject(projectId, (draft) => {
+        const chapter = findChapter(draft, chapterId);
+        const session = findCodexSession(chapter, sessionId);
+        markCodexSessionRunning(session, progressId);
+        saveCodexSession(chapter, session, { activate: false });
+        return draft;
+      });
+      progressManager.publish(progressId, { type: 'starting', phase: 'preparing' });
+      assertCodexRunActive(signal);
+      const chapter = findChapter(project, chapterId);
+      const session = findCodexSession(chapter, sessionId);
+      const baselineChapter = sessionRunnerChapter(chapter, session);
+      const storedSettings = await getSettings();
+      const settings = provider === 'codex'
+        ? await codexSettingsResolver(storedSettings)
+        : storedSettings;
+      const redactionContext = detailLevel === 'summary'
+        ? createCodexRedactionContext(codexActivitySensitiveTexts(baselineChapter, prompt, project))
+        : undefined;
+      assertCodexRunActive(signal);
+      const runner = provider === 'codex' ? codexRunner : ollamaRunner;
+      const resumeThreadId = provider === 'codex' ? session.codexThreadId || '' : '';
+      const turn = await runner({
+        chapter: baselineChapter,
+        project,
+        settings,
+        mode: session.mode,
+        model,
+        provider,
+        sessionId: resumeThreadId,
+        prompt,
+        baselineCurrentScript: Boolean(
+          resumeThreadId
+          || Number(session.turnCount) > 0
+          || baselineChapter.scenes?.length
+        ),
+        detailLevel,
+        reasoningEffort,
+        timeoutMinutes,
+        timeoutMs,
+        signal,
+        onProgress: (event) => publishCodexRunnerProgress(
+          progressManager, progressId, event, redactionContext
+        )
+      });
+      assertCodexRunActive(signal);
+      assertUsableScript(turn.script, baselineChapter, 502);
+      if (provider === 'codex' && !resumeThreadId && !turn.threadId) {
+        throw Object.assign(new Error('Codex 没有返回可续接的 Session ID。'), {
+          statusCode: 502, code: 'CODEX_THREAD_MISSING'
+        });
+      }
+      progressManager.publish(progressId, { type: 'stage', phase: 'saving' });
+      return await mutateProject(projectId, (draft) => {
+        assertCodexRunActive(signal);
+        const targetChapter = findChapter(draft, chapterId);
+        const targetSession = findCodexSession(targetChapter, sessionId);
+        const internalSnapshot = snapshotModelResult(draft, targetChapter, turn.script);
+        const targetWasActive = targetChapter.activeCodexSessionId === targetSession.id;
+        const baselineChapterHash = targetSession.activeRun?.baselineChapterHash || null;
+        const appliedToLive = Boolean(
+          targetWasActive
+          && baselineChapterHash
+          && codexChapterHash(targetChapter) === baselineChapterHash
+        );
+        if (targetWasActive && !appliedToLive) {
+          try {
+            const liveBackup = createCodexSession({
+              provider: 'import',
+              source: 'import',
+              title: '运行期间手工稿自动备份',
+              prompt: '后台结果完成前保存的当前制作台剧本',
+              script: chapterSessionSnapshot(draft, targetChapter)
+            });
+            saveCodexSession(targetChapter, liveBackup);
+          } catch (error) {
+            if (error?.code !== 'SCRIPT_SESSION_VERSION_LIMIT') throw error;
+            // The live chapter remains canonical and will be auto-backed up before
+            // the next switch; clearing the pointer avoids claiming it matches the
+            // completed model snapshot.
+            targetChapter.activeCodexSessionId = null;
+          }
+        }
+        completeCodexSessionRun(targetSession, {
+          progressId,
+          threadId: provider === 'codex' ? turn.threadId || resumeThreadId : '',
+          provider,
+          model,
+          reasoningEffort,
+          timeoutMinutes,
+          script: internalSnapshot,
+          usage: turn.usage
+        });
+        saveCodexSession(targetChapter, targetSession, { activate: false });
+        if (appliedToLive) applyScript(draft, targetChapter, internalSnapshot);
+        pruneUnusedRoles(draft);
+        if (appliedToLive) draft.status = 'scripted';
+        return {
+          project: draft,
+          session: publicCodexSession(targetSession),
+          appliedToLive
+        };
+      });
+    } catch (error) {
+      if (!(signal.aborted && progressManager.closed)) {
+        await persistSessionRunFailure({
+          projectId, chapterId, sessionId, progressId, code: error?.code
+        }).catch(() => {});
+      }
+      throw error;
+    }
+  });
 }
 
 function assertUsableScript(script, chapter, statusCode = 422) {
@@ -436,11 +591,50 @@ function chapterSessionSnapshot(project, chapter) {
   return snapshot;
 }
 
+function sessionRunnerChapter(chapter, session) {
+  if (!session?.scriptSnapshot?.scenes) {
+    throw Object.assign(new Error('这个 Session 没有可用的剧本基线。'), {
+      statusCode: 409, code: 'CODEX_SESSION_VERSION_UNAVAILABLE'
+    });
+  }
+  const snapshot = structuredClone(session.scriptSnapshot);
+  return {
+    ...structuredClone(chapter),
+    chapterTitle: snapshot.chapterTitle || chapter.title,
+    roles: snapshot.roles || [],
+    scenes: snapshot.scenes || [],
+    scriptWarnings: snapshot.warnings || []
+  };
+}
+
+function snapshotModelResult(project, chapter, script) {
+  const staging = {
+    ...structuredClone(chapter),
+    scenes: [],
+    scriptWarnings: []
+  };
+  applyScript(project, staging, script);
+  return chapterSessionSnapshot(project, staging);
+}
+
 function captureActiveScriptVersion(project, chapter) {
   const active = (chapter.codexSessions || [])
     .find((session) => session.id === chapter.activeCodexSessionId);
   if (active) {
-    const captured = { ...active, scriptSnapshot: chapterSessionSnapshot(project, chapter) };
+    const liveSnapshot = chapterSessionSnapshot(project, chapter);
+    if (active.activeRun || ['pending', 'running'].includes(active.status)) {
+      if (JSON.stringify(active.scriptSnapshot) === JSON.stringify(liveSnapshot)) return active;
+      const manualBackup = createCodexSession({
+        provider: 'import',
+        source: 'import',
+        title: '运行期间手工稿自动备份',
+        prompt: '后台协作运行期间保存的当前制作台剧本',
+        script: liveSnapshot
+      });
+      saveCodexSession(chapter, manualBackup);
+      return manualBackup;
+    }
+    const captured = { ...active, scriptSnapshot: liveSnapshot };
     saveCodexSession(chapter, captured);
     return captured;
   }
@@ -492,6 +686,12 @@ function applyScriptVersion(project, chapter, script, {
 function pruneUnusedRoles(project) {
   const used = new Set(project.chapters.flatMap((chapter) => (chapter.scenes || [])
     .flatMap((scene) => (scene.lines || []).map((line) => line.speakerId))));
+  for (const chapter of project.chapters) for (const session of chapter.codexSessions || []) {
+    for (const role of session.scriptSnapshot?.roles || []) if (role.id) used.add(role.id);
+    for (const scene of session.scriptSnapshot?.scenes || []) {
+      for (const line of scene.lines || []) if (line.speakerId) used.add(line.speakerId);
+    }
+  }
   project.characters = project.characters.filter((role) => role.isNarrator || role.voiceId || used.has(role.id));
 }
 
@@ -506,6 +706,33 @@ function publicProject(project) {
         : chapter.codexSessions
     }))
   };
+}
+
+export async function recoverInterruptedCodexSessions(progressManager) {
+  const summaries = await listProjects();
+  for (const summary of summaries) {
+    const stored = await getProject(summary.id);
+    const hasInterrupted = stored.chapters.some((chapter) => (
+      (chapter.codexSessions || []).some((session) => {
+        if (!session?.activeRun && !['pending', 'running'].includes(session?.status)) return false;
+        try {
+          const progress = progressManager.latest(stored.id, chapter.id, session.id);
+          return !progress || progress.terminal;
+        } catch {
+          return true;
+        }
+      })
+    ));
+    if (!hasInterrupted) continue;
+    await mutateProject(stored.id, (draft) => {
+      for (const chapter of draft.chapters) for (const session of chapter.codexSessions || []) {
+        if (!session?.activeRun && !['pending', 'running'].includes(session?.status)) continue;
+        let progress = null;
+        try { progress = progressManager.latest(draft.id, chapter.id, session.id); } catch { /* invalid legacy run */ }
+        if (!progress || progress.terminal) interruptCodexSessionRun(session);
+      }
+    });
+  }
 }
 
 async function getBootstrap() {
@@ -540,8 +767,11 @@ async function handleApi(req, res, url, {
   codexProgressManager: progressManager,
   systemProfileResolver = getSystemProfile,
   withVoiceMutationLock,
-  voiceMutationHook = async () => {}
+  voiceMutationHook = async () => {},
+  sessionRecoveryPromise = Promise.resolve()
 } = {}) {
+  const sessionRecoveryError = await sessionRecoveryPromise;
+  if (sessionRecoveryError) throw sessionRecoveryError;
   const { pathname } = url;
   const method = req.method;
   if (method !== 'GET' && method !== 'HEAD') assertLocalOrigin(req);
@@ -583,7 +813,48 @@ async function handleApi(req, res, url, {
     }
     throw Object.assign(new Error('请求方法不支持'), { statusCode: 405, code: 'METHOD_NOT_ALLOWED' });
   }
-  let params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-progress/:progressId');
+  let params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/codex-progress/:progressId');
+  if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
+    const project = await getProject(params.projectId);
+    const chapter = findChapter(project, params.chapterId);
+    findCodexSession(chapter, params.sessionId);
+    return progressManager.subscribe(req, res, {
+      ...params,
+      lastEventId: req.headers['last-event-id']
+    });
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/codex-progress');
+  if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
+    const project = await getProject(params.projectId);
+    const chapter = findChapter(project, params.chapterId);
+    findCodexSession(chapter, params.sessionId);
+    return json(res, 200, {
+      progress: progressManager.latest(params.projectId, params.chapterId, params.sessionId)
+    });
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/script');
+  if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
+    const project = await getProject(params.projectId);
+    const chapter = findChapter(project, params.chapterId);
+    const session = findCodexSession(chapter, params.sessionId);
+    if (!session.scriptSnapshot?.scenes) {
+      throw Object.assign(new Error('这个 Session 没有可恢复的剧本快照。'), {
+        statusCode: 409, code: 'CODEX_SESSION_VERSION_UNAVAILABLE'
+      });
+    }
+    return json(res, 200, {
+      session: publicCodexSession(session),
+      isActive: chapter.activeCodexSessionId === session.id,
+      script: structuredClone(session.scriptSnapshot)
+    });
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-progress/:progressId');
   if (params && method === 'GET') {
     assertCodexWorkspaceRequest(req);
     const project = await getProject(params.projectId);
@@ -710,15 +981,69 @@ async function handleApi(req, res, url, {
 
   params = routeMatch(pathname, '/api/projects/:projectId/script');
   if (params && method === 'POST') {
+    assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    const batchKeys = new Set([
+      'chapterIds', 'provider', 'mode', 'model', 'reasoningEffort', 'timeoutMinutes'
+    ]);
+    if (
+      !body
+      || typeof body !== 'object'
+      || Array.isArray(body)
+      || Object.keys(body).some((key) => !batchKeys.has(key))
+    ) {
+      throw Object.assign(new Error('批量剧本任务包含不支持的请求字段。'), {
+        statusCode: 400, code: 'SCRIPT_JOB_OPTION_INVALID'
+      });
+    }
     const settings = await getSettings();
     const project = await getProject(params.projectId);
-    const chapterIds = Array.isArray(body.chapterIds) && body.chapterIds.length
-      ? new Set(body.chapterIds)
-      : new Set(project.chapters.map((chapter) => chapter.id));
+    if (body.chapterIds !== undefined && (
+      !Array.isArray(body.chapterIds)
+      || !body.chapterIds.length
+      || body.chapterIds.length > 500
+      || new Set(body.chapterIds).size !== body.chapterIds.length
+    )) {
+      throw Object.assign(new Error('chapterIds 必须是非空且不重复的章节 ID 数组。'), {
+        statusCode: 400, code: 'SCRIPT_CHAPTER_INVALID'
+      });
+    }
+    const chapterIds = new Set(body.chapterIds || project.chapters.map((chapter) => chapter.id));
     let defaultProvider = 'rules';
     try { defaultProvider = scriptJobProvider(settings.scriptProvider, 'rules'); } catch { /* legacy setting */ }
     const provider = scriptJobProvider(body.provider, defaultProvider);
+    const mode = strictScriptMode(body.mode);
+    const hasModel = Object.hasOwn(body, 'model');
+    const hasReasoning = Object.hasOwn(body, 'reasoningEffort');
+    const hasTimeout = Object.hasOwn(body, 'timeoutMinutes');
+    if (provider === 'rules' && (hasModel || hasReasoning || hasTimeout)) {
+      throw Object.assign(new Error('规则生成不接受模型、推理强度或超时选项。'), {
+        statusCode: 400, code: 'SCRIPT_JOB_OPTION_INVALID'
+      });
+    }
+    if (provider === 'ollama' && hasReasoning) {
+      throw Object.assign(new Error('Ollama 不接受 Codex 推理强度。'), {
+        statusCode: 400, code: 'SCRIPT_JOB_OPTION_INVALID'
+      });
+    }
+    if (hasModel && (typeof body.model !== 'string' || !body.model.trim())) {
+      throw Object.assign(new Error('批量剧本任务的 model 必须是非空字符串。'), {
+        statusCode: 400, code: provider === 'ollama' ? 'OLLAMA_MODEL_INVALID' : 'CODEX_MODEL_INVALID'
+      });
+    }
+    if (hasReasoning && (typeof body.reasoningEffort !== 'string' || !body.reasoningEffort.trim())) {
+      throw Object.assign(new Error('批量 Codex 推理强度无效。'), {
+        statusCode: 400, code: 'CODEX_REASONING_EFFORT_INVALID'
+      });
+    }
+    const model = provider === 'rules' ? '' : collaborationModel(provider, body, settings);
+    const reasoningEffort = provider === 'codex'
+      ? normalizeCodexReasoningEffort(body.reasoningEffort)
+      : null;
+    const timeoutMinutes = provider === 'rules'
+      ? null
+      : normalizeCodexTimeoutMinutes(body.timeoutMinutes);
+    const timeoutMs = timeoutMinutes === null ? null : codexTimeoutMinutesToMs(timeoutMinutes);
     const knownChapterIds = new Set(project.chapters.map((chapter) => chapter.id));
     if (![...chapterIds].every((chapterId) => typeof chapterId === 'string' && knownChapterIds.has(chapterId))) {
       throw Object.assign(new Error('chapterIds 包含不属于当前项目的章节。'), {
@@ -726,15 +1051,14 @@ async function handleApi(req, res, url, {
       });
     }
     const targetIds = project.chapters.filter((chapter) => chapterIds.has(chapter.id)).map((chapter) => chapter.id);
-    if (!targetIds.length) {
-      throw Object.assign(new Error('没有可处理的章节。'), {
+    if (!targetIds.length || targetIds.length > 500) {
+      throw Object.assign(new Error('批量剧本任务必须包含 1 到 500 个章节。'), {
         statusCode: 400, code: 'SCRIPT_CHAPTER_INVALID'
       });
     }
     const targetIdSet = new Set(targetIds);
-    const overlappingJob = jobs.list().find((job) => (
+    const overlappingJob = jobs.findActive((job) => (
       job.type === 'script'
-      && ['queued', 'running'].includes(job.state)
       && job.payload?.projectId === project.id
       && Array.isArray(job.payload?.chapterIds)
       && job.payload.chapterIds.some((chapterId) => targetIdSet.has(chapterId))
@@ -744,76 +1068,174 @@ async function handleApi(req, res, url, {
         statusCode: 409, code: 'SCRIPT_JOB_ACTIVE'
       });
     }
-    for (const chapterId of chapterIds) {
-      const active = progressManager.latest(project.id, chapterId);
-      if (active && !active.terminal) {
-        throw Object.assign(new Error('所选章节正在进行剧本协作，请完成后再覆盖生成。'), {
-          statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
-        });
-      }
-    }
-    const job = jobs.create('script', { projectId: project.id, chapterIds: [...chapterIds], provider }, async (update) => {
+    const jobPayload = {
+      projectId: project.id,
+      chapterIds: targetIds,
+      provider,
+      mode,
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(timeoutMinutes ? { timeoutMinutes } : {})
+    };
+    const job = jobs.create('script', jobPayload, async (update) => {
       const versions = [];
+      const chapterResults = [];
       for (let index = 0; index < targetIds.length; index += 1) {
+        if (progressManager.closed) break;
         const chapterId = targetIds[index];
-        await withCodexSessionLock(`${project.id}:${chapterId}`, async () => {
+        let chapterSessionId = null;
+        update((index / targetIds.length) * 100, `正在处理第 ${index + 1}/${targetIds.length} 章`, {
+          currentChapterId: chapterId,
+          currentSessionId: null,
+          session: null,
+          chapterResults: structuredClone(chapterResults)
+        });
+        try {
           const current = await getProject(project.id);
           const chapter = findChapter(current, chapterId);
-          const chapterVersion = codexChapterVersion(chapter);
-          update((index / targetIds.length) * 100, `正在剧本化：${chapter.title}`);
-          const mode = codexMode(body.mode);
-          let turn;
-          if (provider === 'codex') {
-            const runtimeSettings = await codexSettingsResolver(settings);
-            turn = await codexRunner({
-              chapter, project: current, settings: runtimeSettings, mode,
-              model: normalizeCodexModel(undefined),
-              reasoningEffort: normalizeCodexReasoningEffort(undefined),
-              timeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
-              timeoutMs: codexTimeoutMinutesToMs(DEFAULT_CODEX_TIMEOUT_MINUTES)
-            });
-            if (!turn.threadId) {
-              throw Object.assign(new Error('Codex 没有返回可续接的 Session ID。'), {
-                code: 'CODEX_THREAD_MISSING'
+          let result;
+          if (provider === 'rules') {
+            const script = await convertChapter(chapter, { provider, settings, mode });
+            result = await mutateProject(project.id, (draft) => {
+              const targetChapter = findChapter(draft, chapterId);
+              const session = applyScriptVersion(draft, targetChapter, script, {
+                provider: 'rules', title: '规则生成版本', mode,
+                prompt: 'rules 批量剧本生成'
               });
-            }
-          } else if (provider === 'ollama') {
-            turn = await ollamaRunner({
-              chapter, project: current, settings, mode,
-              model: normalizeOllamaModel(settings.ollamaModel),
-              timeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
-              timeoutMs: codexTimeoutMinutesToMs(DEFAULT_CODEX_TIMEOUT_MINUTES)
+              pruneUnusedRoles(draft);
+              draft.status = 'scripted';
+              return { session: publicCodexSession(session), appliedToLive: true };
             });
           } else {
-            turn = { script: await convertChapter(chapter, { provider, settings, mode }) };
-          }
-          const script = turn.script;
-          const version = await mutateProject(project.id, (draft) => {
-            const targetChapter = findChapter(draft, chapterId);
-            assertCodexChapterUnchanged(targetChapter, chapterVersion);
-            const session = applyScriptVersion(draft, targetChapter, script, {
+            const sessionId = createCodexSessionId();
+            chapterSessionId = sessionId;
+            const detailLevel = 'basic';
+            const progress = progressManager.create({
+              projectId: project.id,
+              chapterId,
+              sessionId,
               provider,
-              title: provider === 'rules' ? '规则生成版本' : `${provider === 'ollama' ? 'Ollama' : 'Codex'} 批量生成版本`,
-              threadId: provider === 'codex' ? turn.threadId : '',
-               model: provider === 'ollama' ? normalizeOllamaModel(settings.ollamaModel) : undefined,
-              reasoningEffort: provider === 'codex' ? 'medium' : null,
-              timeoutMinutes: COLLABORATION_PROVIDERS.includes(provider) ? DEFAULT_CODEX_TIMEOUT_MINUTES : null,
-              mode,
-              prompt: `${provider} 批量剧本生成`,
-              usage: turn.usage
+              detailLevel,
+              model,
+              reasoningEffort,
+              timeoutMinutes
             });
-            return { chapterId, session: publicCodexSession(session) };
+            try {
+              const pendingSession = await mutateProject(project.id, (draft) => {
+                const targetChapter = findChapter(draft, chapterId);
+                captureActiveScriptVersion(draft, targetChapter);
+                const session = createPendingCodexSession({
+                  sessionId,
+                  progressId: progress.progressId,
+                  provider,
+                  source: provider,
+                  title: provider === 'codex' ? 'Codex 批量生成版本' : 'Ollama 批量生成版本',
+                  model,
+                  reasoningEffort,
+                  timeoutMinutes,
+                  mode,
+                  prompt: `${provider} 批量剧本生成`,
+                  script: chapterSessionSnapshot(draft, targetChapter),
+                  baselineChapterHash: codexChapterHash(targetChapter)
+                });
+                saveCodexSession(targetChapter, session);
+                return publicCodexSession(session);
+              });
+              update((index / targetIds.length) * 100, `正在处理第 ${index + 1}/${targetIds.length} 章`, {
+                currentChapterId: chapterId,
+                currentSessionId: sessionId,
+                session: pendingSession,
+                chapterResults: structuredClone(chapterResults)
+              });
+            } catch (error) {
+              progressManager.discard(progress.progressId);
+              throw error;
+            }
+            const scope = { projectId: project.id, chapterId, sessionId };
+            const operation = () => executePersistedSessionRun({
+              ...scope,
+              progress,
+              provider,
+              model,
+              reasoningEffort,
+              timeoutMinutes,
+              timeoutMs,
+              detailLevel,
+              prompt: `${provider} 批量剧本生成`,
+              progressManager,
+              codexRunner,
+              ollamaRunner,
+              codexSettingsResolver
+            });
+            try {
+              result = await trackCodexOperation(progressManager, progress, scope, operation);
+              progressManager.complete(progress.progressId);
+            } catch (error) {
+              progressManager.fail(progress.progressId, error?.code);
+              throw error;
+            }
+          }
+          const completed = {
+            chapterId,
+            state: 'completed',
+            session: result.session,
+            appliedToLive: result.appliedToLive
+          };
+          versions.push({ chapterId, session: result.session });
+          chapterResults.push(completed);
+        } catch (error) {
+          if (progressManager.closed) break;
+          const safe = provider === 'rules'
+            ? {
+                code: ['SCRIPT_SCHEMA_INVALID', 'SCRIPT_SESSION_VERSION_LIMIT'].includes(error?.code)
+                  ? error.code
+                  : 'SCRIPT_CHAPTER_FAILED',
+                message: '本章规则剧本生成失败，原稿已保留。'
+              }
+            : codexFailureStatus(error, timeoutMinutes, provider);
+          let failedSession = null;
+          if (chapterSessionId) {
+            try {
+              const failedProject = await getProject(project.id);
+              failedSession = publicCodexSession(findCodexSession(
+                findChapter(failedProject, chapterId), chapterSessionId
+              ));
+            } catch { /* persistence failed before a Session existed */ }
+          }
+          chapterResults.push({
+            chapterId,
+            state: 'failed',
+            code: safe.code,
+            message: safe.message,
+            ...(failedSession ? { session: failedSession } : {})
           });
-          versions.push(version);
+        }
+        update(((index + 1) / targetIds.length) * 100, `已处理 ${index + 1}/${targetIds.length} 章`, {
+          currentChapterId: chapterId,
+          currentSessionId: chapterSessionId,
+          session: chapterResults.at(-1)?.session || null,
+          chapterResults: structuredClone(chapterResults)
         });
       }
-      const summary = await mutateProject(project.id, (draft) => {
-        pruneUnusedRoles(draft);
-        draft.status = 'scripted';
-        return summarizeProject(draft);
-      });
-      return { project: summary, chapterCount: targetIds.length, provider, versions };
-    });
+      const summary = progressManager.closed
+        ? summarizeProject(await getProject(project.id))
+        : await mutateProject(project.id, (draft) => {
+            pruneUnusedRoles(draft);
+            if (chapterResults.some((item) => item.state === 'completed')) draft.status = 'scripted';
+            return summarizeProject(draft);
+          });
+      const successCount = chapterResults.filter((item) => item.state === 'completed').length;
+      return {
+        project: summary,
+        chapterCount: targetIds.length,
+        provider,
+        mode,
+        successCount,
+        failureCount: chapterResults.length - successCount,
+        chapters: chapterResults,
+        versions
+      };
+    }, { gpu: provider !== 'rules' });
     await mutateProject(project.id, (draft) => { draft.production.lastJobId = job.id; });
     return json(res, 202, job);
   }
@@ -821,7 +1243,7 @@ async function handleApi(req, res, url, {
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId');
   if (params && method === 'DELETE') {
     assertCodexWorkspaceRequest(req);
-    const latest = progressManager.latest(params.projectId, params.chapterId);
+    const latest = progressManager.latest(params.projectId, params.chapterId, params.sessionId);
     if (latest && !latest.terminal) {
       throw Object.assign(new Error('本章正在进行剧本协作，暂不能删除版本。'), {
         statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
@@ -830,6 +1252,11 @@ async function handleApi(req, res, url, {
     await mutateProject(params.projectId, (draft) => {
       const chapter = findChapter(draft, params.chapterId);
       const session = findCodexSession(chapter, params.sessionId);
+      if (session.activeRun || ['pending', 'running'].includes(session.status)) {
+        throw Object.assign(new Error('正在处理的 Session 不能删除。'), {
+          statusCode: 409, code: 'SCRIPT_SESSION_ACTIVE'
+        });
+      }
       if (chapter.activeCodexSessionId === session.id) {
         throw Object.assign(new Error('当前活动版本不能删除，请先激活其他版本。'), {
           statusCode: 409, code: 'SCRIPT_SESSION_ACTIVE_DELETE'
@@ -844,15 +1271,14 @@ async function handleApi(req, res, url, {
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/activate');
   if (params && method === 'POST') {
     assertCodexWorkspaceRequest(req);
-    const latest = progressManager.latest(params.projectId, params.chapterId);
-    if (latest && !latest.terminal) {
-      throw Object.assign(new Error('本章正在处理 Codex 请求，完成后才能切换版本。'), {
-        statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
-      });
-    }
     const result = await mutateProject(params.projectId, (draft) => {
       const chapter = findChapter(draft, params.chapterId);
       const targetSession = findCodexSession(chapter, params.sessionId);
+      if (targetSession.activeRun || ['pending', 'running'].includes(targetSession.status)) {
+        throw Object.assign(new Error('正在处理的 Session 不能激活。'), {
+          statusCode: 409, code: 'SCRIPT_SESSION_ACTIVE'
+        });
+      }
       if (chapter.activeCodexSessionId === targetSession.id) {
         return { project: draft, session: publicCodexSession(targetSession) };
       }
@@ -880,11 +1306,6 @@ async function handleApi(req, res, url, {
     const scopeProject = await getProject(params.projectId);
     const scopeChapter = findChapter(scopeProject, params.chapterId);
     const scopeSession = findCodexSession(scopeChapter, params.sessionId);
-    if (scopeChapter.activeCodexSessionId !== scopeSession.id) {
-      throw Object.assign(new Error('请先激活该剧本版本，再基于它继续协作。'), {
-        statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
-      });
-    }
     const sourceProvider = scriptSessionProvider(scopeSession);
     const provider = body.provider === undefined
       ? (COLLABORATION_PROVIDERS.includes(sourceProvider)
@@ -898,105 +1319,93 @@ async function handleApi(req, res, url, {
     const optionSettings = await getSettings();
     const model = collaborationModel(provider, body, optionSettings, scopeSession);
     const reasoningEffort = collaborationReasoningEffort(provider, body, scopeSession);
-    const canAppendExisting = provider === sourceProvider && (
-      provider === 'ollama' || (provider === 'codex' && Boolean(scopeSession.codexThreadId))
-    );
+    const continuesSession = provider === sourceProvider && COLLABORATION_PROVIDERS.includes(sourceProvider);
     let inheritedTimeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES;
-    try { inheritedTimeoutMinutes = normalizeCodexTimeoutMinutes(scopeSession.timeoutMinutes); } catch { /* legacy */ }
+    if (continuesSession) {
+      try { inheritedTimeoutMinutes = normalizeCodexTimeoutMinutes(scopeSession.timeoutMinutes); } catch { /* legacy */ }
+    }
     const timeoutMinutes = normalizeCodexTimeoutMinutes(
       body.timeoutMinutes === undefined || body.timeoutMinutes === null
         ? inheritedTimeoutMinutes
         : body.timeoutMinutes
     );
     const timeoutMs = codexTimeoutMinutesToMs(timeoutMinutes);
-    const progress = progressManager.create({
-      ...params, provider, detailLevel, model, reasoningEffort, timeoutMinutes
-    });
-    const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
-    const lockKey = `${params.projectId}:${params.chapterId}`;
-    const operation = () => withCodexSessionLock(lockKey, async () => {
-      assertCodexRunActive(signal);
-      progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
-      const storedSettings = await getSettings();
-      const settings = provider === 'codex'
-        ? await codexSettingsResolver(storedSettings)
-        : storedSettings;
-      const project = await getProject(params.projectId);
-      const chapter = findChapter(project, params.chapterId);
-      const session = findCodexSession(chapter, params.sessionId);
-      if (chapter.activeCodexSessionId !== session.id) {
-        throw Object.assign(new Error('剧本版本已切换，请先激活目标版本后重试。'), {
-          statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
+    if (continuesSession && (scopeSession.activeRun || ['pending', 'running'].includes(scopeSession.status))) {
+      const existing = progressManager.latest(params.projectId, params.chapterId, scopeSession.id);
+      if (existing && !existing.terminal) {
+        throw Object.assign(new Error('这个 Session 已有请求正在处理。'), {
+          statusCode: 409, code: 'SCRIPT_SESSION_ACTIVE'
         });
       }
-      const chapterVersion = codexChapterVersion(chapter);
-      const redactionContext = detailLevel === 'summary'
-        ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
-        : undefined;
-      assertCodexRunActive(signal);
-      const runner = provider === 'codex' ? codexRunner : ollamaRunner;
-      const resumeThreadId = canAppendExisting && provider === 'codex' ? session.codexThreadId : '';
-      const turn = await runner({
-        chapter, project, settings, mode: session.mode, model,
-        provider,
-        sessionId: resumeThreadId, prompt,
-        baselineCurrentScript: !resumeThreadId && Array.isArray(chapter.scenes) && chapter.scenes.length > 0,
-        detailLevel, reasoningEffort,
-        timeoutMinutes, timeoutMs,
-        signal,
-        onProgress: (event) => publishCodexRunnerProgress(
-          progressManager, progress.progressId, event, redactionContext
-        )
-      });
-      assertCodexRunActive(signal);
-      assertUsableScript(turn.script, chapter, 502);
-      if (provider === 'codex' && !resumeThreadId && !turn.threadId) {
-        throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
-          statusCode: 502, code: 'CODEX_THREAD_MISSING'
-        });
-      }
-      progressManager.publish(progress.progressId, { type: 'stage', phase: 'saving' });
-      return mutateProject(params.projectId, (draft) => {
-        assertCodexRunActive(signal);
-        const targetChapter = findChapter(draft, params.chapterId);
-        assertCodexChapterUnchanged(targetChapter, chapterVersion);
-        const targetSession = findCodexSession(targetChapter, params.sessionId);
-        if (targetChapter.activeCodexSessionId !== targetSession.id) {
-          throw Object.assign(new Error('剧本版本已切换，本轮结果未覆盖当前稿。'), {
-            statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
-          });
+      await mutateProject(params.projectId, (draft) => {
+        const chapter = findChapter(draft, params.chapterId);
+        const session = findCodexSession(chapter, scopeSession.id);
+        if (session.activeRun || ['pending', 'running'].includes(session.status)) {
+          interruptCodexSessionRun(session);
+          saveCodexSession(chapter, session, { activate: false });
         }
-        captureActiveScriptVersion(draft, targetChapter);
-        applyScript(draft, targetChapter, turn.script);
-        const nextSession = canAppendExisting
-          ? appendCodexTurn(targetSession, {
-            prompt, provider, model, reasoningEffort, timeoutMinutes,
-            script: chapterSessionSnapshot(draft, targetChapter), usage: turn.usage
-          })
-          : createCodexSession({
-            provider,
-            source: provider,
-            title: provider === 'codex' ? 'Codex 协作版本' : 'Ollama 协作版本',
-            threadId: provider === 'codex' ? turn.threadId : '',
-            model, reasoningEffort, timeoutMinutes, mode: targetSession.mode,
-            prompt, script: chapterSessionSnapshot(draft, targetChapter), usage: turn.usage
-          });
-        saveCodexSession(targetChapter, nextSession);
-        pruneUnusedRoles(draft);
-        draft.status = 'scripted';
-        return { project: draft, session: publicCodexSession(nextSession) };
       });
+    }
+    const runSessionId = continuesSession ? scopeSession.id : createCodexSessionId();
+    const progress = progressManager.create({
+      ...params, sessionId: runSessionId,
+      provider, detailLevel, model, reasoningEffort, timeoutMinutes
+    });
+    let pendingSession;
+    try {
+      pendingSession = await mutateProject(params.projectId, (draft) => {
+        const chapter = findChapter(draft, params.chapterId);
+        let sourceSession = findCodexSession(chapter, params.sessionId);
+        const sourceWasActive = chapter.activeCodexSessionId === sourceSession.id;
+        if (sourceWasActive) {
+          captureActiveScriptVersion(draft, chapter);
+          sourceSession = findCodexSession(chapter, params.sessionId);
+        }
+        if (continuesSession) {
+          beginCodexSessionRun(sourceSession, {
+            prompt, provider, model, reasoningEffort, timeoutMinutes,
+            progressId: progress.progressId,
+            baselineChapterHash: sourceWasActive ? codexChapterHash(chapter) : null
+          });
+          saveCodexSession(chapter, sourceSession, { activate: false });
+          return sourceSession;
+        }
+        const session = createPendingCodexSession({
+          sessionId: runSessionId,
+          progressId: progress.progressId,
+          provider,
+          source: provider,
+          title: provider === 'codex' ? 'Codex 协作版本' : 'Ollama 协作版本',
+          model,
+          reasoningEffort,
+          timeoutMinutes,
+          mode: sourceSession.mode,
+          prompt,
+          script: sourceSession.scriptSnapshot,
+          baselineChapterHash: sourceWasActive ? codexChapterHash(chapter) : null
+        });
+        saveCodexSession(chapter, session, { activate: sourceWasActive });
+        return session;
+      });
+    } catch (error) {
+      progressManager.discard(progress.progressId);
+      throw error;
+    }
+    const runScope = { ...params, sessionId: runSessionId };
+    const operation = () => executePersistedSessionRun({
+      ...runScope, progress, provider, model, reasoningEffort, timeoutMinutes, timeoutMs,
+      detailLevel, prompt, progressManager, codexRunner, ollamaRunner, codexSettingsResolver
     });
     if (codexAsyncRequested(body)) {
-      runCodexInBackground(progressManager, progress, params, operation);
-      return json(res, 202, codexAccepted(progress));
+      runCodexInBackground(progressManager, progress, runScope, operation);
+      return json(res, 202, codexAccepted(progress, pendingSession));
     }
     try {
-      const result = await trackCodexOperation(progressManager, progress, params, operation);
+      const result = await trackCodexOperation(progressManager, progress, runScope, operation);
       progressManager.complete(progress.progressId);
       return json(res, 200, {
         ...result, project: publicProject(result.project), progressId: progress.progressId,
-        provider, detailLevel, model, reasoningEffort, timeoutMinutes
+        sessionId: runSessionId, provider, detailLevel, model, reasoningEffort, timeoutMinutes
       });
     } catch (error) {
       const failure = codexFailureStatus(error, timeoutMinutes, provider);
@@ -1017,7 +1426,7 @@ async function handleApi(req, res, url, {
     assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const detailLevel = normalizeCodexDetailLevel(body.detailLevel);
-    const mode = codexMode(body.mode);
+    const mode = strictScriptMode(body.mode);
     const provider = collaborationProvider(body.provider, 'codex');
     const optionSettings = await getSettings();
     const model = collaborationModel(provider, body, optionSettings);
@@ -1027,70 +1436,51 @@ async function handleApi(req, res, url, {
     const prompt = codexPrompt(body.prompt);
     const scopeProject = await getProject(params.projectId);
     findChapter(scopeProject, params.chapterId);
+    const sessionId = createCodexSessionId();
     const progress = progressManager.create({
-      ...params, provider, detailLevel, model, reasoningEffort, timeoutMinutes
+      ...params, sessionId, provider, detailLevel, model, reasoningEffort, timeoutMinutes
     });
-    const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
-    const lockKey = `${params.projectId}:${params.chapterId}`;
-    const operation = () => withCodexSessionLock(lockKey, async () => {
-      assertCodexRunActive(signal);
-      progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
-      const storedSettings = await getSettings();
-      const settings = provider === 'codex'
-        ? await codexSettingsResolver(storedSettings)
-        : storedSettings;
-      const project = await getProject(params.projectId);
-      const chapter = findChapter(project, params.chapterId);
-      const chapterVersion = codexChapterVersion(chapter);
-      const redactionContext = detailLevel === 'summary'
-        ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
-        : undefined;
-      assertCodexRunActive(signal);
-      const runner = provider === 'codex' ? codexRunner : ollamaRunner;
-      const turn = await runner({
-        chapter, project, settings, mode, model, prompt,
-        provider,
-        baselineCurrentScript: Array.isArray(chapter.scenes) && chapter.scenes.length > 0,
-        detailLevel, reasoningEffort,
-        timeoutMinutes, timeoutMs,
-        signal,
-        onProgress: (event) => publishCodexRunnerProgress(
-          progressManager, progress.progressId, event, redactionContext
-        )
-      });
-      assertCodexRunActive(signal);
-      assertUsableScript(turn.script, chapter, 502);
-      if (provider === 'codex' && !turn.threadId) {
-        throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
-          statusCode: 502, code: 'CODEX_THREAD_MISSING'
-        });
-      }
-      progressManager.publish(progress.progressId, { type: 'stage', phase: 'saving' });
-      return mutateProject(params.projectId, (draft) => {
-        assertCodexRunActive(signal);
-        const targetChapter = findChapter(draft, params.chapterId);
-        assertCodexChapterUnchanged(targetChapter, chapterVersion);
-        const session = applyScriptVersion(draft, targetChapter, turn.script, {
+    let pendingSession;
+    try {
+      pendingSession = await mutateProject(params.projectId, (draft) => {
+        const chapter = findChapter(draft, params.chapterId);
+        captureActiveScriptVersion(draft, chapter);
+        const session = createPendingCodexSession({
+          sessionId,
+          progressId: progress.progressId,
           provider,
+          source: provider,
           title: provider === 'codex' ? 'Codex 协作版本' : 'Ollama 协作版本',
-          threadId: provider === 'codex' ? turn.threadId : '',
-          model, reasoningEffort, timeoutMinutes, mode, prompt, usage: turn.usage
+          model,
+          reasoningEffort,
+          timeoutMinutes,
+          mode,
+          prompt,
+          script: chapterSessionSnapshot(draft, chapter),
+          baselineChapterHash: codexChapterHash(chapter)
         });
-        pruneUnusedRoles(draft);
-        draft.status = 'scripted';
-        return { project: draft, session: publicCodexSession(session) };
+        saveCodexSession(chapter, session);
+        return session;
       });
+    } catch (error) {
+      progressManager.discard(progress.progressId);
+      throw error;
+    }
+    const runScope = { ...params, sessionId };
+    const operation = () => executePersistedSessionRun({
+      ...runScope, progress, provider, model, reasoningEffort, timeoutMinutes, timeoutMs,
+      detailLevel, prompt, progressManager, codexRunner, ollamaRunner, codexSettingsResolver
     });
     if (codexAsyncRequested(body)) {
-      runCodexInBackground(progressManager, progress, params, operation);
-      return json(res, 202, codexAccepted(progress));
+      runCodexInBackground(progressManager, progress, runScope, operation);
+      return json(res, 202, codexAccepted(progress, pendingSession));
     }
     try {
-      const result = await trackCodexOperation(progressManager, progress, params, operation);
+      const result = await trackCodexOperation(progressManager, progress, runScope, operation);
       progressManager.complete(progress.progressId);
       return json(res, 201, {
         ...result, project: publicProject(result.project), progressId: progress.progressId,
-        provider, detailLevel, model, reasoningEffort, timeoutMinutes
+        sessionId, provider, detailLevel, model, reasoningEffort, timeoutMinutes
       });
     } catch (error) {
       const failure = codexFailureStatus(error, timeoutMinutes, provider);
@@ -1118,12 +1508,6 @@ async function handleApi(req, res, url, {
         });
       }
     }
-    const active = progressManager.latest(params.projectId, params.chapterId);
-    if (active && !active.terminal) {
-      throw Object.assign(new Error('本章正在进行剧本协作，请完成后再导入覆盖。'), {
-        statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
-      });
-    }
     const project = await withCodexSessionLock(`${params.projectId}:${params.chapterId}`, () => (
       mutateProject(params.projectId, (draft) => {
         const chapter = findChapter(draft, params.chapterId);
@@ -1142,7 +1526,7 @@ async function handleApi(req, res, url, {
   if (params && method === 'PATCH') {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const project = await mutateProject(params.projectId, (draft) => {
-      const { line } = findLine(draft, params.lineId);
+      const { chapter, line } = findLine(draft, params.lineId);
       const textFields = ['spokenText', 'emotionNote'];
       const numberFields = ['intensity', 'pace', 'pauseAfterMs'];
       for (const field of textFields) if (field in body) line[field] = String(body[field]).slice(0, 5000);
@@ -1161,6 +1545,7 @@ async function handleApi(req, res, url, {
         line.needsReview = false;
       }
       line.render = { status: 'stale' };
+      captureActiveScriptVersion(draft, chapter);
     });
     return json(res, 200, publicProject(project));
   }
@@ -1356,6 +1741,16 @@ export function createServer(options = {}) {
     codexProgressManager: options.codexProgressManager || new CodexProgressManager(),
     withVoiceMutationLock: options.withVoiceMutationLock || withGlobalVoiceMutationLock
   };
+  const sessionRecovery = options.sessionRecoveryPromise || recoverInterruptedCodexSessions(
+    serverOptions.codexProgressManager
+  );
+  serverOptions.sessionRecoveryPromise = Promise.resolve(sessionRecovery).then(() => null, () => {
+    console.error('恢复中断的剧本 Session 失败。');
+    return Object.assign(new Error('剧本 Session 恢复尚未完成，请稍后重试。'), {
+      statusCode: 503,
+      code: 'SCRIPT_SESSION_RECOVERY_FAILED'
+    });
+  });
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');

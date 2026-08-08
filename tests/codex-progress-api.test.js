@@ -40,9 +40,12 @@ async function createProject(base, title = '流式进度测试') {
   }).then((response) => response.json());
 }
 
-async function waitForProgress(base, projectId, chapterId, expected) {
+async function waitForProgress(base, projectId, chapterId, expected, sessionId) {
+  const progressPath = sessionId
+    ? `/api/projects/${projectId}/chapters/${chapterId}/codex-sessions/${sessionId}/codex-progress`
+    : `/api/projects/${projectId}/chapters/${chapterId}/codex-progress`;
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const result = await fetch(`${base}/api/projects/${projectId}/chapters/${chapterId}/codex-progress`)
+    const result = await fetch(`${base}${progressPath}`)
       .then((response) => response.json());
     if (result.progress?.state === expected) return result.progress;
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -155,6 +158,7 @@ test('Codex 异步协作通过 SSE 流式回放、恢复、隔离并在终态脱
   });
   assert.equal(acceptedResponse.status, 202);
   const accepted = await acceptedResponse.json();
+  assert.match(accepted.sessionId, /^codexchat_[0-9a-f]{16}$/);
   assert.match(accepted.progressId, /^codexprog_[0-9a-f]{32}$/);
   assert.equal(accepted.detailLevel, 'summary');
   assert.equal(accepted.model, 'gpt-5.6-terra');
@@ -164,16 +168,16 @@ test('Codex 异步协作通过 SSE 流式回放、恢复、隔离并在终态脱
   assert.equal(accepted.eventsUrl.endsWith(accepted.progressId), true);
   await runStarted;
 
-  const duplicate = await fetch(sessionsUrl, {
+  const duplicate = await fetch(`${sessionsUrl}/${accepted.sessionId}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: base },
     body: JSON.stringify({ stream: true, prompt: '第二个请求不应排队' })
   });
   assert.equal(duplicate.status, 409);
-  assert.equal((await duplicate.json()).error, 'CODEX_PROGRESS_ACTIVE');
+  assert.equal((await duplicate.json()).error, 'SCRIPT_SESSION_ACTIVE');
   assert.equal(runnerCalls, 1);
 
-  const active = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-progress`)
+  const active = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions/${accepted.sessionId}/codex-progress`)
     .then((response) => response.json());
   assert.equal(active.progress.progressId, accepted.progressId);
   assert.equal(active.progress.detailLevel, 'summary');
@@ -214,7 +218,7 @@ test('Codex 异步协作通过 SSE 流式回放、恢复、隔离并在终态脱
   assert.match(streamText, /"timeoutMinutes":120/);
   assert.doesNotMatch(streamText, /PROMPT-SECRET|不得出现在进度里的小说原文|thread-secret|reasoning-secret|hidden chain|secret\\tool|RAW-TOOL-RESULT|FINAL-JSON-SECRET|完整模型输出|input_tokens|output_tokens|0199a213/i);
 
-  const terminal = await waitForProgress(base, project.id, chapterId, 'completed');
+  const terminal = await waitForProgress(base, project.id, chapterId, 'completed', accepted.sessionId);
   assert.equal(terminal.terminal, true);
   assert.equal(terminal.timeoutMinutes, 120);
   const replayResponse = await fetch(`${base}${accepted.eventsUrl}`, { headers: { 'Last-Event-ID': '2' } });
@@ -288,7 +292,7 @@ test('Codex 异步失败只发送固定终态，服务关闭会强制结束 SSE'
   const failedStart = await fetch(sessionsUrl, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: true })
   }).then((response) => response.json());
-  await waitForProgress(base, project.id, chapterId, 'failed');
+  await waitForProgress(base, project.id, chapterId, 'failed', failedStart.sessionId);
   const failedStream = await fetch(`${base}${failedStart.eventsUrl}`).then((response) => response.text());
   assert.match(failedStream, /event: failed/);
   assert.doesNotMatch(failedStream, /event: activity/);
@@ -308,8 +312,23 @@ test('Codex 异步失败只发送固定终态，服务关闭会强制结束 SSE'
   assert.equal(server.listening, false);
   assert.equal(shutdownSignal?.aborted, true);
   const stored = await getProject(project.id);
-  assert.equal(stored.chapters[0].codexSessions?.length || 0, 0);
+  assert.equal(stored.chapters[0].scenes?.length || 0, 0);
+  assert.equal(stored.chapters[0].codexSessions?.length || 0, 2);
+  assert.equal(stored.chapters[0].codexSessions.some((session) => session.status === 'failed'), true);
+  assert.doesNotMatch(JSON.stringify(stored.chapters[0].codexSessions), /RAW-STDERR|private|schema|--token/i);
   await hangingResponse.body.cancel().catch(() => {});
+
+  const recoveryServer = createServer({
+    codexRunner,
+    codexSettingsResolver: async (settings) => ({ ...settings, codexCommand: 'fake-codex' })
+  });
+  await new Promise((resolve) => recoveryServer.listen(0, '127.0.0.1', resolve));
+  const recoveryBase = `http://127.0.0.1:${recoveryServer.address().port}`;
+  const recovered = await fetch(`${recoveryBase}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`)
+    .then((response) => response.json());
+  assert.equal(recovered.sessions.every((session) => session.status === 'failed'), true);
+  assert.equal(recovered.sessions.some((session) => session.lastFailure?.code === 'SCRIPT_SESSION_INTERRUPTED'), true);
+  await new Promise((resolve) => recoveryServer.close(resolve));
 });
 
 test('Codex active 超时返回 504 语义终态、不提交，并释放本章锁供重试', async (t) => {
@@ -364,7 +383,7 @@ test('Codex active 超时返回 504 语义终态、不提交，并释放本章�
     body: JSON.stringify({ stream: true, timeoutMinutes: 5 })
   }).then((response) => response.json());
   assert.equal(started.timeoutMinutes, 5);
-  const failed = await waitForProgress(base, project.id, chapterId, 'failed');
+  const failed = await waitForProgress(base, project.id, chapterId, 'failed', started.sessionId);
   assert.equal(failed.timeoutMinutes, 5);
   assert.equal(failed.code, 'CODEX_TIMEOUT_ACTIVE');
   assert.match(failed.message, /5 分钟/);
@@ -374,7 +393,9 @@ test('Codex active 超时返回 504 语义终态、不提交，并释放本章�
   assert.match(stream, /5 分钟/);
   assert.doesNotMatch(stream, /RAW timeout|private|prompt\.txt|input_tokens|999/i);
   const afterTimeout = await getProject(project.id);
-  assert.equal(afterTimeout.chapters[0].codexSessions?.length || 0, 0);
+  assert.equal(afterTimeout.chapters[0].codexSessions?.length || 0, 1);
+  assert.equal(afterTimeout.chapters[0].codexSessions[0].status, 'failed');
+  assert.equal(afterTimeout.chapters[0].codexSessions[0].lastFailure.code, 'CODEX_TIMEOUT_ACTIVE');
 
   const activeTimeout = await fetch(sessionsUrl, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -396,7 +417,8 @@ test('Codex active 超时返回 504 语义终态、不提交，并释放本章�
   assert.match(startingFailure.message, /5 分钟/);
   assert.doesNotMatch(JSON.stringify(startingFailure), /RAW starting|private|prompt\.txt/i);
   const afterStartingTimeout = await getProject(project.id);
-  assert.equal(afterStartingTimeout.chapters[0].codexSessions?.length || 0, 0);
+  assert.equal(afterStartingTimeout.chapters[0].codexSessions?.length || 0, 3);
+  assert.equal(afterStartingTimeout.chapters[0].codexSessions.every((session) => session.status === 'failed'), true);
 
   const retry = await fetch(sessionsUrl, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})

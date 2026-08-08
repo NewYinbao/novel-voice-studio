@@ -30,6 +30,7 @@ import {
 import {
   appendCodexTurn,
   createCodexSession,
+  createPendingCodexSession,
   MAX_SESSIONS_PER_CHAPTER,
   normalizeScriptSessionProvider,
   publicCodexSession,
@@ -101,6 +102,37 @@ test('通用剧本版本保留超过 8 个可恢复快照且到硬上限不静�
       (error) => error.code === 'SCRIPT_SESSION_PROVIDER_INVALID'
     );
   }
+});
+
+test('pending/running Session 在容量边界不会被回收，私有 runId 与基线指纹不公开', () => {
+  const script = {
+    chapterTitle: '运行中版本', roles: [], warnings: [],
+    scenes: [{ title: '场景', context: '', lines: [{
+      kind: 'narration', speaker: '旁白', sourceText: '原文', spokenText: '运行中'
+    }] }]
+  };
+  const chapter = { codexSessions: [], activeCodexSessionId: null };
+  for (let index = 0; index < MAX_SESSIONS_PER_CHAPTER - 1; index += 1) {
+    saveCodexSession(chapter, createCodexSession({ provider: 'import', script }));
+  }
+  const pending = createPendingCodexSession({
+    provider: 'codex', script,
+    progressId: 'codexprog_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    baselineChapterHash: `sha256:${'b'.repeat(64)}`,
+    prompt: '继续处理'
+  });
+  saveCodexSession(chapter, pending);
+  assert.throws(
+    () => saveCodexSession(chapter, createCodexSession({ provider: 'rules', script })),
+    (error) => error.code === 'SCRIPT_SESSION_VERSION_LIMIT'
+  );
+  const storedPending = chapter.codexSessions.find((session) => session.id === pending.id);
+  assert.equal(storedPending.status, 'pending');
+  assert.equal(storedPending.activeRun.baselineChapterHash, `sha256:${'b'.repeat(64)}`);
+  const publicValue = publicCodexSession(storedPending);
+  assert.equal(publicValue.activeRun.progressId, pending.activeRun.progressId);
+  assert.equal(Object.hasOwn(publicValue.activeRun, 'baselineChapterHash'), false);
+  assert.doesNotMatch(JSON.stringify(publicValue), /runId|sha256:/);
 });
 
 test('剧本结构、文本、总字节与版本累计快照都执行统一硬预算', async () => {

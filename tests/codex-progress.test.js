@@ -121,6 +121,37 @@ test('Codex progress 只保存固定事件、限制同章并发并在 TTL 后清
   manager.shutdown();
 });
 
+test('Codex progress 以 Session 精确隔离，同章不同 Session 可并发且旧章节路径不可越权读取', () => {
+  const manager = new CodexProgressManager();
+  const sessionA = 'codexchat_aaaaaaaaaaaaaaaa';
+  const sessionB = 'codexchat_bbbbbbbbbbbbbbbb';
+  const a = manager.create({ projectId: 'project_a', chapterId: 'chapter_a', sessionId: sessionA });
+  const b = manager.create({ projectId: 'project_a', chapterId: 'chapter_a', sessionId: sessionB });
+
+  assert.equal(a.sessionId, sessionA);
+  assert.equal(b.sessionId, sessionB);
+  assert.match(a.eventsUrl, new RegExp(`/codex-sessions/${sessionA}/codex-progress/`));
+  assert.equal(manager.latest('project_a', 'chapter_a'), null);
+  assert.equal(manager.latest('project_a', 'chapter_a', sessionA).progressId, a.progressId);
+  assert.throws(
+    () => manager.create({ projectId: 'project_a', chapterId: 'chapter_a', sessionId: sessionA }),
+    (error) => error.statusCode === 409 && error.code === 'SCRIPT_SESSION_ACTIVE'
+  );
+  assert.throws(
+    () => manager.owned(a.progressId, 'project_a', 'chapter_a'),
+    (error) => error.statusCode === 404 && error.code === 'CODEX_PROGRESS_NOT_FOUND'
+  );
+  assert.throws(
+    () => manager.owned(a.progressId, 'project_a', 'chapter_a', sessionB),
+    (error) => error.statusCode === 404 && error.code === 'CODEX_PROGRESS_NOT_FOUND'
+  );
+  assert.equal(
+    manager.owned(a.progressId, 'project_a', 'chapter_a', sessionA).sessionId,
+    sessionA
+  );
+  manager.shutdown();
+});
+
 test('Codex progress SSE 支持回放、严格 Last-Event-ID 与终态关闭', () => {
   const manager = new CodexProgressManager();
   const progress = manager.create({
@@ -196,6 +227,22 @@ test('Codex progress shutdown 强制清理处于回压状态的 SSE', () => {
   manager.shutdown();
   assert.equal(response.destroyed, true);
   assert.equal(manager.records.size, 0);
+});
+
+test('Codex progress 在 shutdown 后不会排入失去追踪的执行任务', async () => {
+  const manager = new CodexProgressManager();
+  const sessionId = 'codexchat_cccccccccccccccc';
+  const progress = manager.create({ projectId: 'project_c', chapterId: 'chapter_c', sessionId });
+  let calls = 0;
+  await manager.shutdown();
+  assert.throws(
+    () => manager.start(
+      progress.progressId, 'project_c', 'chapter_c', () => { calls += 1; }, sessionId
+    ),
+    (error) => error.statusCode === 503 && error.code === 'CODEX_PROGRESS_UNAVAILABLE'
+  );
+  await Promise.resolve();
+  assert.equal(calls, 0);
 });
 
 test('Codex activity 仅在 summary 发布，并受频率、数量、文本与 SSE frame 上限约束', () => {

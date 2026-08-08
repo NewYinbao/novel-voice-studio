@@ -143,10 +143,12 @@ test('Ollama 合并到协作室，同 provider 续问并在跨 provider 时新�
 
   const inactive = await fetch(`${sessionsUrl}/${initial.session.id}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider: 'ollama', prompt: '不应混用非活动版本' })
+    body: JSON.stringify({ provider: 'ollama', prompt: '基于非活动版本独立继续' })
   });
-  assert.equal(inactive.status, 409);
-  assert.equal((await inactive.json()).error, 'SCRIPT_SESSION_NOT_ACTIVE');
+  assert.equal(inactive.status, 200);
+  const inactiveResult = await inactive.json();
+  assert.equal(inactiveResult.session.id, initial.session.id);
+  assert.equal(inactiveResult.appliedToLive, false);
 
   const resumeResponse = await fetch(`${sessionsUrl}/${cross.session.id}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

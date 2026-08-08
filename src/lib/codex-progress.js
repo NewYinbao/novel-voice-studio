@@ -7,6 +7,7 @@ import {
   normalizeOllamaModel
 } from './codex-options.js';
 import {
+  assertCodexSessionId,
   COLLABORATION_PROVIDERS,
   normalizeScriptSessionProvider
 } from './codex-sessions.js';
@@ -47,7 +48,8 @@ const SAFE_FAILURE_CODES = new Set([
   'CODEX_THREAD_MISSING', 'CODEX_TIMEOUT', 'CODEX_TIMEOUT_ACTIVE', 'CODEX_TIMEOUT_STARTING',
   'CODEX_TURN_FAILED', 'CODEX_UNAVAILABLE',
   'OLLAMA_FAILED', 'OLLAMA_TIMEOUT', 'OLLAMA_UNAVAILABLE',
-  'SCRIPT_SCHEMA_INVALID', 'SCRIPT_SESSION_NOT_ACTIVE', 'SCRIPT_SESSION_VERSION_LIMIT'
+  'SCRIPT_SCHEMA_INVALID', 'SCRIPT_SESSION_INTERRUPTED', 'SCRIPT_SESSION_NOT_ACTIVE',
+  'SCRIPT_SESSION_VERSION_LIMIT'
 ]);
 
 function httpError(message, statusCode, code) {
@@ -83,6 +85,9 @@ function isoTime(value) {
 }
 
 function eventsUrl(record) {
+  if (record.sessionId) {
+    return `/api/projects/${encodeURIComponent(record.projectId)}/chapters/${encodeURIComponent(record.chapterId)}/codex-sessions/${encodeURIComponent(record.sessionId)}/codex-progress/${record.id}`;
+  }
   return `/api/projects/${encodeURIComponent(record.projectId)}/chapters/${encodeURIComponent(record.chapterId)}/codex-progress/${record.id}`;
 }
 
@@ -97,6 +102,7 @@ function safeSnapshot(record, now) {
   const elapsedUntil = record.terminal ? record.updatedAt : now;
   const snapshot = {
     progressId: record.id,
+    sessionId: record.sessionId || null,
     provider: record.provider,
     detailLevel: record.detailLevel,
     model: record.model,
@@ -146,6 +152,7 @@ export class CodexProgressManager {
     maxRecords = 128,
     maxActive = 4,
     maxActivePerChapter = 1,
+    maxActivePerSession = 1,
     maxEvents = 96,
     maxActivityEvents = 24,
     maxActivityTextBytes = 8 * 1024,
@@ -162,6 +169,7 @@ export class CodexProgressManager {
     this.maxRecords = Math.max(4, Number(maxRecords) || 128);
     this.maxActive = Math.max(1, Number(maxActive) || 4);
     this.maxActivePerChapter = Math.max(1, Number(maxActivePerChapter) || 1);
+    this.maxActivePerSession = Math.max(1, Number(maxActivePerSession) || 1);
     this.maxEvents = Math.max(8, Number(maxEvents) || 96);
     this.maxActivityEvents = Math.max(1, Math.min(24, Number(maxActivityEvents) || 24));
     this.maxActivityTextBytes = Math.max(256, Math.min(8 * 1024, Number(maxActivityTextBytes) || 8 * 1024));
@@ -187,10 +195,13 @@ export class CodexProgressManager {
     }
   }
 
-  create({ projectId, chapterId, provider, detailLevel, model, reasoningEffort, timeoutMinutes } = {}) {
+  create({ projectId, chapterId, sessionId, provider, detailLevel, model, reasoningEffort, timeoutMinutes } = {}) {
     if (this.closed) throw httpError('Codex 进度服务正在关闭。', 503, 'CODEX_PROGRESS_UNAVAILABLE');
     const ownerProjectId = String(projectId || '');
     const ownerChapterId = String(chapterId || '');
+    const ownerSessionId = sessionId === undefined || sessionId === null || sessionId === ''
+      ? ''
+      : assertCodexSessionId(sessionId);
     const normalizedDetailLevel = normalizeCodexDetailLevel(detailLevel);
     const normalizedProvider = normalizeScriptSessionProvider(provider, {
       fallback: 'codex', allowed: COLLABORATION_PROVIDERS
@@ -210,11 +221,18 @@ export class CodexProgressManager {
     if (activeRecords.length >= this.maxActive) {
       throw httpError('同时进行的 Codex 请求过多，请稍后重试。', 503, 'CODEX_PROGRESS_CAPACITY');
     }
-    const chapterActive = activeRecords.filter((record) => (
-      record.projectId === ownerProjectId && record.chapterId === ownerChapterId
+    const scopeActive = activeRecords.filter((record) => (
+      record.projectId === ownerProjectId
+      && record.chapterId === ownerChapterId
+      && (ownerSessionId ? record.sessionId === ownerSessionId : !record.sessionId)
     ));
-    if (chapterActive.length >= this.maxActivePerChapter) {
-      throw httpError('本章已有 Codex 请求正在处理，请等待完成后再试。', 409, 'CODEX_PROGRESS_ACTIVE');
+    const scopeLimit = ownerSessionId ? this.maxActivePerSession : this.maxActivePerChapter;
+    if (scopeActive.length >= scopeLimit) {
+      throw httpError(
+        ownerSessionId ? '这个 Session 已有请求正在处理。' : '本章已有 Codex 请求正在处理，请等待完成后再试。',
+        409,
+        ownerSessionId ? 'SCRIPT_SESSION_ACTIVE' : 'CODEX_PROGRESS_ACTIVE'
+      );
     }
     if (this.records.size >= this.maxRecords) {
       const terminalRecords = [...this.records.values()]
@@ -231,6 +249,7 @@ export class CodexProgressManager {
       id: `codexprog_${crypto.randomBytes(16).toString('hex')}`,
       projectId: ownerProjectId,
       chapterId: ownerChapterId,
+      sessionId: ownerSessionId,
       provider: normalizedProvider,
       detailLevel: normalizedDetailLevel,
       model: normalizedModel,
@@ -305,6 +324,7 @@ export class CodexProgressManager {
     );
     const data = {
       progressId: record.id,
+      sessionId: record.sessionId || null,
       provider: record.provider,
       type: normalizedType,
       phase: normalizedPhase,
@@ -356,38 +376,76 @@ export class CodexProgressManager {
     return this.publish(progressId, { type: 'failed', phase: 'failed', code });
   }
 
-  owned(progressId, projectId, chapterId) {
+  discard(progressId) {
+    const id = String(progressId || '');
+    if (!PROGRESS_ID_PATTERN.test(id)) return false;
+    const record = this.records.get(id);
+    if (!record) return false;
+    if (!record.controller.signal.aborted) record.controller.abort();
+    for (const subscriber of [...record.subscribers]) this.#closeSubscriber(subscriber, { destroy: true });
+    this.records.delete(id);
+    return true;
+  }
+
+  owned(progressId, projectId, chapterId, sessionId = undefined) {
     this.prune();
     const id = String(progressId || '');
     if (!PROGRESS_ID_PATTERN.test(id)) {
       throw httpError('Codex 进度标识无效。', 404, 'CODEX_PROGRESS_NOT_FOUND');
     }
     const record = this.records.get(id);
-    if (!record || record.projectId !== String(projectId || '') || record.chapterId !== String(chapterId || '')) {
+    const expectedSessionId = sessionId === undefined || sessionId === null || sessionId === ''
+      ? null
+      : assertCodexSessionId(sessionId);
+    if (
+      !record
+      || record.projectId !== String(projectId || '')
+      || record.chapterId !== String(chapterId || '')
+      || record.sessionId !== (expectedSessionId || '')
+    ) {
       throw httpError('Codex 进度不存在或不属于当前章节。', 404, 'CODEX_PROGRESS_NOT_FOUND');
     }
     return record;
   }
 
-  snapshot(progressId, projectId, chapterId) {
-    return safeSnapshot(this.owned(progressId, projectId, chapterId), this.now());
+  snapshot(progressId, projectId, chapterId, sessionId = undefined) {
+    return safeSnapshot(this.owned(progressId, projectId, chapterId, sessionId), this.now());
   }
 
-  signal(progressId, projectId, chapterId) {
-    return this.owned(progressId, projectId, chapterId).controller.signal;
+  signal(progressId, projectId, chapterId, sessionId = undefined) {
+    return this.owned(progressId, projectId, chapterId, sessionId).controller.signal;
   }
 
-  track(progressId, projectId, chapterId, task) {
-    const record = this.owned(progressId, projectId, chapterId);
+  track(progressId, projectId, chapterId, task, sessionId = undefined) {
+    const record = this.owned(progressId, projectId, chapterId, sessionId);
     if (record.task) throw httpError('Codex 进度已绑定执行任务。', 409, 'CODEX_PROGRESS_TASK_EXISTS');
     record.task = Promise.resolve(task);
     return record.task;
   }
 
-  latest(projectId, chapterId) {
+  start(progressId, projectId, chapterId, operation, sessionId = undefined) {
+    if (this.closed) throw httpError('Codex 进度服务正在关闭。', 503, 'CODEX_PROGRESS_UNAVAILABLE');
+    if (typeof operation !== 'function') {
+      throw httpError('Codex 执行任务无效。', 400, 'CODEX_PROGRESS_TASK_INVALID');
+    }
+    // Resolve ownership and reserve the task slot before queuing the operation.
+    // If shutdown already removed the record, no detached promise is created.
+    const record = this.owned(progressId, projectId, chapterId, sessionId);
+    if (record.task) throw httpError('Codex 进度已绑定执行任务。', 409, 'CODEX_PROGRESS_TASK_EXISTS');
+    const task = Promise.resolve().then(operation);
+    record.task = task;
+    return task;
+  }
+
+  latest(projectId, chapterId, sessionId = undefined) {
     this.prune();
+    const expectedSessionId = sessionId === undefined || sessionId === null || sessionId === ''
+      ? null
+      : assertCodexSessionId(sessionId);
     const records = [...this.records.values()].filter((record) => (
-      record.projectId === String(projectId || '') && record.chapterId === String(chapterId || '')
+      record.projectId === String(projectId || '')
+      && record.chapterId === String(chapterId || '')
+      && record.sessionId === (expectedSessionId || '')
     ));
     if (!records.length) return null;
     records.sort((a, b) => Number(a.terminal) - Number(b.terminal)
@@ -395,8 +453,8 @@ export class CodexProgressManager {
     return safeSnapshot(records[0], this.now());
   }
 
-  subscribe(req, res, { progressId, projectId, chapterId, lastEventId = 0 }) {
-    const record = this.owned(progressId, projectId, chapterId);
+  subscribe(req, res, { progressId, projectId, chapterId, sessionId, lastEventId = 0 }) {
+    const record = this.owned(progressId, projectId, chapterId, sessionId);
     const lastId = parseCodexLastEventId(lastEventId);
     const latestId = record.nextEventId - 1;
     if (lastId > latestId) {

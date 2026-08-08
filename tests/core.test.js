@@ -458,12 +458,22 @@ test('Codex 协作室持久化同一 session，并把手工修改带入下一轮
   assert.equal(editDuringRun.status, 200);
   releaseConflictTurn();
   const conflictResponse = await conflictRequest;
-  assert.equal(conflictResponse.status, 409);
+  assert.equal(conflictResponse.status, 200);
   const conflict = await conflictResponse.json();
-  assert.equal(conflict.error, 'CODEX_CHAPTER_CHANGED');
+  assert.equal(conflict.session.id, first.session.id);
+  assert.equal(conflict.session.status, 'ready');
+  assert.equal(conflict.appliedToLive, false);
   const afterConflict = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
   assert.equal(afterConflict.chapters[0].scenes[0].lines[0].spokenText, '处理期间的新手工稿。');
-  assert.equal(afterConflict.chapters[0].codexSessions[0].timeoutMinutes, 120);
+  const completedVersion = afterConflict.chapters[0].codexSessions
+    .find((session) => session.id === first.session.id);
+  assert.equal(completedVersion.timeoutMinutes, 120);
+  assert.equal(completedVersion.status, 'ready');
+  const completedScript = await fetch(
+    `${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions/${first.session.id}/script`
+  ).then((response) => response.json());
+  assert.equal(completedScript.isActive, false);
+  assert.equal(completedScript.script.scenes[0].lines[0].spokenText, '这份旧结果不应覆盖手工稿。');
   assert.equal('codexThreadId' in afterConflict.chapters[0].codexSessions[0], false);
 });
 
