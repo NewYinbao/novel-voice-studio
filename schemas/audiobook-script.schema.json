@@ -7,6 +7,7 @@
     "chapterTitle": { "type": "string" },
     "roles": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -21,6 +22,7 @@
     },
     "scenes": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -30,6 +32,7 @@
           "context": { "type": "string" },
           "lines": {
             "type": "array",
+            "minItems": 1,
             "items": {
               "type": "object",
               "additionalProperties": false,

@@ -1,0 +1,110 @@
+import { id, nowIso } from './utils.js';
+
+const SESSION_ID_PATTERN = /^codexchat_[0-9a-f]{16}$/;
+const MAX_SESSIONS_PER_CHAPTER = 8;
+const MAX_MESSAGES_PER_SESSION = 40;
+const MAX_MESSAGE_CHARS = 4000;
+
+function cleanText(value, max = MAX_MESSAGE_CHARS) {
+  return String(value || '').trim().slice(0, max);
+}
+
+function scriptStats(script) {
+  const scenes = Array.isArray(script?.scenes) ? script.scenes : [];
+  const lines = scenes.flatMap((scene) => Array.isArray(scene.lines) ? scene.lines : []);
+  const roles = Array.isArray(script?.roles) ? script.roles : [];
+  const reviewCount = lines.filter((line) => line.needsReview).length;
+  return { sceneCount: scenes.length, lineCount: lines.length, roleCount: roles.length, reviewCount };
+}
+
+function assistantSummary(script) {
+  const stats = scriptStats(script);
+  const review = stats.reviewCount ? `，其中 ${stats.reviewCount} 句需要确认角色` : '';
+  return `已生成完整剧本：${stats.sceneCount} 个场景、${stats.lineCount} 个片段、${stats.roleCount} 个角色${review}。右侧可继续手动调整，或在下方发送下一轮要求。`;
+}
+
+function safeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const result = {};
+  for (const key of ['input_tokens', 'cached_input_tokens', 'output_tokens']) {
+    const value = Number(usage[key]);
+    if (Number.isSafeInteger(value) && value >= 0) result[key] = value;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function message(role, content, meta = undefined) {
+  const item = { id: id('message'), role, content: cleanText(content), createdAt: nowIso() };
+  if (meta && Object.keys(meta).length) item.meta = meta;
+  return item;
+}
+
+export function assertCodexSessionId(value) {
+  const candidate = String(value || '');
+  if (!SESSION_ID_PATTERN.test(candidate)) {
+    throw Object.assign(new Error('Codex 会话标识无效'), { statusCode: 400, code: 'CODEX_SESSION_INVALID' });
+  }
+  return candidate;
+}
+
+export function findCodexSession(chapter, sessionId) {
+  const normalized = assertCodexSessionId(sessionId);
+  const session = (chapter.codexSessions || []).find((item) => item.id === normalized);
+  if (!session) throw Object.assign(new Error('Codex 会话不存在或已被清理'), { statusCode: 404, code: 'CODEX_SESSION_NOT_FOUND' });
+  return session;
+}
+
+export function createCodexSession({ threadId, model = '', mode = 'faithful', prompt = '', script, usage = null }) {
+  const stats = scriptStats(script);
+  const timestamp = nowIso();
+  return {
+    id: id('codexchat'),
+    codexThreadId: cleanText(threadId, 120),
+    model: cleanText(model, 100),
+    mode: ['faithful', 'polished', 'drama'].includes(mode) ? mode : 'faithful',
+    status: 'ready',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    turnCount: 1,
+    messages: [
+      message('user', prompt || '请把当前章节转换为结构化有声书剧本。'),
+      message('assistant', assistantSummary(script), { ...stats, usage: safeUsage(usage) })
+    ]
+  };
+}
+
+export function appendCodexTurn(session, { prompt, model = '', script, usage = null }) {
+  const stats = scriptStats(script);
+  // An explicit empty model means “return to the Codex CLI default”.
+  session.model = cleanText(model, 100);
+  session.status = 'ready';
+  session.updatedAt = nowIso();
+  session.turnCount = Math.max(0, Number(session.turnCount) || 0) + 1;
+  session.messages = [
+    ...(Array.isArray(session.messages) ? session.messages : []),
+    message('user', prompt),
+    message('assistant', assistantSummary(script), { ...stats, usage: safeUsage(usage) })
+  ].slice(-MAX_MESSAGES_PER_SESSION);
+  return session;
+}
+
+export function saveCodexSession(chapter, session) {
+  const sessions = Array.isArray(chapter.codexSessions) ? chapter.codexSessions : [];
+  chapter.codexSessions = [session, ...sessions.filter((item) => item.id !== session.id)]
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, MAX_SESSIONS_PER_CHAPTER);
+  chapter.activeCodexSessionId = session.id;
+  return session;
+}
+
+export function publicCodexSession(session) {
+  if (!session) return null;
+  const { codexThreadId: _privateThreadId, ...publicValue } = session;
+  return publicValue;
+}
+
+export function publicCodexSessions(chapter) {
+  return (chapter.codexSessions || []).map(publicCodexSession);
+}
+
+export { scriptStats };

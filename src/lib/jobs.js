@@ -4,6 +4,7 @@ import { readJson, writeJsonAtomic } from './utils.js';
 export class JobManager {
   #jobs = new Map();
   #gpuQueue = Promise.resolve();
+  #mediaQueue = Promise.resolve();
   #storagePath;
   #saveTimer;
 
@@ -43,7 +44,8 @@ export class JobManager {
     await this.#persist();
   }
 
-  create(type, payload, handler, { gpu = false } = {}) {
+  create(type, payload, handler, { gpu = false, media = false } = {}) {
+    if (gpu && media) throw new TypeError('任务不能同时加入 GPU 与媒体队列');
     const job = {
       id: id('job'), type, state: 'queued', progress: 0, message: '已加入队列',
       payload, result: null, error: null, createdAt: nowIso(), updatedAt: nowIso()
@@ -75,7 +77,9 @@ export class JobManager {
       this.#schedulePersist();
       return job;
     };
-    if (gpu) {
+    if (media) {
+      this.#mediaQueue = this.#mediaQueue.catch(() => {}).then(execute);
+    } else if (gpu) {
       this.#gpuQueue = this.#gpuQueue.catch(() => {}).then(execute);
     } else {
       queueMicrotask(execute);

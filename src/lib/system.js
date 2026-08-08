@@ -1,5 +1,7 @@
 import os from 'node:os';
 import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { recommendEngine, TTS_ENGINES } from './config.js';
 
@@ -24,7 +26,7 @@ async function run(command, args = [], timeout = 4000) {
   }
 }
 
-async function probeCommand(command, versionArgs = ['--version']) {
+export async function probeCommand(command, versionArgs = ['--version']) {
   if (typeof command !== 'string' || !command.trim() || command.length > 500 || /[\r\n\0]/.test(command)) {
     return { found: false, runnable: false, version: null, path: null, error: '命令格式无效' };
   }
@@ -36,6 +38,112 @@ async function probeCommand(command, versionArgs = ['--version']) {
     path: command,
     error: version.ok ? null : version.stderr
   };
+}
+
+function firstLine(value) {
+  return String(value || '').trim().split(/\r?\n/)[0] || null;
+}
+
+function commandErrorState(result) {
+  const code = String(result.code || '').toUpperCase();
+  return ['ENOENT', 'UNKNOWN'].includes(code) ? 'missing' : 'blocked';
+}
+
+function codexResult(command, state, { version = null, error = null, source = 'configured' } = {}) {
+  const found = state !== 'missing';
+  return {
+    found,
+    runnable: state === 'ready',
+    version,
+    path: command || null,
+    command: command || null,
+    resolvedCommand: command || null,
+    resolvedPath: command || null,
+    state,
+    source,
+    error
+  };
+}
+
+export async function discoverLocalCodexCandidates(localAppData = process.env.LOCALAPPDATA) {
+  if (typeof localAppData !== 'string' || !localAppData.trim()) return [];
+  const binRoot = path.join(localAppData, 'OpenAI', 'Codex', 'bin');
+  try {
+    const entries = await fs.readdir(binRoot, { withFileTypes: true });
+    const candidates = await Promise.all(entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const candidate = path.join(binRoot, entry.name, 'codex.exe');
+        try {
+          const stats = await fs.stat(candidate);
+          return stats.isFile() ? { candidate, modifiedAt: stats.mtimeMs } : null;
+        } catch {
+          return null;
+        }
+      }));
+    return candidates
+      .filter(Boolean)
+      .sort((left, right) => right.modifiedAt - left.modifiedAt || left.candidate.localeCompare(right.candidate))
+      .map((item) => item.candidate);
+  } catch {
+    return [];
+  }
+}
+
+export async function probeCodexCommand(command, { source = 'configured' } = {}) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 500 || /[\r\n\0]/.test(command)) {
+    return codexResult(null, 'missing', { error: 'Codex 命令格式无效', source });
+  }
+  const normalized = command.trim();
+  const versionProbe = await run(normalized, ['--version'], 3500);
+  if (!versionProbe.ok) {
+    const state = commandErrorState(versionProbe);
+    return codexResult(normalized, state, {
+      error: versionProbe.stderr || (state === 'missing' ? '未找到 Codex CLI' : 'Codex CLI 无法启动'),
+      source
+    });
+  }
+
+  const version = firstLine(versionProbe.stdout || versionProbe.stderr);
+  const loginProbe = await run(normalized, ['login', 'status'], 5000);
+  if (loginProbe.ok) return codexResult(normalized, 'ready', { version, source });
+
+  const loginError = loginProbe.stderr || loginProbe.stdout || 'Codex CLI 登录状态检测失败';
+  const code = String(loginProbe.code || '').toUpperCase();
+  const unsupported = /(?:unexpected|unrecognized|unknown)\s+(?:argument|command|subcommand)|invalid\s+subcommand/i.test(loginError);
+  const state = ['EPERM', 'EACCES', 'ENOENT', 'UNKNOWN'].includes(code) || unsupported ? 'blocked' : 'authRequired';
+  return codexResult(normalized, state, {
+    version,
+    error: state === 'authRequired' ? 'Codex CLI 尚未登录，请先完成 Codex CLI 登录。' : loginError,
+    source
+  });
+}
+
+export async function probeCodex(configuredCommand, {
+  platform = process.platform,
+  localAppData = process.env.LOCALAPPDATA,
+  localCandidates
+} = {}) {
+  const configured = typeof configuredCommand === 'string' ? configuredCommand.trim() : '';
+  const command = configured || 'codex';
+  const mayUseWindowsFallback = platform === 'win32' && (!configured || ['codex', 'codex.exe'].includes(configured.toLowerCase()));
+  const probes = [await probeCodexCommand(command, { source: 'configured' })];
+  if (probes[0].state === 'ready' || !mayUseWindowsFallback) return probes[0];
+
+  const discovered = Array.isArray(localCandidates)
+    ? localCandidates
+    : await discoverLocalCodexCandidates(localAppData);
+  const seen = new Set([command.toLowerCase()]);
+  for (const candidate of discovered) {
+    if (typeof candidate !== 'string' || seen.has(candidate.toLowerCase())) continue;
+    seen.add(candidate.toLowerCase());
+    const probe = await probeCodexCommand(candidate, { source: 'localAppData' });
+    probes.push(probe);
+    if (probe.state === 'ready') return probe;
+  }
+
+  const priority = { authRequired: 3, blocked: 2, missing: 1 };
+  return probes.sort((left, right) => (priority[right.state] || 0) - (priority[left.state] || 0))[0];
 }
 
 async function probeGpu() {
@@ -76,7 +184,7 @@ export async function getSystemProfile(settings, { refresh = false } = {}) {
     probeCommand('ffmpeg', ['-version']),
     probeCommand('python', ['--version']),
     probeCommand('uv', ['--version']),
-    probeCommand(settings.codexCommand || 'codex', ['--version']),
+    probeCodex(settings.codexCommand),
     probeWorker(settings.workerUrl)
   ]);
   const base = {

@@ -5,8 +5,9 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import {
-  DATA_DIR, MAX_BOOK_BYTES, MAX_JSON_BYTES, MAX_VOICE_BYTES, PROJECTS_DIR,
-  PUBLIC_DIR, TTS_ENGINES, VOICES_DIR, EXPORTS_DIR, EMOTIONS
+  DATA_DIR, MAX_BOOK_BYTES, MAX_JSON_BYTES, MAX_VOICE_BYTES, MAX_VOICE_SOURCE_BYTES,
+  MAX_VOICE_CLIP_MS, MIN_VOICE_CLIP_MS, PROJECTS_DIR, PUBLIC_DIR, TTS_ENGINES,
+  VOICES_DIR, EXPORTS_DIR, EMOTIONS
 } from './lib/config.js';
 import { engineCompatibility, getSystemProfile } from './lib/system.js';
 import {
@@ -14,9 +15,17 @@ import {
   listVoices, mergeRoles, mutateProject, replaceProjectSource, summarizeProject, updateSettings
 } from './lib/store.js';
 import { decodeBook, normalizeNovelText } from './lib/novel.js';
-import { convertChapter, createCodexPackage, normalizeImportedScript } from './lib/script-engine.js';
+import { convertChapter, createCodexPackage, normalizeImportedScript, runCodexSession } from './lib/script-engine.js';
+import {
+  appendCodexTurn, createCodexSession, findCodexSession, publicCodexSession,
+  publicCodexSessions, saveCodexSession
+} from './lib/codex-sessions.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
+import {
+  claimVoiceSource, deleteVoiceSource, extractVoiceFromSource, resetVoiceSourceWorkspace,
+  saveVoiceSource, validateVoiceExtraction
+} from './lib/video-voice.js';
 import {
   clamp, decodeBase64Payload, isPathInside, json, mediaType, nowIso, parseJsonBody, safeName, text
 } from './lib/utils.js';
@@ -24,6 +33,7 @@ import {
 const jobs = new JobManager(path.join(DATA_DIR, 'jobs.json'));
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 4317);
+const codexSessionLocks = new Map();
 
 function assertLocalOrigin(req) {
   const origin = req.headers.origin;
@@ -100,7 +110,90 @@ function findLine(project, lineId) {
   throw Object.assign(new Error('台词不存在'), { statusCode: 404 });
 }
 
+function withCodexSessionLock(key, operation) {
+  const previous = codexSessionLocks.get(key) || Promise.resolve();
+  const next = previous.catch(() => {}).then(operation);
+  codexSessionLocks.set(key, next);
+  return next.finally(() => {
+    if (codexSessionLocks.get(key) === next) codexSessionLocks.delete(key);
+  });
+}
+
+function codexChapterVersion(chapter) {
+  return JSON.stringify({
+    title: chapter.title,
+    sourceText: chapter.sourceText,
+    scenes: chapter.scenes || [],
+    scriptWarnings: chapter.scriptWarnings || [],
+    scriptedAt: chapter.scriptedAt || null,
+    status: chapter.status || null
+  });
+}
+
+function assertCodexChapterUnchanged(chapter, expectedVersion) {
+  if (codexChapterVersion(chapter) === expectedVersion) return;
+  throw Object.assign(new Error('Codex 处理期间本章剧本已被修改。为保护最新手工稿，本轮结果没有覆盖项目；请确认当前内容后重新发送。'), {
+    statusCode: 409,
+    code: 'CODEX_CHAPTER_CHANGED'
+  });
+}
+
+function codexMode(value) {
+  return ['faithful', 'polished', 'drama'].includes(value) ? value : 'faithful';
+}
+
+function codexModel(value) {
+  const model = String(value || '').trim();
+  if (model.length > 100 || (model && !/^[A-Za-z0-9._:/-]+$/.test(model))) {
+    throw Object.assign(new Error('Codex 模型名称格式无效'), { statusCode: 400, code: 'CODEX_MODEL_INVALID' });
+  }
+  return model;
+}
+
+function codexPrompt(value, { required = false } = {}) {
+  const prompt = String(value || '').trim();
+  if (required && !prompt) throw Object.assign(new Error('请输入本轮调整要求'), { statusCode: 400, code: 'CODEX_PROMPT_REQUIRED' });
+  if (prompt.length > 4000) throw Object.assign(new Error('单轮调整要求不能超过 4000 字'), { statusCode: 400, code: 'CODEX_PROMPT_TOO_LONG' });
+  return prompt;
+}
+
+async function codexRuntimeSettings(settings) {
+  const profile = await getSystemProfile(settings, { refresh: true });
+  const tool = profile.tools?.codex || {};
+  if (!tool.runnable) {
+    const message = tool.state === 'authRequired'
+      ? 'Codex CLI 尚未登录。请先在本机终端运行 codex login，登录完成后再试。'
+      : tool.error || 'Codex CLI 当前不可用，请在模型中心检查命令路径。';
+    throw Object.assign(new Error(message), {
+      statusCode: 409,
+      code: tool.state === 'authRequired' ? 'CODEX_AUTH_REQUIRED' : 'CODEX_UNAVAILABLE'
+    });
+  }
+  const command = tool.resolvedCommand || tool.resolvedPath || tool.path || settings.codexCommand || 'codex';
+  return { ...settings, codexCommand: command };
+}
+
+function codexFailureStatus(error) {
+  if (error.statusCode) return error;
+  if (error.code === 'CODEX_TIMEOUT') error.statusCode = 504;
+  else if (error.code === 'CODEX_UNAVAILABLE') error.statusCode = 503;
+  else if (error.code === 'SCRIPT_SCHEMA_INVALID' || String(error.code || '').startsWith('CODEX_')) error.statusCode = 502;
+  return error;
+}
+
+function assertUsableScript(script, chapter, statusCode = 422) {
+  const lines = (Array.isArray(script?.scenes) ? script.scenes : [])
+    .flatMap((scene) => Array.isArray(scene?.lines) ? scene.lines : []);
+  const readable = lines.some((line) => ['narration', 'dialogue'].includes(line?.kind) && String(line?.spokenText || '').trim());
+  if (!String(chapter?.sourceText || '').trim() || readable) return;
+  throw Object.assign(new Error('剧本结果没有可朗读的旁白或对白，已保留当前章节'), {
+    statusCode,
+    code: 'SCRIPT_SCHEMA_INVALID'
+  });
+}
+
 function applyScript(project, chapter, script) {
+  assertUsableScript(script, chapter);
   const roleMap = mergeRoles(project, script.roles);
   const narrator = project.characters.find((role) => role.isNarrator);
   chapter.scenes = script.scenes.map((scene) => ({
@@ -121,13 +214,33 @@ function pruneUnusedRoles(project) {
   project.characters = project.characters.filter((role) => role.isNarrator || role.voiceId || used.has(role.id));
 }
 
+function publicProject(project) {
+  if (!project || !Array.isArray(project.chapters)) return project;
+  return {
+    ...project,
+    chapters: project.chapters.map((chapter) => ({
+      ...chapter,
+      codexSessions: Array.isArray(chapter.codexSessions)
+        ? chapter.codexSessions.map(publicCodexSession)
+        : chapter.codexSessions
+    }))
+  };
+}
+
 async function getBootstrap() {
   const settings = await getSettings();
   const [profile, projects, voices] = await Promise.all([
     getSystemProfile(settings), listProjects(), listVoices()
   ]);
   return {
-    app: { name: '声绘 Studio', version: '0.1.0' },
+    app: {
+      name: '声绘 Studio', version: '0.1.0',
+      limits: {
+        voiceSourceBytes: MAX_VOICE_SOURCE_BYTES,
+        voiceClipMinMs: MIN_VOICE_CLIP_MS,
+        voiceClipMaxMs: MAX_VOICE_CLIP_MS
+      }
+    },
     settings,
     system: profile,
     engines: engineCompatibility(profile, settings.selectedEngine, settings.qualityMode),
@@ -138,7 +251,10 @@ async function getBootstrap() {
   };
 }
 
-async function handleApi(req, res, url) {
+async function handleApi(req, res, url, {
+  codexRunner = runCodexSession,
+  codexSettingsResolver = codexRuntimeSettings
+} = {}) {
   const { pathname } = url;
   const method = req.method;
   if (method !== 'GET' && method !== 'HEAD') assertLocalOrigin(req);
@@ -174,7 +290,7 @@ async function handleApi(req, res, url) {
       const sourceDir = path.join(PROJECTS_DIR, project.id, 'source');
       await fsp.writeFile(path.join(sourceDir, `original${path.extname(body.fileName).toLowerCase()}`), originalBuffer);
     }
-    return json(res, 201, project);
+    return json(res, 201, publicProject(project));
   }
   if (method === 'POST' && pathname === '/api/voices') {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
@@ -186,12 +302,57 @@ async function handleApi(req, res, url) {
     const voice = await createVoice({ ...body, audio });
     return json(res, 201, voice);
   }
+  if (method === 'POST' && pathname === '/api/voice-sources') {
+    const source = await saveVoiceSource(req, {
+      fileName: url.searchParams.get('fileName'),
+      contentType: req.headers['content-type'],
+      contentLength: req.headers['content-length']
+    });
+    return json(res, 201, source);
+  }
 
   let params = routeMatch(pathname, '/api/jobs/:jobId');
   if (params && method === 'GET') return json(res, 200, jobs.get(params.jobId));
 
+  params = routeMatch(pathname, '/api/voice-sources/:sourceId/extract');
+  if (params && method === 'POST') {
+    const voiceInput = validateVoiceExtraction(await parseJsonBody(req, MAX_JSON_BYTES));
+    const settings = await getSettings();
+    const profile = await getSystemProfile(settings, { refresh: true });
+    if (!profile.worker?.online) {
+      throw Object.assign(new Error('模型工作器未启动，无法裁剪视频或音频'), { code: 'WORKER_OFFLINE', statusCode: 503 });
+    }
+    if (!profile.worker.ffmpeg) {
+      throw Object.assign(new Error('模型工作器中没有 FFmpeg，无法裁剪视频或音频'), { code: 'FFMPEG_UNAVAILABLE', statusCode: 503 });
+    }
+    if (!profile.worker.ffprobe) {
+      throw Object.assign(new Error('模型工作器中没有 FFprobe，无法读取媒体时长'), { code: 'FFPROBE_UNAVAILABLE', statusCode: 503 });
+    }
+    const source = await claimVoiceSource(params.sourceId);
+    let job;
+    try {
+      job = jobs.create(
+        'voice_extract',
+        { sourceId: source.id, name: voiceInput.name, startMs: voiceInput.startMs, endMs: voiceInput.endMs },
+        (update) => extractVoiceFromSource(source, voiceInput, { settings, profile }, update),
+        { media: true }
+      );
+    } catch (error) {
+      await deleteVoiceSource(source.id, { allowClaimed: true, missingOk: true }).catch(() => {});
+      throw error;
+    }
+    return json(res, 202, job);
+  }
+
+  params = routeMatch(pathname, '/api/voice-sources/:sourceId');
+  if (params && method === 'DELETE') {
+    await deleteVoiceSource(params.sourceId);
+    res.writeHead(204);
+    return res.end();
+  }
+
   params = routeMatch(pathname, '/api/projects/:projectId');
-  if (params && method === 'GET') return json(res, 200, await getProject(params.projectId));
+  if (params && method === 'GET') return json(res, 200, publicProject(await getProject(params.projectId)));
   if (params && method === 'PATCH') {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const project = await mutateProject(params.projectId, (draft) => {
@@ -202,7 +363,7 @@ async function handleApi(req, res, url) {
         draft.production.engineId = body.engineId;
       }
     });
-    return json(res, 200, project);
+    return json(res, 200, publicProject(project));
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/import');
@@ -211,7 +372,7 @@ async function handleApi(req, res, url) {
     const originalBuffer = decodeBase64Payload(body.contentBase64, MAX_BOOK_BYTES);
     const sourceText = normalizeNovelText(decodeBook(originalBuffer, body.fileName));
     const project = await replaceProjectSource(params.projectId, { fileName: body.fileName, sourceText, originalBuffer });
-    return json(res, 200, project);
+    return json(res, 200, publicProject(project));
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/script');
@@ -243,6 +404,90 @@ async function handleApi(req, res, url) {
     return json(res, 202, job);
   }
 
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/messages');
+  if (params && method === 'POST') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    const prompt = codexPrompt(body.prompt, { required: true });
+    const lockKey = `${params.projectId}:${params.chapterId}`;
+    const result = await withCodexSessionLock(lockKey, async () => {
+      const settings = await codexSettingsResolver(await getSettings());
+      const project = await getProject(params.projectId);
+      const chapter = findChapter(project, params.chapterId);
+      const session = findCodexSession(chapter, params.sessionId);
+      const chapterVersion = codexChapterVersion(chapter);
+      if (!session.codexThreadId) {
+        throw Object.assign(new Error('这个会话缺少可续接的 Codex Session ID，请新建会话。'), {
+          statusCode: 409, code: 'CODEX_THREAD_MISSING'
+        });
+      }
+      const model = codexModel(Object.hasOwn(body, 'model') ? body.model : session.model);
+      let turn;
+      try {
+        turn = await codexRunner({
+          chapter, project, settings, mode: session.mode, model,
+          sessionId: session.codexThreadId, prompt
+        });
+      } catch (error) { throw codexFailureStatus(error); }
+      assertUsableScript(turn.script, chapter, 502);
+      return mutateProject(params.projectId, (draft) => {
+        const targetChapter = findChapter(draft, params.chapterId);
+        assertCodexChapterUnchanged(targetChapter, chapterVersion);
+        const targetSession = findCodexSession(targetChapter, params.sessionId);
+        applyScript(draft, targetChapter, turn.script);
+        appendCodexTurn(targetSession, { prompt, model, script: turn.script, usage: turn.usage });
+        saveCodexSession(targetChapter, targetSession);
+        pruneUnusedRoles(draft);
+        draft.status = 'scripted';
+        return { project: draft, session: publicCodexSession(targetSession) };
+      });
+    });
+    return json(res, 200, { ...result, project: publicProject(result.project) });
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions');
+  if (params && method === 'GET') {
+    const project = await getProject(params.projectId);
+    const chapter = findChapter(project, params.chapterId);
+    return json(res, 200, { activeSessionId: chapter.activeCodexSessionId || null, sessions: publicCodexSessions(chapter) });
+  }
+  if (params && method === 'POST') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    const mode = codexMode(body.mode);
+    const model = codexModel(body.model);
+    const prompt = codexPrompt(body.prompt);
+    const lockKey = `${params.projectId}:${params.chapterId}`;
+    const result = await withCodexSessionLock(lockKey, async () => {
+      const settings = await codexSettingsResolver(await getSettings());
+      const project = await getProject(params.projectId);
+      const chapter = findChapter(project, params.chapterId);
+      const chapterVersion = codexChapterVersion(chapter);
+      let turn;
+      try {
+        turn = await codexRunner({ chapter, project, settings, mode, model, prompt });
+      } catch (error) { throw codexFailureStatus(error); }
+      assertUsableScript(turn.script, chapter, 502);
+      if (!turn.threadId) {
+        throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
+          statusCode: 502, code: 'CODEX_THREAD_MISSING'
+        });
+      }
+      return mutateProject(params.projectId, (draft) => {
+        const targetChapter = findChapter(draft, params.chapterId);
+        assertCodexChapterUnchanged(targetChapter, chapterVersion);
+        applyScript(draft, targetChapter, turn.script);
+        const session = createCodexSession({
+          threadId: turn.threadId, model, mode, prompt,
+          script: turn.script, usage: turn.usage
+        });
+        saveCodexSession(targetChapter, session);
+        pruneUnusedRoles(draft);
+        draft.status = 'scripted';
+        return { project: draft, session: publicCodexSession(session) };
+      });
+    });
+    return json(res, 201, { ...result, project: publicProject(result.project) });
+  }
+
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-package');
   if (params && method === 'GET') {
     const project = await getProject(params.projectId);
@@ -261,7 +506,7 @@ async function handleApi(req, res, url) {
       pruneUnusedRoles(draft);
       draft.status = 'scripted';
     });
-    return json(res, 200, project);
+    return json(res, 200, publicProject(project));
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/lines/:lineId');
@@ -288,7 +533,7 @@ async function handleApi(req, res, url) {
       }
       line.render = { status: 'stale' };
     });
-    return json(res, 200, project);
+    return json(res, 200, publicProject(project));
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/characters/:roleId');
@@ -316,7 +561,7 @@ async function handleApi(req, res, url) {
         }
       }
     });
-    return json(res, 200, project);
+    return json(res, 200, publicProject(project));
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/render');
@@ -381,13 +626,13 @@ async function handleStatic(req, res, pathname) {
   }
 }
 
-export function createServer() {
+export function createServer(options = {}) {
   return http.createServer(async (req, res) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');
     try {
       const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
-      if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+      if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url, options);
       if (url.pathname.startsWith('/media/')) return await handleMedia(req, res, url.pathname);
       return await handleStatic(req, res, url.pathname);
     } catch (error) {
@@ -401,6 +646,8 @@ export function createServer() {
 
 async function main() {
   await initStore();
+  // 上传 token 只存在于当前浏览器会话；进程重启后，遗留来源和裁剪结果都不可恢复。
+  await resetVoiceSourceWorkspace();
   await jobs.init();
   const server = createServer();
   server.listen(PORT, HOST, () => {

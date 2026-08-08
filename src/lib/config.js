@@ -8,12 +8,17 @@ export const PROJECTS_DIR = path.join(DATA_DIR, 'projects');
 export const VOICES_DIR = path.join(DATA_DIR, 'voices');
 export const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 export const TMP_DIR = path.join(DATA_DIR, '.tmp');
+export const VOICE_SOURCES_DIR = path.join(TMP_DIR, 'voice-sources');
+export const VOICE_CLIPS_DIR = path.join(TMP_DIR, 'voice-clips');
 export const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 export const SCRIPT_SCHEMA_PATH = path.join(ROOT_DIR, 'schemas', 'audiobook-script.schema.json');
 
 export const MAX_JSON_BYTES = 40 * 1024 * 1024;
 export const MAX_BOOK_BYTES = 30 * 1024 * 1024;
 export const MAX_VOICE_BYTES = 25 * 1024 * 1024;
+export const MAX_VOICE_SOURCE_BYTES = 1024 * 1024 * 1024;
+export const MIN_VOICE_CLIP_MS = 3_000;
+export const MAX_VOICE_CLIP_MS = 60_000;
 
 export const EMOTIONS = [
   { id: 'neutral', label: '平静', glyph: '—' },

@@ -245,7 +245,28 @@ export async function getVoice(voiceId) {
   return voice;
 }
 
-export async function createVoice({ name, tags = [], language = 'zh-CN', transcript = '', kind = 'recorded', consent = false, audio }) {
+function normalizeVoiceProvenance(value) {
+  if (!value || typeof value !== 'object') return null;
+  const type = value.type === 'audio' ? 'audio' : value.type === 'video' ? 'video' : null;
+  const sha256 = String(value.sha256 || '').toLowerCase();
+  const startMs = Number(value.startMs);
+  const endMs = Number(value.endMs);
+  if (!type || !/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || startMs < 0 || endMs <= startMs) {
+    return null;
+  }
+  return {
+    type,
+    originalFileName: safeName(value.originalFileName, `source.${type === 'video' ? 'mp4' : 'wav'}`),
+    sha256,
+    bytes: Math.max(0, Math.round(Number(value.bytes) || 0)),
+    startMs,
+    endMs
+  };
+}
+
+export async function createVoice({
+  name, tags = [], language = 'zh-CN', transcript = '', kind = 'recorded', consent = false, audio, provenance = null
+}) {
   if (!consent) throw Object.assign(new Error('请确认你有权使用该声音样本'), { statusCode: 400 });
   const voiceId = id('voice');
   const versionId = id('voicever');
@@ -263,6 +284,11 @@ export async function createVoice({ name, tags = [], language = 'zh-CN', transcr
       transcript: String(transcript || '').trim(),
       sha256: crypto.createHash('sha256').update(audio.buffer).digest('hex')
     };
+    if (Number.isFinite(Number(audio.durationMs)) && Number(audio.durationMs) > 0) reference.durationMs = Math.round(Number(audio.durationMs));
+    if (Number.isSafeInteger(Number(audio.sampleRate)) && Number(audio.sampleRate) > 0) reference.sampleRate = Number(audio.sampleRate);
+    if (Number.isSafeInteger(Number(audio.channels)) && Number(audio.channels) > 0) reference.channels = Number(audio.channels);
+    const normalizedProvenance = normalizeVoiceProvenance(provenance);
+    if (normalizedProvenance) reference.source = normalizedProvenance;
   }
   const timestamp = nowIso();
   const voice = {

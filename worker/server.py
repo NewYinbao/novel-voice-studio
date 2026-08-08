@@ -13,6 +13,13 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+from audio_extract import (
+    AudioExtractRequest,
+    AudioExtractTimeout,
+    AudioProbeError,
+    AudioToolUnavailable,
+    extract_audio_segment,
+)
 from providers.cosyvoice import CosyVoiceProvider
 from providers.qwen3_tts import Qwen3TTSProvider
 
@@ -182,7 +189,22 @@ def health() -> dict[str, Any]:
             "qwen3_tts": importlib.util.find_spec("qwen_tts") is not None,
         },
         "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffprobe": shutil.which("ffprobe") is not None,
     }
+
+
+@app.post("/v1/audio/extract")
+def extract_audio(request: AudioExtractRequest) -> dict[str, Any]:
+    try:
+        return extract_audio_segment(request, DATA_DIR)
+    except AudioExtractTimeout as error:
+        raise HTTPException(status_code=504, detail=str(error)) from error
+    except (ValueError, AudioProbeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except AudioToolUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.post("/v1/tts")

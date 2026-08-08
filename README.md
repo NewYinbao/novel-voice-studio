@@ -10,9 +10,9 @@
 - 中文章节标题识别，无标题长文自动按段落安全切块。
 - 三档剧本策略：忠实朗读、轻度剧本化、广播剧化。
 - 本地规则引擎可立即识别引号对白、推断角色并标注情绪；低置信度结果会标为“待确认”。
-- Codex CLI 结构化输出接口，以及“复制任务提示词 → 导入 JSON”的可靠交接模式。
+- Codex 多轮剧本协作室：持久 session、模型选择、对话微调、逐句人工编辑，以及任务包手工交接。
 - 多角色编辑器：说话人、朗读文本、情绪、强度、语速、停顿均可局部修改。
-- 音色库：麦克风录制、已授权音频或开源音色样本导入、参考文本、标签和授权/许可证确认。
+- 音色库：麦克风录制、短音频导入，以及从长视频/音频中定位、试听并裁剪 3–60 秒素材；保留参考文本、标签、授权确认和来源区间。
 - 角色—音色绑定，单句/本章/整书 TTS 队列，按句缓存和失败隔离。
 - 本机 GPU、显存、内存、工具和工作器检测；按效果/速度偏好自动选模型。
 - 真实模型离线时可生成明确标记的“演示音轨”，用来验收队列、播放器和导出流程。
@@ -112,6 +112,17 @@ npm start
 
 工作器监听 `127.0.0.1:7861`，健康检查为 `http://127.0.0.1:7861/health`。
 
+### 从长视频或音频制作音色
+
+进入“音色库”并选择“制作新音色 → 从长媒体裁剪”：
+
+1. 选择本机视频或音频，在浏览器中预览并定位说话片段。
+2. 用“取当前”设置起点和终点，或直接输入秒数；片段须为 3–60 秒，建议 10–30 秒。
+3. 试听选中范围，确认只包含一位说话人、背景声尽量少，并逐字填写该片段的准确台词。
+4. 确认声音与素材授权后提交。原文件以二进制流上传到本机服务，工作器用 FFmpeg/FFprobe 标准化提取为 24kHz 单声道 PCM WAV，再加入音色库。
+
+单个长媒体默认上限为 1GB，不使用 Base64、不会整体读入内存；裁剪任务串行执行。提交成功或失败后会清理来源和中间文件，应用重启时也会回收未完成任务的临时素材。浏览器无法预览的容器或编码需先转为 MP4、WebM、WAV、MP3 或 M4A。
+
 ### 导入默认开源测试音色
 
 应用和模型工作器启动后，可一次性导入 AISHELL-3 的两位男声和一位女声，并自动绑定到指定作品：
@@ -145,15 +156,17 @@ RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttentio
 
 ## Codex 剧本润色
 
-应用支持三种方式：
+剧本处理有四条路径：本地规则引擎、Codex 剧本协作室、Codex 任务包手工交接，以及本地 Ollama。润色档位与处理路径彼此独立，均可选择忠实朗读、轻度剧本化或广播剧化。
 
-1. `codex`：后端运行 `codex exec --ephemeral --sandbox read-only --output-schema ... -`。
-2. `Codex 任务包`：复制包含原文、编辑规则和结构要求的提示词，在 Codex 中处理后导回 JSON。
-3. `ollama`：把同一份 JSON Schema 发给本地 Ollama 模型。
+Codex 剧本协作室使用持久会话：首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。窗口支持每轮选择模型、查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
 
-当前这台 Windows 机器的 Codex Appx 可执行文件受 WindowsApps ACL 限制，后端无法直接启动，所以 UI 会优先展示任务包模式。该模式仍保留完整结构化校验，也不会把小说交给本地 TTS 模型以外的服务，除非你主动粘贴给 Codex。
+Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。直接协作需要先在终端完成 `codex login`。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。
 
-Codex 官方文档确认 `codex exec` 支持非交互运行、从 stdin 接收完整提示词，并通过 `--output-schema` 约束最终 JSON：[Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)。
+直接使用 Codex 会把当前章节原文以及后续轮次的当前剧本发送给已登录的 Codex 服务；本地规则和 Ollama 路径不会。任务包只有在你主动复制给 Codex 时才会离开本机。
+
+直接协作进程会在独立的空临时工作目录运行，只继承登录、网络和系统运行所需的环境变量，并忽略用户配置/规则，关闭 shell、Apps、浏览器、计算机控制、图像生成和 hooks；它只通过标准输入接收当前章节，并读取复制后的剧本 Schema。这样不会把项目目录或其他应用环境变量暴露给本轮剧本任务。
+
+Codex 官方文档确认 `codex exec` 支持 JSONL 事件、JSON Schema 结构化输出，以及 `exec resume <SESSION_ID>` 续接非交互会话：[Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) · [Developer commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli)。
 
 ## 项目结构
 
@@ -167,11 +180,14 @@ novel-voice-studio/
 │     ├─ novel.js          # 文本解码、章节拆分
 │     ├─ epub.js           # 安全的最小 EPUB 解析器
 │     ├─ script-engine.js  # 规则、Codex、Ollama 剧本 Provider
+│     ├─ codex-sessions.js # Codex 会话记录、轮次摘要与持久化边界
 │     ├─ store.js          # 原子 JSON 持久化与音色版本
 │     ├─ tts.js            # 逐句缓存、工作器调用与队列
+│     ├─ video-voice.js    # 长媒体流式上传、裁剪任务与临时素材
 │     └─ audio.js          # PCM WAV 生成、解析与拼接
 ├─ worker/
 │  ├─ server.py            # FastAPI 单 GPU 工作器
+│  ├─ audio_extract.py     # FFmpeg 安全裁剪与 24kHz 单声道标准化
 │  └─ providers/           # CosyVoice / Qwen3-TTS 适配器
 ├─ schemas/                # Codex 结构化剧本 Schema
 ├─ scripts/                # micromamba 安装与启动脚本
@@ -187,11 +203,17 @@ GET    /api/system?refresh=1
 POST   /api/projects
 POST   /api/projects/:id/import
 POST   /api/projects/:id/script
+GET    /api/projects/:id/chapters/:chapterId/codex-sessions
+POST   /api/projects/:id/chapters/:chapterId/codex-sessions
+POST   /api/projects/:id/chapters/:chapterId/codex-sessions/:sessionId/messages
 GET    /api/projects/:id/chapters/:chapterId/codex-package
 POST   /api/projects/:id/chapters/:chapterId/script-import
 PATCH  /api/projects/:id/lines/:lineId
 PATCH  /api/projects/:id/characters/:roleId
 POST   /api/voices
+POST   /api/voice-sources?fileName=...
+POST   /api/voice-sources/:sourceId/extract
+DELETE /api/voice-sources/:sourceId
 POST   /api/projects/:id/render
 POST   /api/projects/:id/export
 GET    /api/jobs/:jobId
@@ -205,7 +227,14 @@ GET    /api/jobs/:jobId
 npm run verify
 ```
 
-测试覆盖章节拆分（含标题独占一行）、标准 EPUB spine 提取、中文对白/情绪识别、硬件/已安装 Provider 路由、剧本参数边界、流式 WAV 拼接、中文编码/BOM、项目路径防护以及 HTTP API 项目创建。
+模型工作器的真实 FFmpeg 裁剪测试可在隔离环境中运行：
+
+```powershell
+cd .\worker
+& "$env:USERPROFILE\micromamba-root\envs\novel-voice\python.exe" -m unittest discover -s tests -v
+```
+
+测试覆盖章节拆分（含标题独占一行）、标准 EPUB spine 提取、中文对白/情绪识别、Codex JSONL/session 续接、手工剧本带入下一轮、硬件/已安装 Provider 路由、剧本参数边界、流式 WAV 拼接、中文编码/BOM、项目路径防护、长媒体流式限额、裁剪范围、原子 claim/delete、媒体任务串行化、成功/失败清理以及真实 FFmpeg 输出格式。
 
 ## Git 与本地数据
 
