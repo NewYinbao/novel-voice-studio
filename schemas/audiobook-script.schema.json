@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["chapterTitle", "roles", "scenes", "warnings"],
+  "properties": {
+    "chapterTitle": { "type": "string" },
+    "roles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "aliases", "description", "isNarrator"],
+        "properties": {
+          "name": { "type": "string" },
+          "aliases": { "type": "array", "items": { "type": "string" } },
+          "description": { "type": "string" },
+          "isNarrator": { "type": "boolean" }
+        }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "context", "lines"],
+        "properties": {
+          "title": { "type": "string" },
+          "context": { "type": "string" },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "speaker", "sourceText", "spokenText", "emotion", "emotionNote", "intensity", "pace", "pauseAfterMs", "confidence", "needsReview"],
+              "properties": {
+                "kind": { "enum": ["narration", "dialogue", "sfx", "pause", "stage_direction"] },
+                "speaker": { "type": "string" },
+                "sourceText": { "type": "string" },
+                "spokenText": { "type": "string" },
+                "emotion": { "enum": ["neutral", "warm", "joy", "sad", "angry", "fear", "surprise", "whisper", "solemn"] },
+                "emotionNote": { "type": "string" },
+                "intensity": { "type": "number", "minimum": 0, "maximum": 1 },
+                "pace": { "type": "number", "minimum": 0.6, "maximum": 1.6 },
+                "pauseAfterMs": { "type": "integer", "minimum": 0, "maximum": 5000 },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "needsReview": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  }
+}

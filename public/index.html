@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0e0e">
+  <title>声绘 Studio · 本地有声书制作台</title>
+  <link rel="stylesheet" href="/styles.css?v=0.1.0-2">
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="app-shell">
+    <header class="topbar">
+      <button class="brand" data-nav="projects" aria-label="返回项目">
+        <span class="brand-mark" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i>
+        </span>
+        <span class="brand-copy"><strong>声绘</strong><small>STUDIO</small></span>
+      </button>
+      <nav class="main-nav" aria-label="主导航">
+        <button data-nav="projects" class="active"><span class="nav-icon">⌂</span>项目</button>
+        <button data-nav="studio"><span class="nav-icon">◫</span>制作台</button>
+        <button data-nav="voices"><span class="nav-icon">◉</span>音色库</button>
+        <button data-nav="models"><span class="nav-icon">◇</span>模型中心</button>
+      </nav>
+      <div class="top-actions">
+        <button class="status-orb" data-action="open-jobs" aria-label="打开任务队列">
+          <span class="pulse-dot"></span><span class="status-label">本地工作台</span>
+          <span class="job-count" id="job-count">0</span>
+        </button>
+        <button class="icon-button" data-nav="models" aria-label="设置">⚙</button>
+      </div>
+    </header>
+    <main id="app-main" class="app-main">
+      <div class="boot-screen">
+        <div class="boot-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <p>正在唤醒本地工作台…</p>
+      </div>
+    </main>
+  </div>
+
+  <aside class="job-drawer" id="job-drawer" aria-hidden="true" inert>
+    <div class="drawer-head">
+      <div><span class="eyebrow">PRODUCTION</span><h2>任务队列</h2></div>
+      <button class="icon-button" data-action="close-jobs" aria-label="关闭">×</button>
+    </div>
+    <div id="job-list" class="job-list"></div>
+  </aside>
+  <div class="drawer-scrim" id="drawer-scrim" data-action="close-jobs"></div>
+
+  <div class="transport" id="transport" hidden>
+    <div class="transport-meta">
+      <span class="mini-avatar">旁</span>
+      <div><strong id="transport-title">尚未选择片段</strong><small id="transport-subtitle">选择一句台词开始试听</small></div>
+    </div>
+    <div class="transport-controls">
+      <button aria-label="上一句" data-action="previous-line">‹</button>
+      <button class="play-main" aria-label="播放" data-action="play-current">▶</button>
+      <button aria-label="下一句" data-action="next-line">›</button>
+    </div>
+    <div class="transport-timeline"><span id="transport-progress"></span></div>
+    <time id="transport-time">00:00 / 00:00</time>
+    <audio id="audio-player" preload="metadata"></audio>
+  </div>
+
+  <div id="modal-root"></div>
+  <div class="toast-stack" id="toast-stack" aria-live="assertive"></div>
+  <input type="file" id="book-file-input" accept=".txt,.md,.markdown,.epub" hidden>
+  <script type="module" src="/app.js?v=0.1.0-2"></script>
+</body>
+</html>

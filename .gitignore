@@ -1,0 +1,45 @@
+# Local projects, novels, voice samples, renders and exports
+data/**
+!data/.gitkeep
+
+# Machine-specific runtime state and model caches
+.runtime/
+worker/.venv/
+.venv/
+worker/models/
+worker/output/
+worker/vendor/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# JavaScript tooling
+node_modules/
+coverage/
+.nyc_output/
+
+# Python tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local configuration and transient files
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+*.partial
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
