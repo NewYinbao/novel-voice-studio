@@ -1,4 +1,10 @@
 import crypto from 'node:crypto';
+import { normalizeCodexDetailLevel, sanitizeCodexActivitySummary } from './codex-activity.js';
+import {
+  normalizeCodexModel,
+  normalizeCodexReasoningEffort,
+  normalizeCodexTimeoutMinutes
+} from './codex-options.js';
 
 const PROGRESS_ID_PATTERN = /^codexprog_[0-9a-f]{32}$/;
 const LAST_EVENT_ID_PATTERN = /^(?:0|[1-9][0-9]{0,9})$/;
@@ -18,11 +24,23 @@ const EVENT_DEFINITIONS = Object.freeze({
   'failed:failed': { message: '本轮剧本协作未完成，请检查 Codex 状态后重试。', state: 'failed', terminal: true }
 });
 
+const ACTIVITY_DEFINITIONS = Object.freeze({
+  reasoning_summary: { phase: 'reasoning_summary', message: 'Codex 更新了简短分析摘要。' },
+  command: { phase: 'activity', message: '正在执行受控本地操作。' },
+  file: { phase: 'activity', message: '正在处理工作文件。' },
+  mcp: { phase: 'activity', message: '正在调用受控连接器。' },
+  web: { phase: 'activity', message: '正在执行受控信息检索。' },
+  collaboration: { phase: 'activity', message: '正在协调协作步骤。' },
+  plan: { phase: 'activity', message: '正在更新处理计划。' },
+  tool: { phase: 'activity', message: '正在执行受控工具操作。' }
+});
+
 const SAFE_FAILURE_CODES = new Set([
   'CODEX_AUTH_REQUIRED', 'CODEX_CANCELLED', 'CODEX_CHAPTER_CHANGED', 'CODEX_FAILED', 'CODEX_INPUT_INVALID',
   'CODEX_JSONL_INVALID', 'CODEX_OUTPUT_TOO_LARGE', 'CODEX_RESPONSE_EMPTY',
   'CODEX_RESPONSE_MISSING', 'CODEX_SESSION_MISSING', 'CODEX_STDIN_FAILED',
-  'CODEX_THREAD_MISSING', 'CODEX_TIMEOUT', 'CODEX_TURN_FAILED', 'CODEX_UNAVAILABLE',
+  'CODEX_THREAD_MISSING', 'CODEX_TIMEOUT', 'CODEX_TIMEOUT_ACTIVE', 'CODEX_TIMEOUT_STARTING',
+  'CODEX_TURN_FAILED', 'CODEX_UNAVAILABLE',
   'SCRIPT_SCHEMA_INVALID'
 ]);
 
@@ -35,6 +53,20 @@ function safeFailureCode(value) {
   return SAFE_FAILURE_CODES.has(code) ? code : 'CODEX_REQUEST_FAILED';
 }
 
+function safeEventMessage(definition, type, code, timeoutMinutes) {
+  if (type !== 'failed') return definition.message;
+  if (code === 'CODEX_TIMEOUT_ACTIVE') {
+    return `Codex 已开始生成，但未在 ${timeoutMinutes} 分钟内完成。`;
+  }
+  if (code === 'CODEX_TIMEOUT_STARTING') {
+    return `Codex 未能在 ${timeoutMinutes} 分钟内开始响应。`;
+  }
+  if (code === 'CODEX_TIMEOUT') {
+    return `Codex 未能在 ${timeoutMinutes} 分钟内完成处理。`;
+  }
+  return definition.message;
+}
+
 function isoTime(value) {
   return new Date(value).toISOString();
 }
@@ -44,10 +76,20 @@ function eventsUrl(record) {
 }
 
 function safeSnapshot(record, now) {
-  const latest = record.events.at(-1);
+  let latest;
+  for (let index = record.events.length - 1; index >= 0; index -= 1) {
+    if (record.events[index].type !== 'activity') {
+      latest = record.events[index];
+      break;
+    }
+  }
   const elapsedUntil = record.terminal ? record.updatedAt : now;
-  return {
+  const snapshot = {
     progressId: record.id,
+    detailLevel: record.detailLevel,
+    model: record.model,
+    reasoningEffort: record.reasoningEffort,
+    timeoutMinutes: record.timeoutMinutes,
     state: record.state,
     phase: latest?.phase || 'waiting',
     message: latest?.message || EVENT_DEFINITIONS['queued:waiting'].message,
@@ -57,6 +99,10 @@ function safeSnapshot(record, now) {
     terminal: record.terminal,
     eventsUrl: eventsUrl(record)
   };
+  if (latest?.type === 'failed' && latest.data?.code) {
+    snapshot.code = safeFailureCode(latest.data.code);
+  }
+  return snapshot;
 }
 
 function serializeFrame(event) {
@@ -84,10 +130,14 @@ export class CodexProgressManager {
   constructor({
     now = Date.now,
     terminalTtlMs = 10 * 60_000,
+    summaryTerminalTtlMs = 2 * 60_000,
     maxRecords = 128,
     maxActive = 4,
     maxActivePerChapter = 1,
     maxEvents = 96,
+    maxActivityEvents = 24,
+    maxActivityTextBytes = 8 * 1024,
+    activityIntervalMs = 500,
     maxSubscribers = 8,
     maxPendingFrames = 12,
     heartbeatMs = 15_000,
@@ -96,10 +146,14 @@ export class CodexProgressManager {
   } = {}) {
     this.now = now;
     this.terminalTtlMs = Math.max(1_000, Number(terminalTtlMs) || 10 * 60_000);
+    this.summaryTerminalTtlMs = Math.max(1_000, Number(summaryTerminalTtlMs) || 2 * 60_000);
     this.maxRecords = Math.max(4, Number(maxRecords) || 128);
     this.maxActive = Math.max(1, Number(maxActive) || 4);
     this.maxActivePerChapter = Math.max(1, Number(maxActivePerChapter) || 1);
     this.maxEvents = Math.max(8, Number(maxEvents) || 96);
+    this.maxActivityEvents = Math.max(1, Math.min(24, Number(maxActivityEvents) || 24));
+    this.maxActivityTextBytes = Math.max(256, Math.min(8 * 1024, Number(maxActivityTextBytes) || 8 * 1024));
+    this.activityIntervalMs = Math.max(500, Number(activityIntervalMs) || 500);
     this.maxSubscribers = Math.max(1, Number(maxSubscribers) || 8);
     this.maxPendingFrames = Math.max(1, Number(maxPendingFrames) || 12);
     this.heartbeatMs = Math.max(1_000, Number(heartbeatMs) || 15_000);
@@ -107,7 +161,10 @@ export class CodexProgressManager {
     this.clearIntervalFn = clearIntervalFn;
     this.records = new Map();
     this.closed = false;
-    this.cleanupTimer = this.setIntervalFn(() => this.prune(), Math.min(60_000, this.terminalTtlMs));
+    this.cleanupTimer = this.setIntervalFn(
+      () => this.prune(),
+      Math.min(60_000, this.terminalTtlMs, this.summaryTerminalTtlMs)
+    );
     this.cleanupTimer?.unref?.();
   }
 
@@ -118,10 +175,14 @@ export class CodexProgressManager {
     }
   }
 
-  create({ projectId, chapterId }) {
+  create({ projectId, chapterId, detailLevel, model, reasoningEffort, timeoutMinutes } = {}) {
     if (this.closed) throw httpError('Codex 进度服务正在关闭。', 503, 'CODEX_PROGRESS_UNAVAILABLE');
     const ownerProjectId = String(projectId || '');
     const ownerChapterId = String(chapterId || '');
+    const normalizedDetailLevel = normalizeCodexDetailLevel(detailLevel);
+    const normalizedModel = normalizeCodexModel(model);
+    const normalizedReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
+    const normalizedTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
     if (!ownerProjectId || !ownerChapterId) {
       throw httpError('Codex 进度缺少项目或章节边界。', 400, 'CODEX_PROGRESS_SCOPE_INVALID');
     }
@@ -151,6 +212,10 @@ export class CodexProgressManager {
       id: `codexprog_${crypto.randomBytes(16).toString('hex')}`,
       projectId: ownerProjectId,
       chapterId: ownerChapterId,
+      detailLevel: normalizedDetailLevel,
+      model: normalizedModel,
+      reasoningEffort: normalizedReasoningEffort,
+      timeoutMinutes: normalizedTimeoutMinutes,
       state: 'queued',
       startedAt: timestamp,
       updatedAt: timestamp,
@@ -159,6 +224,10 @@ export class CodexProgressManager {
       nextEventId: 1,
       events: [],
       subscribers: new Set(),
+      activityCount: 0,
+      activityTextBytes: 0,
+      activityKeys: new Set(),
+      lastActivityAt: Number.NEGATIVE_INFINITY,
       controller: new AbortController(),
       task: null
     };
@@ -167,16 +236,41 @@ export class CodexProgressManager {
     return safeSnapshot(record, this.now());
   }
 
-  publish(progressId, { type, phase, code } = {}) {
+  publish(progressId, { type, phase, code, category, text } = {}) {
     const record = this.records.get(String(progressId || ''));
     if (!record || record.terminal) return null;
     const normalizedType = String(type || '');
     const normalizedPhase = String(phase || '');
-    const definition = EVENT_DEFINITIONS[`${normalizedType}:${normalizedPhase}`];
+    const normalizedCategory = String(category || '');
+    const activityDefinition = normalizedType === 'activity' ? ACTIVITY_DEFINITIONS[normalizedCategory] : null;
+    const isActivity = Boolean(
+      activityDefinition && record.detailLevel === 'summary' && activityDefinition.phase === normalizedPhase
+    );
+    const definition = isActivity
+      ? { ...activityDefinition, state: 'running' }
+      : EVENT_DEFINITIONS[`${normalizedType}:${normalizedPhase}`];
     if (!definition) return safeSnapshot(record, this.now());
 
+    let safeText;
+    let activityKey;
+    if (normalizedType === 'activity') {
+      if (!isActivity) return safeSnapshot(record, this.now());
+      safeText = normalizedCategory === 'reasoning_summary'
+        ? sanitizeCodexActivitySummary(text)
+        : undefined;
+      if (normalizedCategory === 'reasoning_summary' && !safeText) return safeSnapshot(record, this.now());
+      activityKey = `${normalizedCategory}:${safeText || ''}`;
+      if (record.activityKeys.has(activityKey)) return safeSnapshot(record, this.now());
+      if (record.activityCount >= this.maxActivityEvents) return safeSnapshot(record, this.now());
+      const activityTextBytes = safeText ? Buffer.byteLength(safeText, 'utf8') : 0;
+      if (record.activityTextBytes + activityTextBytes > this.maxActivityTextBytes) {
+        return safeSnapshot(record, this.now());
+      }
+      if (this.now() - record.lastActivityAt < this.activityIntervalMs) return safeSnapshot(record, this.now());
+    }
+
     const previous = record.events.at(-1);
-    if (!definition.terminal && previous?.type === normalizedType && previous?.phase === normalizedPhase) {
+    if (!isActivity && !definition.terminal && previous?.type === normalizedType && previous?.phase === normalizedPhase) {
       return safeSnapshot(record, this.now());
     }
     // Keep one slot reserved for a terminal event; extra CLI updates are intentionally dropped.
@@ -185,27 +279,49 @@ export class CodexProgressManager {
     }
 
     const timestamp = this.now();
+    const failureCode = normalizedType === 'failed' ? safeFailureCode(code) : undefined;
+    const publicMessage = safeEventMessage(
+      definition, normalizedType, failureCode, record.timeoutMinutes
+    );
     const data = {
       progressId: record.id,
       type: normalizedType,
       phase: normalizedPhase,
-      message: definition.message,
+      message: publicMessage,
+      timeoutMinutes: record.timeoutMinutes,
       elapsedMs: Math.max(0, Math.min(86_400_000, timestamp - record.startedAt)),
       at: isoTime(timestamp),
       terminal: Boolean(definition.terminal)
     };
-    if (normalizedType === 'failed') data.code = safeFailureCode(code);
-    // Fixed definitions keep this far below the limit; retain a hard serialized bound as defense in depth.
-    if (JSON.stringify(data).length > 1_024) return safeSnapshot(record, timestamp);
-
-    const event = { id: record.nextEventId, type: normalizedType, phase: normalizedPhase, message: definition.message, data };
+    if (isActivity) {
+      data.category = normalizedCategory;
+      if (safeText) data.text = safeText;
+    }
+    if (failureCode) data.code = failureCode;
+    const event = {
+      id: record.nextEventId,
+      type: normalizedType,
+      phase: normalizedPhase,
+      message: publicMessage,
+      data
+    };
+    // The full SSE frame, not merely its JSON payload, is bounded to one KiB.
+    if (Buffer.byteLength(serializeFrame(event), 'utf8') > 1_024) return safeSnapshot(record, timestamp);
     record.nextEventId += 1;
     record.events.push(event);
+    if (isActivity) {
+      record.activityCount += 1;
+      record.activityTextBytes += safeText ? Buffer.byteLength(safeText, 'utf8') : 0;
+      record.activityKeys.add(activityKey);
+      record.lastActivityAt = timestamp;
+    }
     record.state = definition.state;
     record.updatedAt = timestamp;
     if (definition.terminal) {
       record.terminal = true;
-      record.expiresAt = timestamp + this.terminalTtlMs;
+      record.expiresAt = timestamp + (
+        record.detailLevel === 'summary' ? this.summaryTerminalTtlMs : this.terminalTtlMs
+      );
     }
     for (const subscriber of [...record.subscribers]) this.#send(subscriber, event);
     return safeSnapshot(record, timestamp);

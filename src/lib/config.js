@@ -140,6 +140,8 @@ export const DEFAULT_SETTINGS = {
   qualityMode: 'balanced',
   workerUrl: 'http://127.0.0.1:7861',
   codexCommand: 'codex',
+  codexModel: 'gpt-5.6-terra',
+  codexReasoningEffort: 'medium',
   scriptProvider: 'rules',
   ollamaUrl: 'http://127.0.0.1:11434',
   ollamaModel: 'qwen3:8b',

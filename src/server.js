@@ -24,6 +24,19 @@ import {
   assertLocalHostRequest, assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
 } from './lib/codex-login.js';
 import { CodexProgressManager } from './lib/codex-progress.js';
+import {
+  codexTimeoutMinutesToMs,
+  DEFAULT_CODEX_TIMEOUT_MINUTES,
+  normalizeCodexModel,
+  normalizeCodexReasoningEffort,
+  normalizeCodexTimeoutMinutes
+} from './lib/codex-options.js';
+import {
+  codexActivitySensitiveTexts,
+  createCodexRedactionContext,
+  normalizeCodexDetailLevel,
+  sanitizeCodexActivitySummary
+} from './lib/codex-activity.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
 import {
@@ -147,11 +160,7 @@ function codexMode(value) {
 }
 
 function codexModel(value) {
-  const model = String(value || '').trim();
-  if (model.length > 100 || (model && !/^[A-Za-z0-9._:/-]+$/.test(model))) {
-    throw Object.assign(new Error('Codex 模型名称格式无效'), { statusCode: 400, code: 'CODEX_MODEL_INVALID' });
-  }
-  return model;
+  return normalizeCodexModel(value);
 }
 
 function codexPrompt(value, { required = false } = {}) {
@@ -197,15 +206,18 @@ async function assertNoCodexAuthOptions(req) {
   }
 }
 
-function codexFailureStatus(error) {
+function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES) {
   const code = String(error?.code || 'CODEX_REQUEST_FAILED').toUpperCase();
+  const safeTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
   const statusCode = error?.statusCode
-    || (code === 'CODEX_TIMEOUT' ? 504 : code === 'CODEX_UNAVAILABLE' ? 503 : 502);
+    || (code.startsWith('CODEX_TIMEOUT') ? 504 : code === 'CODEX_UNAVAILABLE' ? 503 : 502);
   const messages = {
     CODEX_AUTH_REQUIRED: 'Codex CLI 尚未登录，请先完成本机登录。',
     CODEX_CANCELLED: 'Codex 请求已因服务关闭而取消。',
     CODEX_CHAPTER_CHANGED: '处理期间本章已被修改，本轮结果没有覆盖最新内容。',
-    CODEX_TIMEOUT: 'Codex 处理超时，请稍后重试。',
+    CODEX_TIMEOUT: `Codex 未能在 ${safeTimeoutMinutes} 分钟内完成处理，请稍后重试。`,
+    CODEX_TIMEOUT_ACTIVE: `Codex 已开始生成，但未在 ${safeTimeoutMinutes} 分钟内完成，请缩短章节、降低推理强度或延长超时后重试。`,
+    CODEX_TIMEOUT_STARTING: `Codex 未能在 ${safeTimeoutMinutes} 分钟内开始响应，请检查网络、登录状态和模型可用性。`,
     CODEX_UNAVAILABLE: 'Codex CLI 当前不可用，请检查模型中心状态。',
     SCRIPT_SCHEMA_INVALID: 'Codex 返回的剧本结构未通过校验，当前章节未被覆盖。'
   };
@@ -226,7 +238,15 @@ function codexAsyncRequested(body) {
 }
 
 function codexAccepted(progress) {
-  return { progressId: progress.progressId, state: progress.state, eventsUrl: progress.eventsUrl };
+  return {
+    progressId: progress.progressId,
+    detailLevel: progress.detailLevel,
+    model: progress.model,
+    reasoningEffort: progress.reasoningEffort,
+    timeoutMinutes: progress.timeoutMinutes,
+    state: progress.state,
+    eventsUrl: progress.eventsUrl
+  };
 }
 
 function assertCodexRunActive(signal) {
@@ -258,11 +278,34 @@ const CODEX_RUNNER_PROGRESS = new Set([
   'stage:analyzing', 'stage:drafting', 'stage:processing', 'stage:validating'
 ]);
 
-function publishCodexRunnerProgress(progressManager, progressId, event) {
+const CODEX_RUNNER_ACTIVITY = new Map([
+  ['reasoning_summary:reasoning_summary', 'reasoning_summary'],
+  ['activity:command', 'command'],
+  ['activity:file', 'file'],
+  ['activity:mcp', 'mcp'],
+  ['activity:web', 'web'],
+  ['activity:collaboration', 'collaboration'],
+  ['activity:plan', 'plan'],
+  ['activity:tool', 'tool']
+]);
+
+function publishCodexRunnerProgress(progressManager, progressId, event, redactionContext) {
   const type = typeof event?.type === 'string' ? event.type : '';
   const phase = typeof event?.phase === 'string' ? event.phase : '';
-  if (!CODEX_RUNNER_PROGRESS.has(`${type}:${phase}`)) return;
-  progressManager.publish(progressId, { type, phase });
+  if (CODEX_RUNNER_PROGRESS.has(`${type}:${phase}`)) {
+    progressManager.publish(progressId, { type, phase });
+    return;
+  }
+  if (type !== 'activity') return;
+  const category = typeof event?.category === 'string' ? event.category : '';
+  if (CODEX_RUNNER_ACTIVITY.get(`${phase}:${category}`) !== category) return;
+  if (category === 'reasoning_summary') {
+    const safeText = sanitizeCodexActivitySummary(event?.text, { redactionContext });
+    if (!safeText) return;
+    progressManager.publish(progressId, { type: 'activity', phase: 'reasoning_summary', category, text: safeText });
+    return;
+  }
+  progressManager.publish(progressId, { type: 'activity', phase: 'activity', category });
 }
 
 function assertUsableScript(script, chapter, statusCode = 422) {
@@ -541,11 +584,26 @@ async function handleApi(req, res, url, {
   if (params && method === 'POST') {
     assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    const detailLevel = normalizeCodexDetailLevel(body.detailLevel);
     const prompt = codexPrompt(body.prompt, { required: true });
     const scopeProject = await getProject(params.projectId);
     const scopeChapter = findChapter(scopeProject, params.chapterId);
-    findCodexSession(scopeChapter, params.sessionId);
-    const progress = progressManager.create(params);
+    const scopeSession = findCodexSession(scopeChapter, params.sessionId);
+    const model = codexModel(Object.hasOwn(body, 'model') ? body.model : scopeSession.model);
+    const reasoningEffort = normalizeCodexReasoningEffort(
+      Object.hasOwn(body, 'reasoningEffort') ? body.reasoningEffort : scopeSession.reasoningEffort
+    );
+    let inheritedTimeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES;
+    try { inheritedTimeoutMinutes = normalizeCodexTimeoutMinutes(scopeSession.timeoutMinutes); } catch { /* legacy */ }
+    const timeoutMinutes = normalizeCodexTimeoutMinutes(
+      body.timeoutMinutes === undefined || body.timeoutMinutes === null
+        ? inheritedTimeoutMinutes
+        : body.timeoutMinutes
+    );
+    const timeoutMs = codexTimeoutMinutesToMs(timeoutMinutes);
+    const progress = progressManager.create({
+      ...params, detailLevel, model, reasoningEffort, timeoutMinutes
+    });
     const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
     const operation = () => withCodexSessionLock(lockKey, async () => {
@@ -561,13 +619,19 @@ async function handleApi(req, res, url, {
           statusCode: 409, code: 'CODEX_THREAD_MISSING'
         });
       }
-      const model = codexModel(Object.hasOwn(body, 'model') ? body.model : session.model);
+      const redactionContext = detailLevel === 'summary'
+        ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
+        : undefined;
       assertCodexRunActive(signal);
       const turn = await codexRunner({
         chapter, project, settings, mode: session.mode, model,
         sessionId: session.codexThreadId, prompt,
+        detailLevel, reasoningEffort,
+        timeoutMinutes, timeoutMs,
         signal,
-        onProgress: (event) => publishCodexRunnerProgress(progressManager, progress.progressId, event)
+        onProgress: (event) => publishCodexRunnerProgress(
+          progressManager, progress.progressId, event, redactionContext
+        )
       });
       assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
@@ -578,7 +642,9 @@ async function handleApi(req, res, url, {
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
         const targetSession = findCodexSession(targetChapter, params.sessionId);
         applyScript(draft, targetChapter, turn.script);
-        appendCodexTurn(targetSession, { prompt, model, script: turn.script, usage: turn.usage });
+        appendCodexTurn(targetSession, {
+          prompt, model, reasoningEffort, timeoutMinutes, script: turn.script, usage: turn.usage
+        });
         saveCodexSession(targetChapter, targetSession);
         pruneUnusedRoles(draft);
         draft.status = 'scripted';
@@ -592,9 +658,12 @@ async function handleApi(req, res, url, {
     try {
       const result = await trackCodexOperation(progressManager, progress, params, operation);
       progressManager.complete(progress.progressId);
-      return json(res, 200, { ...result, project: publicProject(result.project), progressId: progress.progressId });
+      return json(res, 200, {
+        ...result, project: publicProject(result.project), progressId: progress.progressId,
+        detailLevel, model, reasoningEffort, timeoutMinutes
+      });
     } catch (error) {
-      const failure = codexFailureStatus(error);
+      const failure = codexFailureStatus(error, timeoutMinutes);
       progressManager.fail(progress.progressId, failure.code);
       failure.progressId = progress.progressId;
       throw failure;
@@ -611,12 +680,18 @@ async function handleApi(req, res, url, {
   if (params && method === 'POST') {
     assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    const detailLevel = normalizeCodexDetailLevel(body.detailLevel);
     const mode = codexMode(body.mode);
     const model = codexModel(body.model);
+    const reasoningEffort = normalizeCodexReasoningEffort(body.reasoningEffort);
+    const timeoutMinutes = normalizeCodexTimeoutMinutes(body.timeoutMinutes);
+    const timeoutMs = codexTimeoutMinutesToMs(timeoutMinutes);
     const prompt = codexPrompt(body.prompt);
     const scopeProject = await getProject(params.projectId);
     findChapter(scopeProject, params.chapterId);
-    const progress = progressManager.create(params);
+    const progress = progressManager.create({
+      ...params, detailLevel, model, reasoningEffort, timeoutMinutes
+    });
     const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
     const operation = () => withCodexSessionLock(lockKey, async () => {
@@ -626,11 +701,18 @@ async function handleApi(req, res, url, {
       const project = await getProject(params.projectId);
       const chapter = findChapter(project, params.chapterId);
       const chapterVersion = codexChapterVersion(chapter);
+      const redactionContext = detailLevel === 'summary'
+        ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
+        : undefined;
       assertCodexRunActive(signal);
       const turn = await codexRunner({
         chapter, project, settings, mode, model, prompt,
+        detailLevel, reasoningEffort,
+        timeoutMinutes, timeoutMs,
         signal,
-        onProgress: (event) => publishCodexRunnerProgress(progressManager, progress.progressId, event)
+        onProgress: (event) => publishCodexRunnerProgress(
+          progressManager, progress.progressId, event, redactionContext
+        )
       });
       assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
@@ -646,7 +728,7 @@ async function handleApi(req, res, url, {
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
         applyScript(draft, targetChapter, turn.script);
         const session = createCodexSession({
-          threadId: turn.threadId, model, mode, prompt,
+          threadId: turn.threadId, model, reasoningEffort, timeoutMinutes, mode, prompt,
           script: turn.script, usage: turn.usage
         });
         saveCodexSession(targetChapter, session);
@@ -662,9 +744,12 @@ async function handleApi(req, res, url, {
     try {
       const result = await trackCodexOperation(progressManager, progress, params, operation);
       progressManager.complete(progress.progressId);
-      return json(res, 201, { ...result, project: publicProject(result.project), progressId: progress.progressId });
+      return json(res, 201, {
+        ...result, project: publicProject(result.project), progressId: progress.progressId,
+        detailLevel, model, reasoningEffort, timeoutMinutes
+      });
     } catch (error) {
-      const failure = codexFailureStatus(error);
+      const failure = codexFailureStatus(error, timeoutMinutes);
       progressManager.fail(progress.progressId, failure.code);
       failure.progressId = progress.progressId;
       throw failure;

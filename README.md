@@ -10,7 +10,7 @@
 - 中文章节标题识别，无标题长文自动按段落安全切块。
 - 三档剧本策略：忠实朗读、轻度剧本化、广播剧化。
 - 本地规则引擎可立即识别引号对白、推断角色并标注情绪；低置信度结果会标为“待确认”。
-- Codex 多轮剧本协作室：持久 session、模型选择、对话微调、可恢复的后台进度、逐句人工编辑，以及任务包手工交接。
+- Codex 多轮剧本协作室：持久 session、模型选择、对话微调、可恢复的后台进度、可选推理摘要与活动日志、逐句人工编辑，以及任务包手工交接。
 - 多角色编辑器：说话人、朗读文本、情绪、强度、语速、停顿均可局部修改。
 - 音色库：麦克风录制、短音频导入，以及从长视频/音频中定位、试听并裁剪 3–60 秒素材；保留参考文本、标签、授权确认和来源区间。
 - 角色—音色绑定，单句/本章/整书 TTS 队列，按句缓存和失败隔离。
@@ -158,9 +158,13 @@ RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttentio
 
 剧本处理有四条路径：本地规则引擎、Codex 剧本协作室、Codex 任务包手工交接，以及本地 Ollama。润色档位与处理路径彼此独立，均可选择忠实朗读、轻度剧本化或广播剧化。
 
-Codex 剧本协作室使用持久会话：首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。窗口支持每轮选择模型、查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
+Codex 剧本协作室使用持久会话：首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。窗口支持每轮选择模型、推理强度和超时时间，查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
 
-协作室可选择是否显示实时处理进度。发送后任务会转到后台执行，页面通过可断线恢复的事件流展示排队、准备、分析、结构化校验和保存等安全阶段摘要；隐藏面板、关闭协作窗口或刷新页面都不会取消任务。进度摘要不是模型隐藏思维链，不会包含原始推理、小说正文、提示词、命令、文件路径、Codex thread ID 或令牌信息。
+新会话默认显式使用 `gpt-5.6-terra` 与 `medium`，不会受用户级 `config.toml` 中的模型或推理强度影响。界面可选择 `low`、`medium`、`high`、`xhigh` 或 `max`；其中 `medium` 是质量与速度的推荐平衡点，`max` 最慢，只适合质量优先的困难章节。模型、推理强度和超时时间会随会话保存，并在任务进度卡中显示本轮实际快照。
+
+协作室可选择是否显示实时处理进度，并可为新任务显式开启“推理摘要与活动日志”。发送后任务会转到后台执行，页面通过可断线恢复的事件流展示排队、准备、分析、结构化校验和保存等阶段；详细模式还会追加 Codex 提供且经过脱敏、限长的模型推理摘要，以及命令、文件、MCP、搜索、协作和计划等固定类别活动。推理摘要不是模型隐藏思维链；原始 reasoning tokens、最终剧本 JSON、命令参数、工具结果、小说正文片段、提示词、文件路径、Codex thread ID 和令牌不会进入日志。详细日志只在本机内存中短暂保留，不写入项目或会话数据；隐藏面板、关闭协作窗口或刷新页面都不会取消任务。
+
+单轮 Codex 子进程默认保留 10 分钟硬上限；长章节可在协作室按轮调整为 5–120 分钟，但不会允许无限运行。超时时若还没有收到合法 JSONL 事件，界面提示优先检查网络、登录和模型可用性；若已经收到事件，则提示降低推理强度、缩短章节或适当延长本轮上限。两种情况都会终止本轮进程、保留当前剧本并释放章节锁，之后可以直接重试。CLI 启动探测、临时 Schema 准备以及最终校验/保存不计入所选子进程时限，因此用户看到的总墙钟时间可能略长。
 
 Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。未登录时，可在 Codex 剧本协作室或模型中心点击“登录 Codex”：本地服务会启动官方 `codex login` 浏览器认证，并在界面中等待结果。若 CLI 没有自动唤起系统浏览器，工作台会从 CLI 输出中提取、严格校验本次临时的 OpenAI 官方授权地址，再打开独立标签页；弹窗内也会保留手动打开入口。授权地址只存在于当前登录进程的内存中，完成、取消或超时后立即清除。账号、密码、验证码和令牌始终由 OpenAI 登录页与 Codex CLI 处理，不会进入本项目的页面、日志或项目数据。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。认证方式见 [OpenAI Authentication](https://learn.chatgpt.com/docs/auth)。
 
@@ -168,7 +172,7 @@ Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动
 
 直接协作进程会在独立的空临时工作目录运行，只继承登录、网络和系统运行所需的环境变量，并忽略用户配置/规则，关闭 shell、Apps、浏览器、计算机控制、图像生成和 hooks；它只通过标准输入接收当前章节，并读取复制后的剧本 Schema。这样不会把项目目录或其他应用环境变量暴露给本轮剧本任务。
 
-Codex 官方文档确认 `codex exec` 支持 JSONL 事件、JSON Schema 结构化输出，以及 `exec resume <SESSION_ID>` 续接非交互会话：[Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) · [Developer commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli)。
+Codex 官方文档确认 `codex exec` 支持 JSONL 事件、JSON Schema 结构化输出，以及 `exec resume <SESSION_ID>` 续接非交互会话；GPT-5.6 指南将 Terra 定位为平衡型模型，并建议从 `medium` 推理强度开始：[Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) · [Developer commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli) · [GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)。
 
 ## 项目结构
 

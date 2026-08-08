@@ -1,4 +1,9 @@
 import { id, nowIso } from './utils.js';
+import {
+  normalizeCodexModel,
+  normalizeCodexReasoningEffort,
+  normalizeCodexTimeoutMinutes
+} from './codex-options.js';
 
 const SESSION_ID_PATTERN = /^codexchat_[0-9a-f]{16}$/;
 const MAX_SESSIONS_PER_CHAPTER = 8;
@@ -54,13 +59,24 @@ export function findCodexSession(chapter, sessionId) {
   return session;
 }
 
-export function createCodexSession({ threadId, model = '', mode = 'faithful', prompt = '', script, usage = null }) {
+export function createCodexSession({
+  threadId,
+  model,
+  reasoningEffort,
+  timeoutMinutes,
+  mode = 'faithful',
+  prompt = '',
+  script,
+  usage = null
+}) {
   const stats = scriptStats(script);
   const timestamp = nowIso();
   return {
     id: id('codexchat'),
     codexThreadId: cleanText(threadId, 120),
-    model: cleanText(model, 100),
+    model: normalizeCodexModel(model),
+    reasoningEffort: normalizeCodexReasoningEffort(reasoningEffort),
+    timeoutMinutes: normalizeCodexTimeoutMinutes(timeoutMinutes),
     mode: ['faithful', 'polished', 'drama'].includes(mode) ? mode : 'faithful',
     status: 'ready',
     createdAt: timestamp,
@@ -73,10 +89,13 @@ export function createCodexSession({ threadId, model = '', mode = 'faithful', pr
   };
 }
 
-export function appendCodexTurn(session, { prompt, model = '', script, usage = null }) {
+export function appendCodexTurn(session, {
+  prompt, model, reasoningEffort, timeoutMinutes, script, usage = null
+}) {
   const stats = scriptStats(script);
-  // An explicit empty model means “return to the Codex CLI default”.
-  session.model = cleanText(model, 100);
+  session.model = normalizeCodexModel(model);
+  session.reasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
+  session.timeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
   session.status = 'ready';
   session.updatedAt = nowIso();
   session.turnCount = Math.max(0, Number(session.turnCount) || 0) + 1;
@@ -100,8 +119,19 @@ export function saveCodexSession(chapter, session) {
 export function publicCodexSession(session) {
   if (!session) return null;
   const { codexThreadId: _privateThreadId, ...publicValue } = session;
+  let publicReasoningEffort = null;
+  if (publicValue.reasoningEffort !== undefined && publicValue.reasoningEffort !== null && publicValue.reasoningEffort !== '') {
+    try { publicReasoningEffort = normalizeCodexReasoningEffort(publicValue.reasoningEffort); } catch { /* legacy value */ }
+  }
+  let publicTimeoutMinutes = null;
+  if (typeof publicValue.timeoutMinutes === 'number') {
+    try { publicTimeoutMinutes = normalizeCodexTimeoutMinutes(publicValue.timeoutMinutes); } catch { /* legacy value */ }
+  }
   return {
     ...publicValue,
+    model: cleanText(publicValue.model, 100),
+    reasoningEffort: publicReasoningEffort,
+    timeoutMinutes: publicTimeoutMinutes,
     messages: Array.isArray(publicValue.messages) ? publicValue.messages.map((item) => {
       if (!item?.meta || typeof item.meta !== 'object') return { ...item };
       const { usage: _privateUsage, ...safeMeta } = item.meta;

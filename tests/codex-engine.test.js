@@ -8,13 +8,22 @@ import {
   buildCodexFollowUpPrompt,
   chapterToScriptSnapshot,
   codexProcessEnv,
+  CODEX_PROCESS_TIMEOUT_MS,
   createCodexJsonlProgressParser,
+  formatCodexTimeoutDuration,
   mapCodexJsonlProgress,
   normalizeImportedScript,
   parseCodexJsonl,
   resolveCodexModel,
   runCodexSession
 } from '../src/lib/script-engine.js';
+import {
+  codexTimeoutMinutesToMs,
+  normalizeCodexModel,
+  normalizeCodexReasoningEffort,
+  normalizeCodexTimeoutMinutes
+} from '../src/lib/codex-options.js';
+import { publicCodexSession } from '../src/lib/codex-sessions.js';
 
 test('Codex 初始会话使用 JSONL 和 Schema，且不使用 ephemeral', () => {
   const args = buildCodexExecArgs({ schemaPath: 'C:\\schemas\\script.json', model: 'gpt-test' });
@@ -22,17 +31,22 @@ test('Codex 初始会话使用 JSONL 和 Schema，且不使用 ephemeral', () =>
     'exec', '--sandbox', 'read-only', '--json', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
     '--disable', 'shell_tool', '--disable', 'apps', '--disable', 'browser_use',
     '--disable', 'computer_use', '--disable', 'image_generation', '--disable', 'hooks',
-    '--model', 'gpt-test', '--output-schema', 'C:\\schemas\\script.json', '-'
+    '--model', 'gpt-test', '-c', 'model_reasoning_effort="medium"',
+    '--output-schema', 'C:\\schemas\\script.json', '-'
   ]);
   assert.equal(args.includes('--ephemeral'), false);
 });
 
-test('Codex 续问使用指定 session ID 和同一个 Schema', () => {
-  const args = buildCodexExecArgs({ schemaPath: 'schema.json', sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53' });
+test('Codex 续问使用指定 session ID、Terra、推理强度和同一个 Schema', () => {
+  const args = buildCodexExecArgs({
+    schemaPath: 'schema.json', reasoningEffort: 'max',
+    sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53'
+  });
   assert.deepEqual(args, [
     'exec', 'resume', '--json', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
     '--disable', 'shell_tool', '--disable', 'apps', '--disable', 'browser_use',
     '--disable', 'computer_use', '--disable', 'image_generation', '--disable', 'hooks',
+    '--model', 'gpt-5.6-terra', '-c', 'model_reasoning_effort="max"',
     '--output-schema', 'schema.json', '0199a213-81c0-7800-8aa1-bbab2a035a53', '-'
   ]);
   assert.equal(args.includes('--sandbox'), false);
@@ -179,6 +193,83 @@ test('Codex runner 收到 abort 后终止受控子进程且不等待真实 CLI',
   child.stdin.destroy();
 });
 
+test('Codex 默认 10 分钟上限来自子进程 timer，所选时长超时会终止唯一受控子进程', async () => {
+  assert.equal(CODEX_PROCESS_TIMEOUT_MS, 600_000);
+  let child;
+  const run = runCodexSession({
+    project: { id: 'project_timeout' },
+    chapter: { id: 'chapter_timeout', title: '超时测试', sourceText: '测试原文。' },
+    settings: { codexCommand: 'fake-codex' },
+    timeoutMs: 10,
+    spawnProcess() {
+      child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.killCalls = 0;
+      child.kill = () => {
+        child.killCalls += 1;
+        child.signalCode = 'SIGTERM';
+        queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+        return true;
+      };
+      return child;
+    }
+  });
+  await assert.rejects(
+    run,
+    (error) => error.code === 'CODEX_TIMEOUT_STARTING'
+      && error.timeoutMs === 10
+      && /10 毫秒/.test(error.message)
+  );
+  assert.equal(child.killCalls, 1);
+  child.stdout.destroy();
+  child.stderr.destroy();
+  child.stdin.destroy();
+});
+
+test('Codex 已收到 JSONL 后超时会标记为 active 且不公开原始事件', async () => {
+  let child;
+  const run = runCodexSession({
+    project: { id: 'project_active_timeout' },
+    chapter: { id: 'chapter_active_timeout', title: '生成超时', sourceText: '测试原文。' },
+    settings: { codexCommand: 'fake-codex' },
+    timeoutMs: 10,
+    spawnProcess() {
+      child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.killCalls = 0;
+      child.kill = () => {
+        child.killCalls += 1;
+        child.signalCode = 'SIGTERM';
+        queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+        return true;
+      };
+      queueMicrotask(() => child.stdout.write(`${JSON.stringify({
+        type: 'turn.started', prompt: 'RAW-PROMPT-SECRET'
+      })}\n`));
+      return child;
+    }
+  });
+  await assert.rejects(
+    run,
+    (error) => error.code === 'CODEX_TIMEOUT_ACTIVE'
+      && error.timeoutMs === 10
+      && /10 毫秒/.test(error.message)
+      && !/RAW-PROMPT-SECRET/.test(error.message)
+  );
+  assert.equal(child.killCalls, 1);
+  child.stdout.destroy();
+  child.stderr.destroy();
+  child.stdin.destroy();
+});
+
 test('Codex 子进程只继承白名单环境变量', () => {
   const env = codexProcessEnv({
     Path: 'C:\\bin', LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
@@ -191,9 +282,65 @@ test('Codex 子进程只继承白名单环境变量', () => {
   assert.equal('APP_SECRET' in env, false);
 });
 
-test('显式空模型会回到 Codex CLI 默认，不回退到旧设置', () => {
+test('Codex 模型与推理强度由后端权威默认并拒绝参数注入', () => {
   assert.equal(resolveCodexModel(undefined, { codexModel: 'gpt-old' }), 'gpt-old');
-  assert.equal(resolveCodexModel('', { codexModel: 'gpt-old' }), '');
+  assert.equal(resolveCodexModel('', { codexModel: 'gpt-old' }), 'gpt-5.6-terra');
+  assert.equal(normalizeCodexModel(undefined), 'gpt-5.6-terra');
+  assert.equal(normalizeCodexReasoningEffort(undefined), 'medium');
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    assert.equal(normalizeCodexReasoningEffort(effort), effort);
+  }
+  for (const effort of ['none', 'minimal', 'ultra', 'invalid', '-c']) {
+    assert.throws(
+      () => normalizeCodexReasoningEffort(effort),
+      (error) => error.statusCode === 400 && error.code === 'CODEX_REASONING_EFFORT_INVALID'
+    );
+  }
+  assert.throws(
+    () => buildCodexExecArgs({ model: '--dangerously-bypass-approvals-and-sandbox' }),
+    (error) => error.code === 'CODEX_MODEL_INVALID'
+  );
+  assert.throws(
+    () => buildCodexExecArgs({ reasoningEffort: 'medium -c model="evil"' }),
+    (error) => error.code === 'CODEX_REASONING_EFFORT_INVALID'
+  );
+  for (const value of [['gpt-5.6-terra'], { model: 'gpt-5.6-terra' }]) {
+    assert.throws(() => normalizeCodexModel(value), (error) => error.code === 'CODEX_MODEL_INVALID');
+    assert.throws(() => buildCodexExecArgs({ model: value }), (error) => error.code === 'CODEX_MODEL_INVALID');
+  }
+  for (const value of [['medium'], { effort: 'medium' }]) {
+    assert.throws(
+      () => normalizeCodexReasoningEffort(value),
+      (error) => error.code === 'CODEX_REASONING_EFFORT_INVALID'
+    );
+  }
+});
+
+test('Codex 会话超时严格限制为 5..120 整数分钟并安全换算毫秒', () => {
+  assert.equal(normalizeCodexTimeoutMinutes(undefined), 10);
+  assert.equal(normalizeCodexTimeoutMinutes(null), 10);
+  for (const minutes of [5, 10, 120]) {
+    assert.equal(normalizeCodexTimeoutMinutes(minutes), minutes);
+    assert.equal(codexTimeoutMinutesToMs(minutes), minutes * 60_000);
+  }
+  for (const value of [4, 121, 5.5, '', '10', true, false, [], [10], {}, NaN, Infinity, -Infinity]) {
+    assert.throws(
+      () => normalizeCodexTimeoutMinutes(value),
+      (error) => error.statusCode === 400 && error.code === 'CODEX_TIMEOUT_MINUTES_INVALID'
+    );
+  }
+  assert.equal(formatCodexTimeoutDuration(5 * 60_000), '5 分钟');
+  assert.equal(formatCodexTimeoutDuration(2_000), '2 秒');
+  assert.equal(formatCodexTimeoutDuration(10), '10 毫秒');
+  assert.throws(() => formatCodexTimeoutDuration(2_147_483_648), /安全计时范围/);
+
+  for (const timeoutMinutes of [undefined, null, '10', 4, 121]) {
+    const legacy = publicCodexSession({
+      id: 'codexchat_0000000000000000', timeoutMinutes, messages: []
+    });
+    assert.equal(legacy.timeoutMinutes, null);
+  }
+  assert.equal(publicCodexSession({ timeoutMinutes: 5, messages: [] }).timeoutMinutes, 5);
 });
 
 test('非空章节拒绝没有可朗读片段的空剧本', () => {

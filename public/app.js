@@ -2,6 +2,12 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const CODEX_PROGRESS_PREFERENCE_KEY = 'novelVoiceStudio.codexProgressVisible.v1';
+const CODEX_ACTIVITY_PREFERENCE_KEY = 'novelVoiceStudio.codexActivityVisible.v1';
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
+const DEFAULT_CODEX_REASONING_EFFORT = 'medium';
+const DEFAULT_CODEX_TIMEOUT_MINUTES = 10;
+const MIN_CODEX_TIMEOUT_MINUTES = 5;
+const MAX_CODEX_TIMEOUT_MINUTES = 120;
 
 function readLocalBoolean(key, fallback) {
   try {
@@ -52,12 +58,15 @@ const state = {
   codexSessionId: null,
   codexSessionByChapter: new Map(),
   codexDrafts: new Map(),
-  codexModel: '',
+  codexModel: DEFAULT_CODEX_MODEL,
+  codexReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+  codexTimeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
   codexMode: 'faithful',
   codexBusy: false,
   codexError: '',
   codexRequestId: 0,
   codexProgressVisible: readLocalBoolean(CODEX_PROGRESS_PREFERENCE_KEY, true),
+  codexActivityVisible: readLocalBoolean(CODEX_ACTIVITY_PREFERENCE_KEY, false),
   codexProgressByChapter: new Map(),
   codexProgressSources: new Map(),
   codexProgressGeneration: 0,
@@ -333,6 +342,67 @@ const CODEX_MODE_LABELS = { faithful: '忠实朗读', polished: '轻度剧本化
 const CODEX_MODEL_OPTIONS = [
   ['gpt-5.6-sol', 'Sol'], ['gpt-5.6-terra', 'Terra'], ['gpt-5.6-luna', 'Luna']
 ];
+const CODEX_REASONING_OPTIONS = [
+  ['low', 'Low · 较快'],
+  ['medium', 'Medium · 推荐（质量 / 速度平衡）'],
+  ['high', 'High · 更深入'],
+  ['xhigh', 'XHigh · 很深入'],
+  ['max', 'Max · 最强、最慢']
+];
+const CODEX_REASONING_VALUES = new Set(CODEX_REASONING_OPTIONS.map(([value]) => value));
+const CODEX_REASONING_LABELS = {
+  low: '较低',
+  medium: '中等',
+  high: '高',
+  xhigh: '极高',
+  max: '最高（最慢）'
+};
+const CODEX_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
+
+function normalizeCodexModel(value, fallback = DEFAULT_CODEX_MODEL) {
+  if (typeof value !== 'string') return fallback;
+  const model = value.trim();
+  return CODEX_MODEL_PATTERN.test(model) ? model : fallback;
+}
+
+function normalizeCodexReasoningEffort(value, fallback = DEFAULT_CODEX_REASONING_EFFORT) {
+  return CODEX_REASONING_VALUES.has(value) ? value : fallback;
+}
+
+function parseCodexTimeoutMinutes(value) {
+  const text = typeof value === 'string' ? value.trim() : String(value ?? '');
+  if (!/^\d{1,3}$/.test(text)) return null;
+  const minutes = Number(text);
+  return Number.isInteger(minutes)
+    && minutes >= MIN_CODEX_TIMEOUT_MINUTES
+    && minutes <= MAX_CODEX_TIMEOUT_MINUTES
+    ? minutes
+    : null;
+}
+
+function normalizeCodexTimeoutMinutes(value, fallback = DEFAULT_CODEX_TIMEOUT_MINUTES) {
+  return parseCodexTimeoutMinutes(value) ?? fallback;
+}
+
+function codexReasoningLabel(value, fallback = '未记录') {
+  return CODEX_REASONING_LABELS[value] || fallback;
+}
+
+function codexSessionRuntimeLabel(session) {
+  const model = typeof session?.model === 'string' && session.model.trim()
+    ? session.model.trim()
+    : '模型未记录';
+  const effort = codexReasoningLabel(session?.reasoningEffort, '推理强度未记录');
+  const timeout = parseCodexTimeoutMinutes(session?.timeoutMinutes);
+  return `${model} · 推理 ${effort} · ${timeout === null ? '超时未记录' : `超时 ${timeout} 分钟`}`;
+}
+
+function codexProgressRuntimeLabel(progress) {
+  const model = normalizeCodexModel(progress?.model);
+  const effort = codexReasoningLabel(normalizeCodexReasoningEffort(progress?.reasoningEffort));
+  const timeout = normalizeCodexTimeoutMinutes(progress?.timeoutMinutes);
+  return `${model} · 推理 ${effort} · 超时 ${timeout} 分钟`;
+}
 
 function codexSessions(chapter = currentChapter()) {
   return [...(chapter?.codexSessions || [])].sort((left, right) => {
@@ -855,6 +925,33 @@ const CODEX_PROGRESS_PHASE_MESSAGES = {
   'completed:completed': '本轮剧本协作已完成。',
   'failed:failed': '本轮剧本协作未完成，请检查 Codex 状态后重试。'
 };
+const CODEX_ACTIVITY_CATEGORIES = new Set(['reasoning_summary', 'command', 'file', 'mcp', 'web', 'collaboration', 'plan', 'tool']);
+const CODEX_ACTIVITY_PRESENTATION = {
+  reasoning_summary: { label: '模型推理摘要', tone: 'summary' },
+  command: { label: '受控命令', tone: 'activity' },
+  file: { label: '文件活动', tone: 'activity' },
+  mcp: { label: '扩展工具', tone: 'activity' },
+  web: { label: '联网检索', tone: 'activity' },
+  collaboration: { label: '协作活动', tone: 'activity' },
+  plan: { label: '任务计划', tone: 'activity' },
+  tool: { label: '工具活动', tone: 'activity' }
+};
+const CODEX_ACTIVITY_FIXED_TEXT = {
+  command: '正在执行受控命令。',
+  file: '正在处理工作区文件。',
+  mcp: '正在调用已配置的扩展工具。',
+  web: '正在执行联网检索。',
+  collaboration: '正在进行协作任务。',
+  plan: '正在更新任务计划。',
+  tool: '正在使用受控工具。'
+};
+const CODEX_ACTIVITY_MAX_ITEMS = 24;
+const CODEX_ACTIVITY_MAX_TEXT_BYTES = 8 * 1024;
+const CODEX_TIMEOUT_FAILURE_CODES = new Set([
+  'CODEX_TIMEOUT_STARTING',
+  'CODEX_TIMEOUT_ACTIVE',
+  'CODEX_TIMEOUT'
+]);
 
 function codexProgressKey(projectId = state.project?.id, chapterId = currentChapter()?.id) {
   return projectId && chapterId ? `${projectId}:${chapterId}` : '';
@@ -888,6 +985,25 @@ function fixedCodexProgressMessage(type, phase) {
     || CODEX_PROGRESS_PRESENTATION.stage.label;
 }
 
+function safeCodexTimeoutFailureCode(value) {
+  const code = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return CODEX_TIMEOUT_FAILURE_CODES.has(code) ? code : '';
+}
+
+function codexProgressFailureMessage(progress) {
+  const minutes = normalizeCodexTimeoutMinutes(progress?.timeoutMinutes);
+  if (progress?.failureCode === 'CODEX_TIMEOUT_STARTING') {
+    return `Codex 未能在 ${minutes} 分钟内开始响应，请检查本机状态后重试。`;
+  }
+  if (progress?.failureCode === 'CODEX_TIMEOUT_ACTIVE') {
+    return `Codex 已开始生成，但未在 ${minutes} 分钟内完成；可缩短章节、降低推理强度或提高超时后重试。`;
+  }
+  if (progress?.failureCode === 'CODEX_TIMEOUT') {
+    return `Codex 未能在 ${minutes} 分钟内完成处理，请稍后重试。`;
+  }
+  return fixedCodexProgressMessage('failed', 'failed');
+}
+
 function normalizeCodexProgressEventsUrl(value, { projectId, chapterId, progressId }) {
   if (typeof value !== 'string' || value.length > 2_000) return '';
   try {
@@ -914,6 +1030,7 @@ function normalizeCodexProgressEvent(value, expectedProgressId = '') {
   const elapsedMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Number(value.elapsedMs) || 0));
   const atValue = typeof value.at === 'string' ? value.at : '';
   const at = Number.isFinite(Date.parse(atValue)) ? atValue : new Date().toISOString();
+  const failureCode = type === 'failed' ? safeCodexTimeoutFailureCode(value.code) : '';
   return {
     progressId,
     type,
@@ -921,8 +1038,69 @@ function normalizeCodexProgressEvent(value, expectedProgressId = '') {
     message: fixedCodexProgressMessage(type, phase),
     elapsedMs,
     at,
-    terminal: value.terminal === true || type === 'completed' || type === 'failed'
+    terminal: value.terminal === true || type === 'completed' || type === 'failed',
+    failureCode
   };
+}
+
+function normalizeCodexDetailLevel(value, fallback = 'basic') {
+  return value === 'summary' || value === 'basic' ? value : fallback;
+}
+
+function truncateCodexActivityText(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || /[\u0000-\u001f\u007f-\u009f\u034f\u061c\u180e\u202a-\u202e\u2066-\u2069]/u.test(text)) return '';
+  const limited = text.slice(0, 1_024);
+  if (typeof Intl?.Segmenter !== 'function') return [...limited].slice(0, 320).join('');
+  const segments = new Intl.Segmenter('zh-CN', { granularity: 'grapheme' }).segment(limited);
+  let output = '';
+  let count = 0;
+  for (const { segment } of segments) {
+    if (count >= 320) break;
+    output += segment;
+    count += 1;
+  }
+  return output;
+}
+
+function codexActivityTextBytes(value) {
+  try { return new TextEncoder().encode(value).byteLength; } catch { return String(value).length * 2; }
+}
+
+function normalizeCodexActivityEvent(value, expectedProgressId = '') {
+  if (!value || typeof value !== 'object' || value.type !== 'activity' || value.terminal !== false) return null;
+  const progressId = safeCodexProgressId(value.progressId);
+  const category = CODEX_ACTIVITY_CATEGORIES.has(value.category) ? value.category : '';
+  const phase = value.phase === 'reasoning_summary' || value.phase === 'activity' ? value.phase : '';
+  const expectedPhase = category === 'reasoning_summary' ? 'reasoning_summary' : 'activity';
+  const text = category === 'reasoning_summary'
+    ? truncateCodexActivityText(value.text)
+    : CODEX_ACTIVITY_FIXED_TEXT[category] || '';
+  const atValue = typeof value.at === 'string' ? value.at : '';
+  if (!progressId || progressId !== expectedProgressId || !category || phase !== expectedPhase || !text
+    || atValue.length > 40 || !Number.isFinite(Date.parse(atValue))) return null;
+  return { progressId, category, text, at: atValue };
+}
+
+function appendCodexActivityEvent(progress, activity, eventId = '') {
+  if (!progress || !activity || progress.progressId !== activity.progressId || progress.detailLevel !== 'summary') return false;
+  if (!progress.activityEventIds) progress.activityEventIds = new Set();
+  const normalizedEventId = typeof eventId === 'string' ? eventId.slice(0, 160) : '';
+  if (normalizedEventId && progress.activityEventIds.has(normalizedEventId)) return false;
+  if (normalizedEventId) {
+    progress.activityEventIds.add(normalizedEventId);
+    while (progress.activityEventIds.size > 256) progress.activityEventIds.delete(progress.activityEventIds.values().next().value);
+  }
+  const signature = `${activity.category}:${activity.text}:${activity.at}`;
+  if (progress.lastActivitySignature === signature) return false;
+  progress.lastActivitySignature = signature;
+  progress.activities = [...(progress.activities || []), activity];
+  while (progress.activities.length > CODEX_ACTIVITY_MAX_ITEMS
+    || progress.activities.reduce((total, item) => total + codexActivityTextBytes(item.text), 0) > CODEX_ACTIVITY_MAX_TEXT_BYTES) {
+    progress.activities.shift();
+  }
+  return true;
 }
 
 function appendCodexProgressEvent(progress, event, eventId = '') {
@@ -931,7 +1109,7 @@ function appendCodexProgressEvent(progress, event, eventId = '') {
   const normalizedEventId = typeof eventId === 'string' ? eventId.slice(0, 160) : '';
   if (normalizedEventId && progress.eventIds.has(normalizedEventId)) return false;
   if (normalizedEventId) progress.eventIds.add(normalizedEventId);
-  const signature = `${event.type}:${event.phase}:${event.message}:${event.at}`;
+  const signature = `${event.type}:${event.phase}:${event.failureCode}:${event.message}:${event.at}`;
   if (progress.lastEventSignature === signature) return false;
   progress.lastEventSignature = signature;
   progress.type = event.type;
@@ -941,6 +1119,7 @@ function appendCodexProgressEvent(progress, event, eventId = '') {
   progress.lastEventReceivedAt = Date.now();
   progress.at = event.at;
   progress.terminal = event.terminal;
+  progress.failureCode = event.failureCode;
   progress.timeline = [...(progress.timeline || []), event].slice(-12);
   return true;
 }
@@ -948,6 +1127,19 @@ function appendCodexProgressEvent(progress, event, eventId = '') {
 function createCodexProgressSnapshot(raw, context, existing = null) {
   const progressId = safeCodexProgressId(raw?.progressId);
   if (!progressId) return null;
+  const detailLevel = normalizeCodexDetailLevel(
+    raw?.detailLevel,
+    normalizeCodexDetailLevel(context?.detailLevel, normalizeCodexDetailLevel(existing?.detailLevel))
+  );
+  const model = normalizeCodexModel(raw?.model, normalizeCodexModel(context?.model, normalizeCodexModel(existing?.model)));
+  const reasoningEffort = normalizeCodexReasoningEffort(
+    raw?.reasoningEffort,
+    normalizeCodexReasoningEffort(context?.reasoningEffort, normalizeCodexReasoningEffort(existing?.reasoningEffort))
+  );
+  const timeoutMinutes = normalizeCodexTimeoutMinutes(
+    raw?.timeoutMinutes,
+    normalizeCodexTimeoutMinutes(context?.timeoutMinutes, normalizeCodexTimeoutMinutes(existing?.timeoutMinutes))
+  );
   const base = existing?.progressId === progressId ? existing : {
     progressId,
     projectId: context.projectId,
@@ -962,12 +1154,25 @@ function createCodexProgressSnapshot(raw, context, existing = null) {
     at: new Date().toISOString(),
     terminal: false,
     expanded: true,
+    detailLevel,
+    model,
+    reasoningEffort,
+    timeoutMinutes,
+    activities: [],
+    activityEventIds: new Set(),
+    activityExpanded: true,
+    activityUnread: 0,
     connection: 'connecting',
     timeline: [],
     eventIds: new Set(),
+    failureCode: '',
     finalized: false,
     finalizing: false
   };
+  base.detailLevel = detailLevel;
+  base.model = model;
+  base.reasoningEffort = reasoningEffort;
+  base.timeoutMinutes = timeoutMinutes;
   const eventsUrl = normalizeCodexProgressEventsUrl(raw?.eventsUrl || base.eventsUrl, {
     projectId: context.projectId, chapterId: context.chapterId, progressId
   });
@@ -990,6 +1195,7 @@ function createCodexProgressSnapshot(raw, context, existing = null) {
       base.lastEventReceivedAt = Date.now();
       base.at = current.at;
       base.terminal = current.terminal;
+      base.failureCode = current.failureCode;
     }
   } else if (['queued', 'completed', 'failed'].includes(raw?.state)) {
     base.type = raw.state;
@@ -1028,13 +1234,75 @@ function codexProgressTimelineHtml(progress) {
   }).join('');
 }
 
+function formatCodexActivityTime(value) {
+  const timestamp = Date.parse(value || '');
+  if (!Number.isFinite(timestamp)) return '';
+  return new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function codexActivityAtBottom(element) {
+  if (!element) return true;
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= 18;
+}
+
+function codexActivityItemsHtml(progress) {
+  return (progress?.activities || []).map((activity) => {
+    const presentation = CODEX_ACTIVITY_PRESENTATION[activity.category];
+    return `<li class="${presentation.tone}"><div><span>${escapeHtml(presentation.label)}</span><time datetime="${escapeHtml(activity.at)}">${escapeHtml(formatCodexActivityTime(activity.at))}</time></div><p>${escapeHtml(activity.text)}</p></li>`;
+  }).join('');
+}
+
+function codexActivityPanelHtml(progress) {
+  const summaryRun = progress?.detailLevel === 'summary';
+  const activities = progress?.activities || [];
+  const bodyId = `codex-activity-body-${progress.progressId}`;
+  const expanded = progress?.activityExpanded !== false;
+  const unread = Math.max(0, Number(progress?.activityUnread) || 0);
+  const content = summaryRun
+    ? `<div class="codex-activity-log" data-codex-activity-log tabindex="0" aria-label="Codex 安全活动日志"><ol data-codex-activity-list>${codexActivityItemsHtml(progress)}</ol>${activities.length ? '' : '<p class="codex-activity-empty">等待安全摘要或运行记录…</p>'}</div>`
+    : '<p class="codex-activity-empty standalone">当前任务使用基础进度模式。此开关会让下一次发送记录安全摘要。</p>';
+  return `<section class="codex-activity-panel ${summaryRun ? 'summary-enabled' : 'basic'}" data-codex-activity-panel aria-labelledby="codex-activity-title">
+    <header><div><strong id="codex-activity-title">推理摘要与活动日志</strong><small>${summaryRun ? '本任务已启用摘要模式' : '仅应用于之后发送的任务'}</small></div><div><span data-codex-activity-count>${activities.length} 条</span><button class="button ghost small" type="button" data-action="clear-codex-activity" ${activities.length ? '' : 'disabled'}>清空本地视图</button><button class="icon-button" type="button" data-action="toggle-codex-activity" aria-expanded="${expanded}" aria-controls="${bodyId}" aria-label="${expanded ? '折叠推理摘要与活动日志' : '展开推理摘要与活动日志'}">${expanded ? '⌃' : '⌄'}</button></div></header>
+    <div class="codex-activity-body" id="${bodyId}" ${expanded ? '' : 'hidden'}>${content}<button class="codex-activity-unread" type="button" data-action="scroll-codex-activity" ${unread ? '' : 'hidden'}>${unread} 条新记录 · 回到底部</button><p class="codex-activity-disclosure"><strong>模型推理摘要不是内部思维链</strong><span>这里只显示后端筛选后的简短摘要与运行记录，不展示提示词、完整模型输出、命令、路径或凭据。</span></p><div class="sr-only" data-codex-activity-announcer role="status" aria-live="polite" aria-atomic="true"></div></div>
+  </section>`;
+}
+
+function updateCodexActivityPanel(progress, { autoScroll = false } = {}) {
+  const panel = $('#modal-root .codex-room-modal .codex-progress-panel');
+  const slot = panel?.querySelector('[data-codex-activity-slot]');
+  if (!slot) return;
+  const previousLog = slot.querySelector('[data-codex-activity-log]');
+  const previousScrollTop = previousLog?.scrollTop || 0;
+  const hadLog = Boolean(previousLog);
+  if (!state.codexActivityVisible || !progress) {
+    slot.innerHTML = '';
+    return;
+  }
+  slot.innerHTML = codexActivityPanelHtml(progress);
+  const nextLog = slot.querySelector('[data-codex-activity-log]');
+  if (!nextLog) return;
+  requestAnimationFrame(() => {
+    if (currentCodexProgress()?.progressId !== progress.progressId || !nextLog.isConnected) return;
+    nextLog.scrollTop = autoScroll || !hadLog ? nextLog.scrollHeight : previousScrollTop;
+  });
+}
+
+function announceCodexActivity(progress, category) {
+  if (!state.codexActivityVisible || !progress) return;
+  const now = Date.now();
+  if (now - Number(progress.lastActivityAnnouncementAt || 0) < 1_800) return;
+  progress.lastActivityAnnouncementAt = now;
+  const announcer = $('#modal-root .codex-room-modal [data-codex-activity-announcer]');
+  if (announcer) announcer.textContent = category === 'reasoning_summary' ? '新增一条模型推理摘要。' : '新增一条运行记录。';
+}
+
 function codexProgressPanelHtml(progress) {
   if (!progress) return '';
   const presentation = CODEX_PROGRESS_PRESENTATION[progress.type] || CODEX_PROGRESS_PRESENTATION.stage;
   const bodyId = `codex-progress-body-${progress.progressId}`;
   return `<section class="codex-progress-panel ${presentation.tone}" data-progress-id="${escapeHtml(progress.progressId)}" role="region" aria-labelledby="codex-progress-title">
-    <header><div class="codex-progress-heading"><i aria-hidden="true"></i><div><strong id="codex-progress-title" data-codex-progress-title>${escapeHtml(presentation.label)}</strong><small data-codex-progress-connection>${escapeHtml(codexProgressConnectionLabel(progress))}</small></div></div><div class="codex-progress-meta"><time data-codex-progress-elapsed datetime="PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S" aria-label="已用时 ${escapeHtml(formatCodexProgressElapsed(progress))}">${escapeHtml(formatCodexProgressElapsed(progress))}</time><button class="icon-button" type="button" data-action="toggle-codex-progress" aria-expanded="${progress.expanded !== false}" aria-controls="${bodyId}" aria-label="${progress.expanded === false ? '展开处理进度' : '折叠处理进度'}">${progress.expanded === false ? '⌄' : '⌃'}</button></div></header>
-    <div class="codex-progress-body" id="${bodyId}" ${progress.expanded === false ? 'hidden' : ''}><p class="codex-progress-summary" data-codex-progress-summary>${escapeHtml(progress.message || presentation.label)}</p><ol class="codex-progress-timeline" data-codex-progress-timeline>${codexProgressTimelineHtml(progress)}</ol><p class="codex-progress-disclosure"><span aria-hidden="true">◇</span><span><strong>这是任务进度摘要，不是隐藏思维链</strong><small>这里只显示阶段、耗时和安全摘要，不展示模型内部推理或凭据。</small></span></p></div>
+    <header><div class="codex-progress-heading"><i aria-hidden="true"></i><div><strong id="codex-progress-title" data-codex-progress-title>${escapeHtml(presentation.label)}</strong><small data-codex-progress-connection>${escapeHtml(codexProgressConnectionLabel(progress))}</small><small class="codex-progress-runtime">${escapeHtml(codexProgressRuntimeLabel(progress))}</small></div></div><div class="codex-progress-meta"><time data-codex-progress-elapsed datetime="PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S" aria-label="已用时 ${escapeHtml(formatCodexProgressElapsed(progress))}">${escapeHtml(formatCodexProgressElapsed(progress))}</time><button class="icon-button" type="button" data-action="toggle-codex-progress" aria-expanded="${progress.expanded !== false}" aria-controls="${bodyId}" aria-label="${progress.expanded === false ? '展开处理进度' : '折叠处理进度'}">${progress.expanded === false ? '⌄' : '⌃'}</button></div></header>
+    <div class="codex-progress-body" id="${bodyId}" ${progress.expanded === false ? 'hidden' : ''}><p class="codex-progress-summary" data-codex-progress-summary>${escapeHtml(progress.message || presentation.label)}</p><ol class="codex-progress-timeline" data-codex-progress-timeline>${codexProgressTimelineHtml(progress)}</ol><div data-codex-activity-slot>${state.codexActivityVisible ? codexActivityPanelHtml(progress) : ''}</div><p class="codex-progress-disclosure"><span aria-hidden="true">◇</span><span><strong>这是任务进度摘要，不是隐藏思维链</strong><small>这里只显示阶段、耗时和安全摘要，不展示模型内部推理或凭据。</small></span></p></div>
   </section>`;
 }
 
@@ -1043,11 +1311,13 @@ function announceCodexProgress(text) {
   if (announcer) announcer.textContent = text;
 }
 
-function updateCodexProgressPanel({ announce = '' } = {}) {
+function updateCodexProgressPanel({ announce = '', activityAutoScroll = false } = {}) {
   const modal = $('#modal-root .codex-room-modal');
   if (!modal) return;
   const toggle = $('#codex-progress-visible', modal);
   if (toggle) toggle.checked = state.codexProgressVisible;
+  const activityToggle = $('#codex-activity-visible', modal);
+  if (activityToggle) activityToggle.checked = state.codexActivityVisible;
   const slot = $('#codex-progress-slot', modal);
   if (!slot) return;
   const progress = currentCodexProgress();
@@ -1087,6 +1357,7 @@ function updateCodexProgressPanel({ announce = '' } = {}) {
       collapse.textContent = progress.expanded === false ? '⌄' : '⌃';
     }
   }
+  updateCodexActivityPanel(progress, { autoScroll: activityAutoScroll });
   if (announce) announceCodexProgress(announce);
 }
 
@@ -1130,7 +1401,9 @@ async function finalizeCodexProgress(progress, { recovered = false } = {}) {
   progress.finalizing = true;
   closeCodexProgressConnection(key);
   const targetsCurrentChapter = state.project?.id === progress.projectId && currentChapter()?.id === progress.chapterId;
-  if (progress.type === 'failed' && targetsCurrentChapter) state.codexError = fixedCodexProgressMessage('failed', 'failed');
+  const failureMessage = progress.type === 'failed' ? codexProgressFailureMessage(progress) : '';
+  if (failureMessage) progress.message = failureMessage;
+  if (failureMessage && targetsCurrentChapter) state.codexError = failureMessage;
   try {
     if (progress.type === 'completed') {
       const refreshed = await api(`/api/projects/${encodeURIComponent(progress.projectId)}`);
@@ -1142,6 +1415,16 @@ async function finalizeCodexProgress(progress, { recovered = false } = {}) {
           const sessions = codexSessions(chapter);
           state.codexSessionId = chapter.activeCodexSessionId || sessions[0]?.id || progress.sessionId || null;
           if (state.codexSessionId) state.codexSessionByChapter.set(progress.chapterId, state.codexSessionId);
+          const activeSession = sessions.find((item) => item.id === state.codexSessionId) || null;
+          state.codexModel = normalizeCodexModel(activeSession?.model, progress.model);
+          state.codexReasoningEffort = normalizeCodexReasoningEffort(
+            activeSession?.reasoningEffort,
+            progress.reasoningEffort
+          );
+          state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(
+            activeSession?.timeoutMinutes,
+            progress.timeoutMinutes
+          );
           state.codexDrafts.delete(progress.promptDraftKey);
           state.codexDrafts.set(`${progress.chapterId}:${state.codexSessionId || 'new'}`, '');
           state.codexError = '';
@@ -1164,7 +1447,7 @@ async function finalizeCodexProgress(progress, { recovered = false } = {}) {
   else updateCodexProgressPanel();
   if (!recovered || progress.type === 'failed') {
     if (progress.type === 'completed') toast('Codex 已在后台更新本章剧本', '重新打开协作室可继续对话和逐句调整。');
-    else toast('Codex 本轮没有完成', fixedCodexProgressMessage('failed', 'failed'), 'error');
+    else toast('Codex 本轮没有完成', failureMessage || fixedCodexProgressMessage('failed', 'failed'), 'error');
   }
 }
 
@@ -1204,6 +1487,17 @@ function connectCodexProgress(progress) {
     if (!isCurrent()) return;
     let payload;
     try { payload = JSON.parse(streamEvent.data); } catch { return; }
+    const activity = normalizeCodexActivityEvent(payload, progress.progressId);
+    if (activity) {
+      if (!state.codexActivityVisible) return;
+      const activityLog = $('#modal-root .codex-room-modal [data-codex-activity-log]');
+      const autoScroll = codexActivityAtBottom(activityLog);
+      if (!appendCodexActivityEvent(progress, activity, streamEvent.lastEventId)) return;
+      progress.activityUnread = autoScroll ? 0 : Math.min(99, Number(progress.activityUnread || 0) + 1);
+      updateCodexProgressPanel({ activityAutoScroll: autoScroll });
+      announceCodexActivity(progress, activity.category);
+      return;
+    }
     const event = normalizeCodexProgressEvent(payload, progress.progressId);
     if (!event || !appendCodexProgressEvent(progress, event, streamEvent.lastEventId)) return;
     progress.connection = event.terminal ? 'closed' : 'open';
@@ -1214,6 +1508,7 @@ function connectCodexProgress(progress) {
   };
   source.onmessage = handleEvent;
   for (const type of CODEX_PROGRESS_TYPES) source.addEventListener(type, handleEvent);
+  source.addEventListener('activity', handleEvent);
   source.onopen = () => {
     if (!isCurrent()) return;
     const wasInterrupted = progress.connection === 'reconnecting';
@@ -1252,11 +1547,19 @@ async function recoverCodexProgress() {
       projectId,
       chapterId,
       sessionId: state.codexSessionId,
+      detailLevel: existing?.detailLevel,
+      model: existing?.model,
+      reasoningEffort: existing?.reasoningEffort,
+      timeoutMinutes: existing?.timeoutMinutes,
       promptDraftKey: existing?.promptDraftKey
     }, existing);
     if (!progress) return;
     state.codexProgressByChapter.set(key, progress);
-    updateCodexProgressPanel();
+    state.codexModel = progress.model;
+    state.codexReasoningEffort = progress.reasoningEffort;
+    state.codexTimeoutMinutes = progress.timeoutMinutes;
+    if ($('#modal-root .codex-room-modal')) renderCodexStudio();
+    else updateCodexProgressPanel();
     if (progress.terminal) await finalizeCodexProgress(progress, { recovered: true });
     else connectCodexProgress(progress);
   } catch {
@@ -1289,6 +1592,15 @@ function rememberCodexComposer() {
   if (composer) state.codexDrafts.set(codexDraftKey(), composer.value);
   const model = $('#codex-model');
   if (model) state.codexModel = model.value.trim();
+  const reasoningEffort = $('#codex-reasoning-effort');
+  if (reasoningEffort && !reasoningEffort.disabled) {
+    state.codexReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort.value);
+  }
+  const timeoutMinutes = $('#codex-timeout-minutes');
+  const parsedTimeoutMinutes = timeoutMinutes && !timeoutMinutes.disabled
+    ? parseCodexTimeoutMinutes(timeoutMinutes.value)
+    : null;
+  if (parsedTimeoutMinutes !== null) state.codexTimeoutMinutes = parsedTimeoutMinutes;
   const mode = $('#codex-room-mode');
   if (mode && !mode.disabled) state.codexMode = mode.value;
 }
@@ -1652,7 +1964,15 @@ function codexStudioHtml() {
   const lines = chapter?.scenes?.flatMap((scene) => scene.lines || []) || [];
   const progress = currentCodexProgress();
   const busy = codexRoomBusy();
-  const model = session?.model ?? state.codexModel ?? '';
+  const activeProgress = codexProgressIsActive(progress) ? progress : null;
+  const model = normalizeCodexModel(activeProgress?.model ?? state.codexModel ?? session?.model);
+  const reasoningEffort = normalizeCodexReasoningEffort(
+    activeProgress?.reasoningEffort ?? state.codexReasoningEffort ?? session?.reasoningEffort
+  );
+  const timeoutMinutes = normalizeCodexTimeoutMinutes(
+    activeProgress?.timeoutMinutes ?? state.codexTimeoutMinutes ?? session?.timeoutMinutes
+  );
+  const legacyTimeout = Boolean(session) && !activeProgress && parseCodexTimeoutMinutes(session.timeoutMinutes) === null;
   const mode = session?.mode || state.codexMode || 'faithful';
   const sessionStatus = busy ? (CODEX_PROGRESS_PRESENTATION[progress?.type]?.short || '提交中') : session ? codexStatusLabel(session.status) : '新会话';
   const canSend = readiness.ready && !busy;
@@ -1664,15 +1984,22 @@ function codexStudioHtml() {
     <div class="codex-room-grid">
       <aside class="codex-session-panel" aria-label="Codex 会话历史">
         <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>本章会话</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新会话</button></div>
-        <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${busy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(item.model || 'Codex 默认')}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
+        <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${busy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(codexSessionRuntimeLabel(item))}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
         <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${busy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
       </aside>
       <main class="codex-chat-panel" aria-busy="${busy}">
-        <div class="codex-chat-toolbar"><label><span>模型（可输入完整 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" value="${escapeHtml(model)}" placeholder="Codex 默认" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" ${busy ? 'disabled' : ''}>默认</button></div></label><datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist><label><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || busy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label><div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label></div></div>
+        <div class="codex-chat-toolbar">
+          <label class="codex-model-control"><span>模型（默认 Terra，可输入 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}" value="${escapeHtml(model)}" placeholder="gpt-5.6-terra" title="以字母或数字开头，最多 100 个字符" autocomplete="off" spellcheck="false" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" title="使用推荐模型 gpt-5.6-terra" ${busy ? 'disabled' : ''}>Terra</button></div></label>
+          <datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist>
+          <label class="codex-reasoning-control"><span>推理强度（影响质量 / 耗时）</span><select class="select-field" id="codex-reasoning-effort" ${busy ? 'disabled' : ''}>${CODEX_REASONING_OPTIONS.map(([value, label]) => `<option value="${value}" ${value === reasoningEffort ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+          <label class="codex-timeout-control"><span>任务超时（分钟）${legacyTimeout ? ' · 旧会话下轮默认 10' : ''}</span><input class="field" id="codex-timeout-minutes" type="number" min="5" max="120" step="1" inputmode="numeric" value="${timeoutMinutes}" title="请输入 5–120 的整数；建议按 5 分钟调整" ${busy ? 'disabled' : ''}></label>
+          <label class="codex-mode-control"><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || busy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+          <div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small><fieldset class="codex-observability-controls"><legend class="sr-only">Codex 进度显示设置</legend><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label><label class="codex-progress-visibility codex-activity-visibility"><input type="checkbox" id="codex-activity-visible" ${state.codexActivityVisible ? 'checked' : ''} aria-describedby="codex-activity-setting-help"><span>显示推理摘要与活动日志 <em>非隐藏思维链</em></span></label><small id="codex-activity-setting-help">摘要采集模式在发送新任务时确定；关闭显示不会停止后台处理</small></fieldset></div>
+        </div>
         <div class="sr-only" id="codex-progress-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
         <div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>
         <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一章</h3><p>第一次发送会创建会话并更新右侧剧本。之后可以继续要求修正角色、语气或某一段台词。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 Codex 后台任务</strong><small>收到任务编号后即可关闭协作室，处理会在后台继续。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
-        <form class="codex-composer" id="codex-chat-form"><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以关闭协作室，稍后回来继续查看。' : readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
+        <form class="codex-composer" id="codex-chat-form" novalidate><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以关闭协作室，稍后回来继续查看。' : readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
       </main>
       <aside class="codex-script-panel" aria-label="当前剧本逐句编辑">
         <div class="codex-panel-title"><div><span class="eyebrow">LIVE SCRIPT</span><strong>当前剧本</strong></div><span class="codex-line-count">${lines.length} 句</span></div>
@@ -1688,6 +2015,8 @@ function renderCodexStudio({ focus = '' } = {}) {
   requestAnimationFrame(() => {
     const conversation = $('#codex-conversation');
     if (conversation) conversation.scrollTop = conversation.scrollHeight;
+    const activityLog = $('[data-codex-activity-log]');
+    if (activityLog && !Number(currentCodexProgress()?.activityUnread || 0)) activityLog.scrollTop = activityLog.scrollHeight;
     if (focus === 'composer') $('#codex-chat-prompt')?.focus();
     if (focus === 'model') $('#codex-model')?.focus();
   });
@@ -1701,7 +2030,9 @@ function openCodexStudio(mode = state.codexMode) {
   const remembered = state.codexSessionByChapter.get(chapter?.id);
   state.codexSessionId = sessions.some((session) => session.id === remembered) ? remembered : sessions[0]?.id || null;
   const session = currentCodexSession();
-  if (session?.model) state.codexModel = session.model;
+  state.codexModel = normalizeCodexModel(session?.model);
+  state.codexReasoningEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
+  state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(session?.timeoutMinutes);
   if (session?.mode) state.codexMode = session.mode;
   renderCodexStudio({ focus: state.codexSessionId ? '' : 'composer' });
   recoverCodexLogin();
@@ -1714,6 +2045,9 @@ function startNewCodexSession() {
   const chapterId = currentChapter()?.id;
   if (chapterId) state.codexSessionByChapter.delete(chapterId);
   state.codexSessionId = null;
+  state.codexModel = DEFAULT_CODEX_MODEL;
+  state.codexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+  state.codexTimeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES;
   state.codexError = '';
   state.codexDrafts.delete(codexDraftKey(null));
   renderCodexStudio({ focus: 'composer' });
@@ -1726,7 +2060,9 @@ function selectCodexSession(sessionId) {
   const chapterId = currentChapter()?.id;
   if (chapterId) state.codexSessionByChapter.set(chapterId, sessionId);
   const session = currentCodexSession();
-  if (session?.model) state.codexModel = session.model;
+  state.codexModel = normalizeCodexModel(session?.model);
+  state.codexReasoningEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
+  state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(session?.timeoutMinutes);
   if (session?.mode) state.codexMode = session.mode;
   state.codexError = '';
   renderCodexStudio({ focus: 'composer' });
@@ -1756,11 +2092,25 @@ async function submitCodexMessage() {
   const chapterId = currentChapter()?.id;
   if (!projectId || !chapterId) return;
   const sessionId = state.codexSessionId;
-  const model = String($('#codex-model')?.value ?? state.codexModel ?? '').trim();
+  const rawModel = String($('#codex-model')?.value ?? state.codexModel ?? '').trim();
+  if (rawModel && !CODEX_MODEL_PATTERN.test(rawModel)) {
+    return toast('模型 ID 格式不正确', '请使用字母或数字开头，最多 100 个字符。', 'warn');
+  }
+  const model = normalizeCodexModel(rawModel);
+  const reasoningEffort = normalizeCodexReasoningEffort(
+    $('#codex-reasoning-effort')?.value ?? state.codexReasoningEffort ?? currentCodexSession()?.reasoningEffort
+  );
+  const timeoutMinutes = parseCodexTimeoutMinutes($('#codex-timeout-minutes')?.value);
+  if (timeoutMinutes === null) {
+    return toast('任务超时设置无效', '请输入 5–120 的整数分钟数。', 'warn');
+  }
   const mode = String($('#codex-room-mode')?.value || currentCodexSession()?.mode || state.codexMode || 'faithful');
+  const detailLevel = state.codexActivityVisible ? 'summary' : 'basic';
   state.codexProgressRecoveryId += 1;
   const requestId = ++state.codexRequestId;
   state.codexModel = model;
+  state.codexReasoningEffort = reasoningEffort;
+  state.codexTimeoutMinutes = timeoutMinutes;
   state.codexMode = mode;
   state.codexBusy = true;
   state.codexError = '';
@@ -1771,7 +2121,9 @@ async function submitCodexMessage() {
     const endpoint = sessionId
       ? `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions/${encodeURIComponent(sessionId)}/messages`
       : `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions`;
-    const body = sessionId ? { model, prompt, stream: true } : { mode, model, prompt, stream: true };
+    const body = sessionId
+      ? { model, reasoningEffort, timeoutMinutes, prompt, stream: true, detailLevel }
+      : { mode, model, reasoningEffort, timeoutMinutes, prompt, stream: true, detailLevel };
     const result = await api(endpoint, { method: 'POST', body });
     if (requestId !== state.codexRequestId) return;
     if (result?.progressId && result?.eventsUrl) {
@@ -1780,6 +2132,10 @@ async function submitCodexMessage() {
         projectId,
         chapterId,
         sessionId,
+        detailLevel,
+        model,
+        reasoningEffort,
+        timeoutMinutes,
         promptDraftKey: `${chapterId}:${sessionId || 'new'}`
       });
       if (!progress) throw new Error('Codex 已接收任务，但返回的进度地址无效。');
@@ -1793,6 +2149,9 @@ async function submitCodexMessage() {
     }
     if (result.project && state.project?.id === projectId) state.project = result.project;
     state.codexSessionId = result.session?.id || sessionId;
+    state.codexModel = normalizeCodexModel(result.session?.model, model);
+    state.codexReasoningEffort = normalizeCodexReasoningEffort(result.session?.reasoningEffort, reasoningEffort);
+    state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(result.session?.timeoutMinutes, timeoutMinutes);
     if (state.codexSessionId) state.codexSessionByChapter.set(chapterId, state.codexSessionId);
     state.codexDrafts.delete(`${chapterId}:${sessionId || 'new'}`);
     state.codexDrafts.set(`${chapterId}:${state.codexSessionId || 'new'}`, '');
@@ -1803,7 +2162,17 @@ async function submitCodexMessage() {
   } catch (error) {
     if (requestId !== state.codexRequestId) return;
     state.codexBusy = false;
-    state.codexError = error.message;
+    if (error.status === 409 && error.code === 'CODEX_PROGRESS_ACTIVE') {
+      state.codexError = '';
+      await recoverCodexProgress();
+      if (requestId !== state.codexRequestId) return;
+      renderCodexStudio();
+      toast('已接回本章后台任务', '当前任务仍在运行，可以继续查看进度。', 'warn');
+      return;
+    }
+    state.codexError = error.code === 'CODEX_TIMEOUT_MINUTES_INVALID'
+      ? '任务超时必须是 5–120 的整数分钟数。'
+      : error.message;
     renderCodexStudio({ focus: 'composer' });
   }
 }
@@ -2387,10 +2756,34 @@ document.addEventListener('click', async (event) => {
       updateCodexProgressPanel();
       return;
     }
+    if (action === 'toggle-codex-activity') {
+      const progress = currentCodexProgress();
+      if (!progress) return;
+      progress.activityExpanded = progress.activityExpanded === false;
+      updateCodexProgressPanel({ activityAutoScroll: progress.activityExpanded !== false && !progress.activityUnread });
+      return;
+    }
+    if (action === 'clear-codex-activity') {
+      const progress = currentCodexProgress();
+      if (!progress) return;
+      progress.activities = [];
+      progress.activityUnread = 0;
+      updateCodexProgressPanel();
+      toast('本地活动视图已清空', '后台任务仍会继续运行。', 'warn');
+      return;
+    }
+    if (action === 'scroll-codex-activity') {
+      const progress = currentCodexProgress();
+      if (!progress) return;
+      progress.activityExpanded = true;
+      progress.activityUnread = 0;
+      updateCodexProgressPanel({ activityAutoScroll: true });
+      return;
+    }
     if (action === 'use-codex-default-model') {
-      state.codexModel = '';
+      state.codexModel = DEFAULT_CODEX_MODEL;
       const model = $('#codex-model');
-      if (model) { model.value = ''; model.focus(); }
+      if (model) { model.value = DEFAULT_CODEX_MODEL; model.focus(); }
       return;
     }
     if (action === 'refresh-codex-room') {
@@ -2487,6 +2880,15 @@ document.addEventListener('click', async (event) => {
   } catch (error) { toast('操作失败', error.message, 'error'); }
 });
 
+document.addEventListener('scroll', (event) => {
+  const log = event.target?.matches?.('[data-codex-activity-log]') ? event.target : null;
+  const progress = currentCodexProgress();
+  if (!log || !progress || !codexActivityAtBottom(log) || !progress.activityUnread) return;
+  progress.activityUnread = 0;
+  const unread = $('#modal-root .codex-room-modal [data-action="scroll-codex-activity"]');
+  if (unread) unread.hidden = true;
+}, true);
+
 document.addEventListener('submit', (event) => {
   event.preventDefault();
   if (event.target.id === 'project-form') submitProject(event.target);
@@ -2506,11 +2908,35 @@ document.addEventListener('change', async (event) => {
     return;
   }
   if (input.id === 'codex-model') { state.codexModel = input.value.trim(); return; }
+  if (input.id === 'codex-reasoning-effort') {
+    state.codexReasoningEffort = normalizeCodexReasoningEffort(input.value);
+    return;
+  }
+  if (input.id === 'codex-timeout-minutes') {
+    const timeoutMinutes = parseCodexTimeoutMinutes(input.value);
+    if (timeoutMinutes !== null) state.codexTimeoutMinutes = timeoutMinutes;
+    return;
+  }
   if (input.id === 'codex-room-mode') { state.codexMode = CODEX_MODE_LABELS[input.value] ? input.value : 'faithful'; return; }
   if (input.id === 'codex-progress-visible') {
     state.codexProgressVisible = input.checked;
     writeLocalBoolean(CODEX_PROGRESS_PREFERENCE_KEY, state.codexProgressVisible);
     updateCodexProgressPanel();
+    return;
+  }
+  if (input.id === 'codex-activity-visible') {
+    state.codexActivityVisible = input.checked;
+    writeLocalBoolean(CODEX_ACTIVITY_PREFERENCE_KEY, state.codexActivityVisible);
+    const progress = currentCodexProgress();
+    if (!state.codexActivityVisible && progress) {
+      progress.activities = [];
+      progress.activityUnread = 0;
+    }
+    updateCodexProgressPanel();
+    if (state.codexActivityVisible && progress?.detailLevel === 'summary' && codexProgressIsActive(progress)) {
+      closeCodexProgressConnection(codexProgressKey());
+      connectCodexProgress(progress);
+    }
     return;
   }
   if (input.id === 'modal-book-file') {

@@ -4,6 +4,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { SCRIPT_SCHEMA_PATH } from './config.js';
+import {
+  codexActivitySensitiveTexts,
+  createCodexRedactionContext,
+  normalizeCodexDetailLevel,
+  sanitizeCodexActivitySummary
+} from './codex-activity.js';
+import {
+  codexReasoningConfigArg,
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+  DEFAULT_CODEX_TIMEOUT_MINUTES,
+  codexTimeoutMinutesToMs,
+  normalizeCodexModel,
+  normalizeCodexReasoningEffort,
+  normalizeCodexTimeoutMinutes
+} from './codex-options.js';
 import { clamp, id, stripCodeFence } from './utils.js';
 
 const MODE_GUIDANCE = {
@@ -17,6 +33,7 @@ export const CODEX_PROCESS_LIMITS = Object.freeze({
   stderrBytes: 2 * 1024 * 1024,
   errorDetailChars: 4000
 });
+export const CODEX_PROCESS_TIMEOUT_MS = codexTimeoutMinutesToMs(DEFAULT_CODEX_TIMEOUT_MINUTES);
 
 const CODEX_ENV_KEYS = [
   'APPDATA', 'CODEX_HOME', 'COMSPEC', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY',
@@ -262,9 +279,15 @@ function validateCliValue(value, label, { required = false, maxLength = 300 } = 
   return text;
 }
 
-export function buildCodexExecArgs({ schemaPath = SCRIPT_SCHEMA_PATH, model = '', sessionId = '' } = {}) {
+export function buildCodexExecArgs({
+  schemaPath = SCRIPT_SCHEMA_PATH,
+  model = DEFAULT_CODEX_MODEL,
+  reasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
+  sessionId = ''
+} = {}) {
   const schema = validateCliValue(schemaPath, 'Codex Schema 路径', { required: true, maxLength: 2000 });
-  const selectedModel = validateCliValue(model, 'Codex 模型');
+  const selectedModel = normalizeCodexModel(model);
+  const selectedReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
   const resumeId = validateCliValue(sessionId, 'Codex 会话 ID');
   if (resumeId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$/.test(resumeId)) {
     throw Object.assign(new Error('Codex 会话 ID 格式无效'), { code: 'CODEX_CONFIG_INVALID' });
@@ -273,7 +296,8 @@ export function buildCodexExecArgs({ schemaPath = SCRIPT_SCHEMA_PATH, model = ''
     '--json', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
     '--disable', 'shell_tool', '--disable', 'apps', '--disable', 'browser_use',
     '--disable', 'computer_use', '--disable', 'image_generation', '--disable', 'hooks',
-    ...(selectedModel ? ['--model', selectedModel] : []),
+    '--model', selectedModel,
+    '-c', codexReasoningConfigArg(selectedReasoningEffort),
     '--output-schema', schema
   ];
   return resumeId
@@ -282,9 +306,10 @@ export function buildCodexExecArgs({ schemaPath = SCRIPT_SCHEMA_PATH, model = ''
 }
 
 export function resolveCodexModel(model, settings = {}, project = null) {
-  return model === undefined
-    ? settings?.codexModel || project?.codexModel || project?.production?.codexModel || ''
-    : String(model || '');
+  const configured = model === undefined
+    ? settings?.codexModel || project?.codexModel || project?.production?.codexModel || DEFAULT_CODEX_MODEL
+    : model;
+  return normalizeCodexModel(configured);
 }
 
 /**
@@ -306,24 +331,76 @@ export function mapCodexJsonlProgress(event) {
       ? { type: 'stage', phase: 'validating' }
       : { type: 'stage', phase: 'drafting' };
   }
-  if (['command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'todo_list'].includes(itemType)) {
+  if ([
+    'command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'todo_list',
+    'collaboration', 'collab_tool_call', 'tool_call', 'function_call', 'dynamic_tool_call'
+  ].includes(itemType)) {
     return { type: 'stage', phase: 'processing' };
   }
   return null;
 }
 
+const CODEX_ACTIVITY_CATEGORIES = Object.freeze({
+  command_execution: 'command',
+  file_change: 'file',
+  mcp_tool_call: 'mcp',
+  web_search: 'web',
+  collaboration: 'collaboration',
+  collab_tool_call: 'collaboration',
+  todo_list: 'plan',
+  tool_call: 'tool',
+  function_call: 'tool',
+  dynamic_tool_call: 'tool'
+});
+
+const CODEX_JSONL_EVENT_TYPES = new Set([
+  'thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'error',
+  'item.started', 'item.updated', 'item.completed'
+]);
+
+/**
+ * Projects one JSONL item into the deliberately tiny public activity contract.
+ * Raw event fields are never copied. Agent messages (including final JSON) are always ignored.
+ */
+export function mapCodexJsonlActivity(event, {
+  detailLevel = 'basic',
+  redactionContext,
+  sensitiveTexts
+} = {}) {
+  if (detailLevel !== 'summary') return null;
+  const eventType = typeof event?.type === 'string' ? event.type : '';
+  if (!['item.started', 'item.updated', 'item.completed'].includes(eventType)) return null;
+  const itemType = typeof event?.item?.type === 'string' ? event.item.type : '';
+  if (itemType === 'agent_message') return null;
+  if (itemType === 'reasoning') {
+    const text = sanitizeCodexActivitySummary(event?.item?.text, { redactionContext, sensitiveTexts });
+    return text ? { type: 'activity', phase: 'reasoning_summary', category: 'reasoning_summary', text } : null;
+  }
+  const category = CODEX_ACTIVITY_CATEGORIES[itemType];
+  return category ? { type: 'activity', phase: 'activity', category } : null;
+}
+
 /** Incrementally decodes JSONL chunks while exposing only the fixed signals above. */
 export function createCodexJsonlProgressParser(onProgress, {
   maxEvents = 64,
+  maxActivityEvents = 24,
   maxParsedLines = 512,
-  maxBufferChars = CODEX_PROCESS_LIMITS.stdoutBytes
+  maxBufferChars = CODEX_PROCESS_LIMITS.stdoutBytes,
+  detailLevel = 'basic',
+  redactionContext,
+  sensitiveTexts
 } = {}) {
   const decoder = new StringDecoder('utf8');
+  const hasProgressHandler = typeof onProgress === 'function';
   const emitted = new Set();
+  const activityItems = new Set();
+  const activitySummaries = new Set();
   let lineBuffer = '';
-  let disabled = typeof onProgress !== 'function';
+  let disabled = false;
   let eventCount = 0;
+  let activityEventCount = 0;
   let parsedLineCount = 0;
+  let validJsonEventCount = 0;
   let firstLine = true;
 
   const emitLine = (line) => {
@@ -339,13 +416,42 @@ export function createCodexJsonlProgressParser(onProgress, {
     }
     let event;
     try { event = JSON.parse(candidate); } catch { return; }
+    if (CODEX_JSONL_EVENT_TYPES.has(typeof event?.type === 'string' ? event.type : '')) {
+      validJsonEventCount += 1;
+    }
     const progress = mapCodexJsonlProgress(event);
-    if (!progress) return;
-    const key = `${progress.type}:${progress.phase}`;
-    if (emitted.has(key) || eventCount >= maxEvents) return;
-    emitted.add(key);
+    if (progress) {
+      const key = `${progress.type}:${progress.phase}`;
+      if (!emitted.has(key) && eventCount < maxEvents) {
+        emitted.add(key);
+        eventCount += 1;
+        if (hasProgressHandler) {
+          try { onProgress({ type: progress.type, phase: progress.phase }); } catch { /* progress is best effort */ }
+        }
+      }
+    }
+    if (eventCount >= maxEvents || activityEventCount >= maxActivityEvents) return;
+    const activity = mapCodexJsonlActivity(event, { detailLevel, redactionContext, sensitiveTexts });
+    if (!activity) return;
+    const itemType = typeof event?.item?.type === 'string' ? event.item.type : '';
+    const rawItemId = typeof event?.item?.id === 'string' ? event.item.id.slice(0, 128) : '';
+    const itemKey = rawItemId ? `${itemType}:${rawItemId}` : '';
+    if (itemKey && activityItems.has(itemKey)) return;
+    if (activity.text && activitySummaries.has(activity.text)) return;
+    if (itemKey) activityItems.add(itemKey);
+    if (activity.text) activitySummaries.add(activity.text);
+    activityEventCount += 1;
     eventCount += 1;
-    try { onProgress({ ...progress }); } catch { /* progress must never affect the Codex result */ }
+    if (hasProgressHandler) {
+      try {
+        onProgress({
+          type: 'activity',
+          phase: activity.phase,
+          category: activity.category,
+          ...(activity.phase === 'reasoning_summary' ? { text: activity.text } : {})
+        });
+      } catch { /* progress is best effort */ }
+    }
   };
 
   const consume = (text) => {
@@ -379,6 +485,9 @@ export function createCodexJsonlProgressParser(onProgress, {
     cancel() {
       lineBuffer = '';
       disabled = true;
+    },
+    hasValidEvent() {
+      return validJsonEventCount > 0;
     }
   };
 }
@@ -474,17 +583,47 @@ function processErrorMessage(error) {
   return '无法启动 Codex CLI，请检查本机安装与执行权限。';
 }
 
+function normalizeCodexProcessTimeoutMs(value) {
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < 1
+    || value > 2_147_483_647
+  ) {
+    throw Object.assign(new Error('Codex 子进程超时时间超出安全计时范围。'), {
+      code: 'CODEX_CONFIG_INVALID'
+    });
+  }
+  return value;
+}
+
+export function formatCodexTimeoutDuration(timeoutMs) {
+  const duration = normalizeCodexProcessTimeoutMs(timeoutMs);
+  if (duration % 60_000 === 0) return `${duration / 60_000} 分钟`;
+  if (duration % 1_000 === 0) return `${duration / 1_000} 秒`;
+  return `${duration} 毫秒`;
+}
+
 function runProcess(command, args, stdin, {
   cwd,
   env = codexProcessEnv(),
-  timeoutMs = 10 * 60_000,
+  timeoutMs = CODEX_PROCESS_TIMEOUT_MS,
   maxStdoutBytes = CODEX_PROCESS_LIMITS.stdoutBytes,
   maxStderrBytes = CODEX_PROCESS_LIMITS.stderrBytes,
   onProgress,
+  detailLevel = 'basic',
+  redactionContext,
   signal,
   spawnProcess = spawn
 } = {}) {
   return new Promise((resolve, reject) => {
+    let normalizedTimeoutMs;
+    try {
+      normalizedTimeoutMs = normalizeCodexProcessTimeoutMs(timeoutMs);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     if (signal?.aborted) {
       reject(Object.assign(new Error('Codex 请求已取消。'), { code: 'CODEX_CANCELLED' }));
       return;
@@ -502,7 +641,11 @@ function runProcess(command, args, stdin, {
     let stderrBytes = 0;
     let settled = false;
     let abortHandler = null;
-    const progressParser = createCodexJsonlProgressParser(onProgress, { maxBufferChars: maxStdoutBytes });
+    const progressParser = createCodexJsonlProgressParser(onProgress, {
+      maxBufferChars: maxStdoutBytes,
+      detailLevel,
+      redactionContext
+    });
 
     const detachAbort = () => {
       if (abortHandler) signal?.removeEventListener('abort', abortHandler);
@@ -521,8 +664,17 @@ function runProcess(command, args, stdin, {
       reject(error);
     };
     const timer = setTimeout(() => {
-      fail(Object.assign(new Error(`Codex 处理超时（${Math.round(timeoutMs / 1000)} 秒）`), { code: 'CODEX_TIMEOUT' }));
-    }, timeoutMs);
+      const active = progressParser.hasValidEvent();
+      const duration = formatCodexTimeoutDuration(normalizedTimeoutMs);
+      fail(Object.assign(new Error(
+        active
+          ? `Codex 已开始生成，但未在 ${duration}内完成。`
+          : `Codex 启动或网络响应未在 ${duration}内开始。`
+      ), {
+        code: active ? 'CODEX_TIMEOUT_ACTIVE' : 'CODEX_TIMEOUT_STARTING',
+        timeoutMs: normalizedTimeoutMs
+      }));
+    }, normalizedTimeoutMs);
 
     child.stdout.on('data', (chunk) => {
       if (settled) return;
@@ -594,7 +746,10 @@ export async function runCodexSession({
   model,
   sessionId = '',
   prompt = '',
-  timeoutMs = 10 * 60_000,
+  timeoutMinutes,
+  timeoutMs,
+  reasoningEffort,
+  detailLevel = 'basic',
   onProgress,
   signal,
   spawnProcess
@@ -604,14 +759,31 @@ export async function runCodexSession({
   }
   const command = validateCliValue(settings?.codexCommand || 'codex', 'Codex CLI 命令', { required: true, maxLength: 2000 });
   const resumeId = validateCliValue(sessionId, 'Codex 会话 ID');
+  const normalizedDetailLevel = normalizeCodexDetailLevel(detailLevel);
+  const normalizedReasoningEffort = normalizeCodexReasoningEffort(
+    reasoningEffort === undefined ? settings?.codexReasoningEffort : reasoningEffort
+  );
+  const normalizedTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
+  const processTimeoutMs = timeoutMs === undefined
+    ? codexTimeoutMinutesToMs(normalizedTimeoutMinutes)
+    : normalizeCodexProcessTimeoutMs(timeoutMs);
   const selectedModel = resolveCodexModel(model, settings, project);
   const runtime = await prepareCodexRuntime(project, chapter);
-  const args = buildCodexExecArgs({ schemaPath: runtime.schemaPath, model: selectedModel, sessionId: resumeId });
+  const args = buildCodexExecArgs({
+    schemaPath: runtime.schemaPath,
+    model: selectedModel,
+    reasoningEffort: normalizedReasoningEffort,
+    sessionId: resumeId
+  });
   const stdin = resumeId
     ? buildCodexFollowUpPrompt({ chapter, project, prompt })
     : buildInitialSessionPrompt(chapter, mode, prompt);
+  const redactionContext = normalizedDetailLevel === 'summary'
+    ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
+    : undefined;
   const output = await runProcess(command, args, stdin, {
-    cwd: runtime.cwd, timeoutMs, onProgress, signal, spawnProcess
+    cwd: runtime.cwd, timeoutMs: processTimeoutMs, onProgress, detailLevel: normalizedDetailLevel,
+    redactionContext, signal, spawnProcess
   });
   const parsed = parseCodexJsonl(output.stdout);
   const threadId = parsed.threadId || resumeId;

@@ -336,6 +336,8 @@ test('Codex 协作室持久化同一 session，并把手工修改带入下一轮
       script: makeScript('第一版台词。'), usage: { input_tokens: 10, output_tokens: 20 }
     };
     if (input.prompt === '模拟慢请求。') {
+      assert.equal(input.timeoutMinutes, 120);
+      assert.equal(input.timeoutMs, 120 * 60_000);
       signalConflictStarted();
       await conflictGate;
       return {
@@ -364,15 +366,46 @@ test('Codex 协作室持久化同一 session，并把手工修改带入下一轮
   }).then((response) => response.json());
   const chapterId = project.chapters[0].id;
 
+  const invalidModel = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: '--dangerously-bypass-approvals-and-sandbox' })
+  });
+  assert.equal(invalidModel.status, 400);
+  assert.equal((await invalidModel.json()).error, 'CODEX_MODEL_INVALID');
+  const invalidEffort = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reasoningEffort: 'none' })
+  });
+  assert.equal(invalidEffort.status, 400);
+  assert.equal((await invalidEffort.json()).error, 'CODEX_REASONING_EFFORT_INVALID');
+  for (const timeoutMinutes of [4, 121, 5.5, '', '10', true, [], [10], {}]) {
+    const invalidTimeout = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeoutMinutes })
+    });
+    assert.equal(invalidTimeout.status, 400);
+    assert.equal((await invalidTimeout.json()).error, 'CODEX_TIMEOUT_MINUTES_INVALID');
+  }
+  assert.equal(calls.length, 0);
+
   const firstResponse = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: 'faithful', model: 'gpt-5.6-terra', prompt: '保持克制。' })
+    body: JSON.stringify({ mode: 'faithful', prompt: '保持克制。', timeoutMinutes: null })
   });
   assert.equal(firstResponse.status, 201);
   const first = await firstResponse.json();
   assert.match(first.session.id, /^codexchat_[a-f0-9]{16}$/);
   assert.equal(first.session.turnCount, 1);
   assert.equal(first.session.model, 'gpt-5.6-terra');
+  assert.equal(first.session.reasoningEffort, 'medium');
+  assert.equal(first.session.timeoutMinutes, 10);
+  assert.equal(first.model, 'gpt-5.6-terra');
+  assert.equal(first.reasoningEffort, 'medium');
+  assert.equal(first.timeoutMinutes, 10);
+  assert.equal(calls[0].model, 'gpt-5.6-terra');
+  assert.equal(calls[0].reasoningEffort, 'medium');
+  assert.equal(calls[0].timeoutMinutes, 10);
+  assert.equal(calls[0].timeoutMs, 10 * 60_000);
   const lineId = first.project.chapters[0].scenes[0].lines[0].id;
 
   const manualResponse = await fetch(`${base}/api/projects/${project.id}/lines/${lineId}`, {
@@ -383,28 +416,38 @@ test('Codex 协作室持久化同一 session，并把手工修改带入下一轮
 
   const followResponse = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions/${first.session.id}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: '', prompt: '在手工稿基础上再自然一点。' })
+    body: JSON.stringify({
+      model: '', reasoningEffort: 'high', timeoutMinutes: 120,
+      prompt: '在手工稿基础上再自然一点。'
+    })
   });
   assert.equal(followResponse.status, 200);
   const follow = await followResponse.json();
   assert.equal(follow.session.id, first.session.id);
   assert.equal(follow.session.turnCount, 2);
-  assert.equal(follow.session.model, '');
+  assert.equal(follow.session.model, 'gpt-5.6-terra');
+  assert.equal(follow.session.reasoningEffort, 'high');
+  assert.equal(follow.session.timeoutMinutes, 120);
+  assert.equal(follow.timeoutMinutes, 120);
   assert.equal(follow.session.messages.at(-2).content, '在手工稿基础上再自然一点。');
   assert.equal(follow.project.chapters[0].scenes[0].lines[0].spokenText, 'Codex 根据手工稿继续精修。');
   assert.equal(calls[1].sessionId, '0199a213-81c0-7800-8aa1-bbab2a035a53');
-  assert.equal(calls[1].model, '');
+  assert.equal(calls[1].model, 'gpt-5.6-terra');
+  assert.equal(calls[1].reasoningEffort, 'high');
+  assert.equal(calls[1].timeoutMinutes, 120);
+  assert.equal(calls[1].timeoutMs, 120 * 60_000);
   assert.equal('codexThreadId' in first.project.chapters[0].codexSessions[0], false);
   assert.equal('codexThreadId' in follow.project.chapters[0].codexSessions[0], false);
 
   const sessions = await fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions`).then((response) => response.json());
   assert.equal(sessions.activeSessionId, first.session.id);
   assert.equal(sessions.sessions.length, 1);
+  assert.equal(sessions.sessions[0].timeoutMinutes, 120);
   assert.equal('codexThreadId' in sessions.sessions[0], false);
 
   const conflictRequest = fetch(`${base}/api/projects/${project.id}/chapters/${chapterId}/codex-sessions/${first.session.id}/messages`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: '', prompt: '模拟慢请求。' })
+    body: JSON.stringify({ model: '', prompt: '模拟慢请求。', timeoutMinutes: null })
   });
   await conflictStarted;
   const latestLineId = follow.project.chapters[0].scenes[0].lines[0].id;
@@ -420,6 +463,7 @@ test('Codex 协作室持久化同一 session，并把手工修改带入下一轮
   assert.equal(conflict.error, 'CODEX_CHAPTER_CHANGED');
   const afterConflict = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
   assert.equal(afterConflict.chapters[0].scenes[0].lines[0].spokenText, '处理期间的新手工稿。');
+  assert.equal(afterConflict.chapters[0].codexSessions[0].timeoutMinutes, 120);
   assert.equal('codexThreadId' in afterConflict.chapters[0].codexSessions[0], false);
 });
 
