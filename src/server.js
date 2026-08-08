@@ -15,7 +15,9 @@ import {
   listVoices, mergeRoles, mutateProject, replaceProjectSource, summarizeProject, updateSettings
 } from './lib/store.js';
 import { decodeBook, normalizeNovelText } from './lib/novel.js';
-import { convertChapter, createCodexPackage, normalizeImportedScript, runCodexSession } from './lib/script-engine.js';
+import {
+  chapterToScriptSnapshot, convertChapter, createCodexPackage, normalizeImportedScript, runCodexSession
+} from './lib/script-engine.js';
 import {
   appendCodexTurn, createCodexSession, findCodexSession, publicCodexSession,
   publicCodexSessions, saveCodexSession
@@ -335,6 +337,19 @@ function applyScript(project, chapter, script) {
   chapter.status = 'scripted';
 }
 
+function chapterSessionSnapshot(project, chapter) {
+  const snapshot = chapterToScriptSnapshot(chapter, project);
+  snapshot.scenes = snapshot.scenes.map((scene, sceneIndex) => ({
+    ...scene,
+    id: chapter.scenes?.[sceneIndex]?.id,
+    lines: scene.lines.map((line, lineIndex) => ({
+      ...line,
+      id: chapter.scenes?.[sceneIndex]?.lines?.[lineIndex]?.id
+    }))
+  }));
+  return snapshot;
+}
+
 function pruneUnusedRoles(project) {
   const used = new Set(project.chapters.flatMap((chapter) => (chapter.scenes || [])
     .flatMap((scene) => (scene.lines || []).map((line) => line.speakerId))));
@@ -580,6 +595,38 @@ async function handleApi(req, res, url, {
     return json(res, 202, job);
   }
 
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/activate');
+  if (params && method === 'POST') {
+    assertCodexWorkspaceRequest(req);
+    const latest = progressManager.latest(params.projectId, params.chapterId);
+    if (latest && !latest.terminal) {
+      throw Object.assign(new Error('本章正在处理 Codex 请求，完成后才能切换版本。'), {
+        statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
+      });
+    }
+    const result = await mutateProject(params.projectId, (draft) => {
+      const chapter = findChapter(draft, params.chapterId);
+      const targetSession = findCodexSession(chapter, params.sessionId);
+      if (chapter.activeCodexSessionId === targetSession.id) {
+        return { project: draft, session: publicCodexSession(targetSession) };
+      }
+      if (!targetSession.scriptSnapshot?.scenes?.length) {
+        throw Object.assign(new Error('这个旧 Session 没有可恢复的剧本快照。'), {
+          statusCode: 409, code: 'CODEX_SESSION_VERSION_UNAVAILABLE'
+        });
+      }
+      const currentSession = (chapter.codexSessions || [])
+        .find((session) => session.id === chapter.activeCodexSessionId);
+      if (currentSession) currentSession.scriptSnapshot = chapterSessionSnapshot(draft, chapter);
+      applyScript(draft, chapter, structuredClone(targetSession.scriptSnapshot));
+      chapter.activeCodexSessionId = targetSession.id;
+      pruneUnusedRoles(draft);
+      draft.status = 'scripted';
+      return { project: draft, session: publicCodexSession(targetSession) };
+    });
+    return json(res, 200, { project: publicProject(result.project), session: result.session });
+  }
+
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/messages');
   if (params && method === 'POST') {
     assertCodexWorkspaceRequest(req);
@@ -726,6 +773,9 @@ async function handleApi(req, res, url, {
         assertCodexRunActive(signal);
         const targetChapter = findChapter(draft, params.chapterId);
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
+        const previousSession = (targetChapter.codexSessions || [])
+          .find((session) => session.id === targetChapter.activeCodexSessionId);
+        if (previousSession) previousSession.scriptSnapshot = chapterSessionSnapshot(draft, targetChapter);
         applyScript(draft, targetChapter, turn.script);
         const session = createCodexSession({
           threadId: turn.threadId, model, reasoningEffort, timeoutMinutes, mode, prompt,

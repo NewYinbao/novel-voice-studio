@@ -44,6 +44,11 @@ function message(role, content, meta = undefined) {
   return item;
 }
 
+function cloneScriptSnapshot(script) {
+  if (!script || typeof script !== 'object' || !Array.isArray(script.scenes)) return null;
+  return structuredClone(script);
+}
+
 export function assertCodexSessionId(value) {
   const candidate = String(value || '');
   if (!SESSION_ID_PATTERN.test(candidate)) {
@@ -82,6 +87,7 @@ export function createCodexSession({
     createdAt: timestamp,
     updatedAt: timestamp,
     turnCount: 1,
+    scriptSnapshot: cloneScriptSnapshot(script),
     messages: [
       message('user', prompt || '请把当前章节转换为结构化有声书剧本。'),
       message('assistant', assistantSummary(script), { ...stats, usage: safeUsage(usage) })
@@ -99,6 +105,7 @@ export function appendCodexTurn(session, {
   session.status = 'ready';
   session.updatedAt = nowIso();
   session.turnCount = Math.max(0, Number(session.turnCount) || 0) + 1;
+  session.scriptSnapshot = cloneScriptSnapshot(script);
   session.messages = [
     ...(Array.isArray(session.messages) ? session.messages : []),
     message('user', prompt),
@@ -118,7 +125,7 @@ export function saveCodexSession(chapter, session) {
 
 export function publicCodexSession(session) {
   if (!session) return null;
-  const { codexThreadId: _privateThreadId, ...publicValue } = session;
+  const { codexThreadId: _privateThreadId, scriptSnapshot: _privateScriptSnapshot, ...publicValue } = session;
   let publicReasoningEffort = null;
   if (publicValue.reasoningEffort !== undefined && publicValue.reasoningEffort !== null && publicValue.reasoningEffort !== '') {
     try { publicReasoningEffort = normalizeCodexReasoningEffort(publicValue.reasoningEffort); } catch { /* legacy value */ }
@@ -129,6 +136,7 @@ export function publicCodexSession(session) {
   }
   return {
     ...publicValue,
+    versionAvailable: Boolean(_privateScriptSnapshot?.scenes?.length),
     model: cleanText(publicValue.model, 100),
     reasoningEffort: publicReasoningEffort,
     timeoutMinutes: publicTimeoutMinutes,

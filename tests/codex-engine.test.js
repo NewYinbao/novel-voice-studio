@@ -23,7 +23,32 @@ import {
   normalizeCodexReasoningEffort,
   normalizeCodexTimeoutMinutes
 } from '../src/lib/codex-options.js';
-import { publicCodexSession } from '../src/lib/codex-sessions.js';
+import { appendCodexTurn, createCodexSession, publicCodexSession } from '../src/lib/codex-sessions.js';
+
+test('Codex Session 保存私有剧本版本快照且公开接口只暴露可用标记', () => {
+  const script = {
+    chapterTitle: '第一章', roles: [{ name: '旁白', aliases: [], description: '', isNarrator: true }],
+    scenes: [{ id: 'scene_a', title: '场景', context: '', lines: [{ id: 'line_a', kind: 'narration', speaker: '旁白', sourceText: '原文', spokenText: '版本一' }] }],
+    warnings: []
+  };
+  const session = createCodexSession({
+    threadId: 'thread-a', model: 'gpt-5.6-terra', reasoningEffort: 'medium', timeoutMinutes: 10,
+    mode: 'faithful', prompt: '生成版本', script
+  });
+  script.scenes[0].lines[0].spokenText = '外部修改';
+  assert.equal(session.scriptSnapshot.scenes[0].lines[0].spokenText, '版本一');
+  const nextScript = structuredClone(session.scriptSnapshot);
+  nextScript.scenes[0].lines[0].spokenText = '版本二';
+  appendCodexTurn(session, {
+    prompt: '继续修改', model: 'gpt-5.6-terra', reasoningEffort: 'medium', timeoutMinutes: 10,
+    script: nextScript
+  });
+  assert.equal(session.scriptSnapshot.scenes[0].lines[0].spokenText, '版本二');
+  const publicValue = publicCodexSession(session);
+  assert.equal(publicValue.versionAvailable, true);
+  assert.equal('scriptSnapshot' in publicValue, false);
+  assert.equal('codexThreadId' in publicValue, false);
+});
 
 test('Codex 初始会话使用 JSONL 和 Schema，且不使用 ephemeral', () => {
   const args = buildCodexExecArgs({ schemaPath: 'C:\\schemas\\script.json', model: 'gpt-test' });

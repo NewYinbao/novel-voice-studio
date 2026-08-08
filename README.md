@@ -158,7 +158,7 @@ RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttentio
 
 剧本处理有四条路径：本地规则引擎、Codex 剧本协作室、Codex 任务包手工交接，以及本地 Ollama。润色档位与处理路径彼此独立，均可选择忠实朗读、轻度剧本化或广播剧化。
 
-Codex 剧本协作室使用带项目与章节 ID 的独立页面路由，刷新、浏览器前进后退或从制作台重新进入时都能恢复当前章节。首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。页面支持每轮选择模型、推理强度和超时时间，查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
+Codex 剧本协作室使用带项目与章节 ID 的独立页面路由，刷新、浏览器前进后退或从制作台重新进入时都能恢复当前章节。首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。左侧按 Session 展示整个项目的版本线，章节名仅作为归属标签；同一章节可保留多个 Session 版本，切换时会恢复对应剧本快照。中间对话与右侧逐句剧本之间的分隔线可拖拽或用方向键调整，比例保存在当前浏览器。页面支持每轮选择模型、推理强度和超时时间，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
 
 新会话默认显式使用 `gpt-5.6-terra` 与 `medium`，不会受用户级 `config.toml` 中的模型或推理强度影响。界面可选择 `low`、`medium`、`high`、`xhigh` 或 `max`；其中 `medium` 是质量与速度的推荐平衡点，`max` 最慢，只适合质量优先的困难章节。模型、推理强度和超时时间会随会话保存，并在任务进度卡中显示本轮实际快照。
 

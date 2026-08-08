@@ -3,6 +3,8 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const CODEX_PROGRESS_PREFERENCE_KEY = 'novelVoiceStudio.codexProgressVisible.v1';
 const CODEX_ACTIVITY_PREFERENCE_KEY = 'novelVoiceStudio.codexActivityVisible.v1';
+const CODEX_SESSION_PANE_WIDTH_KEY = 'novelVoiceStudio.codexSessionPaneWidth.v1';
+const CODEX_SCRIPT_PANE_WIDTH_KEY = 'novelVoiceStudio.codexScriptPaneWidth.v1';
 const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
 const DEFAULT_CODEX_REASONING_EFFORT = 'medium';
 const DEFAULT_CODEX_TIMEOUT_MINUTES = 10;
@@ -20,6 +22,21 @@ function readLocalBoolean(key, fallback) {
 
 function writeLocalBoolean(key, value) {
   try { localStorage.setItem(key, value ? 'true' : 'false'); } catch {}
+}
+
+function readLocalNumber(key, fallback, min, max) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw === '') return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocalNumber(key, value) {
+  try { localStorage.setItem(key, String(Math.round(value))); } catch {}
 }
 
 const state = {
@@ -67,6 +84,8 @@ const state = {
   codexRequestId: 0,
   codexProgressVisible: readLocalBoolean(CODEX_PROGRESS_PREFERENCE_KEY, true),
   codexActivityVisible: readLocalBoolean(CODEX_ACTIVITY_PREFERENCE_KEY, false),
+  codexSessionPaneWidth: readLocalNumber(CODEX_SESSION_PANE_WIDTH_KEY, 224, 180, 360),
+  codexScriptPaneWidth: readLocalNumber(CODEX_SCRIPT_PANE_WIDTH_KEY, 430, 300, 720),
   codexProgressByChapter: new Map(),
   codexProgressSources: new Map(),
   codexProgressGeneration: 0,
@@ -386,6 +405,27 @@ function codexSessions(chapter = currentChapter()) {
     const rightDate = right.updatedAt || right.messages?.at(-1)?.createdAt || right.createdAt || '';
     return String(rightDate).localeCompare(String(leftDate));
   });
+}
+
+function allCodexSessions() {
+  const rows = [];
+  for (const chapter of state.project?.chapters || []) {
+    const sessions = codexSessions(chapter);
+    sessions.forEach((session, index) => rows.push({
+      ...session,
+      chapterId: chapter.id,
+      chapterTitle: chapter.title,
+      chapterIndex: chapter.index,
+      versionNumber: Math.max(1, sessions.length - index)
+    }));
+  }
+  return rows.sort((left, right) => String(right.updatedAt || right.createdAt || '')
+    .localeCompare(String(left.updatedAt || left.createdAt || '')));
+}
+
+function findCodexSessionAcrossProject(sessionId, chapterId = '') {
+  return allCodexSessions().find((session) => session.id === sessionId
+    && (!chapterId || session.chapterId === chapterId)) || null;
 }
 
 function currentCodexSession() {
@@ -1276,9 +1316,9 @@ function codexProgressPanelHtml(progress) {
   if (!progress) return '';
   const presentation = CODEX_PROGRESS_PRESENTATION[progress.type] || CODEX_PROGRESS_PRESENTATION.stage;
   const bodyId = `codex-progress-body-${progress.progressId}`;
-  return `<section class="codex-progress-panel ${presentation.tone}" data-progress-id="${escapeHtml(progress.progressId)}" role="region" aria-labelledby="codex-progress-title">
+  return `<section class="codex-progress-panel codex-run-event ${presentation.tone}" data-progress-id="${escapeHtml(progress.progressId)}" role="region" aria-labelledby="codex-progress-title">
     <header><div class="codex-progress-heading"><i aria-hidden="true"></i><div><strong id="codex-progress-title" data-codex-progress-title>${escapeHtml(presentation.label)}</strong><small data-codex-progress-connection>${escapeHtml(codexProgressConnectionLabel(progress))}</small><small class="codex-progress-runtime">${escapeHtml(codexProgressRuntimeLabel(progress))}</small></div></div><div class="codex-progress-meta"><time data-codex-progress-elapsed datetime="PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S" aria-label="已用时 ${escapeHtml(formatCodexProgressElapsed(progress))}">${escapeHtml(formatCodexProgressElapsed(progress))}</time><button class="icon-button" type="button" data-action="toggle-codex-progress" aria-expanded="${progress.expanded !== false}" aria-controls="${bodyId}" aria-label="${progress.expanded === false ? '展开处理进度' : '折叠处理进度'}">${progress.expanded === false ? '⌄' : '⌃'}</button></div></header>
-    <div class="codex-progress-body" id="${bodyId}" ${progress.expanded === false ? 'hidden' : ''}><p class="codex-progress-summary" data-codex-progress-summary>${escapeHtml(progress.message || presentation.label)}</p><ol class="codex-progress-timeline" data-codex-progress-timeline>${codexProgressTimelineHtml(progress)}</ol><div data-codex-activity-slot>${state.codexActivityVisible ? codexActivityPanelHtml(progress) : ''}</div><p class="codex-progress-disclosure"><span aria-hidden="true">◇</span><span><strong>这是任务进度摘要，不是隐藏思维链</strong><small>这里只显示阶段、耗时和安全摘要，不展示模型内部推理或凭据。</small></span></p></div>
+    <div class="codex-progress-body" id="${bodyId}" ${progress.expanded === false ? 'hidden' : ''}><p class="codex-progress-summary" data-codex-progress-summary>${escapeHtml(progress.message || presentation.label)}</p><ol class="codex-progress-timeline" data-codex-progress-timeline>${codexProgressTimelineHtml(progress)}</ol><div data-codex-activity-slot>${state.codexActivityVisible ? codexActivityPanelHtml(progress) : ''}</div><p class="codex-run-note">安全运行摘要 · 不展示隐藏思维链、提示词或凭据</p></div>
   </section>`;
 }
 
@@ -1585,6 +1625,18 @@ function codexSessionTitle(session, index) {
   const firstPrompt = session.messages?.find((message) => message.role === 'user')?.content || '';
   const title = String(session.title || firstPrompt).replace(/\s+/g, ' ').trim();
   return title ? title.slice(0, 34) : `协作会话 ${index + 1}`;
+}
+
+function codexSessionItemHtml(item, index, activeSessionId, disabled = false) {
+  const progress = state.codexProgressByChapter.get(codexProgressKey(state.project?.id, item.chapterId));
+  const running = codexProgressIsActive(progress) && progress?.sessionId === item.id;
+  const selected = item.id === activeSessionId && item.chapterId === currentChapter()?.id;
+  const version = `V${item.versionNumber || 1}`;
+  return `<button class="codex-session-item ${selected ? 'active' : ''} ${running ? 'running' : ''}" data-action="select-codex-session" data-session-id="${escapeHtml(item.id)}" data-chapter-id="${escapeHtml(item.chapterId)}" ${disabled ? 'disabled' : ''}>
+    <span class="codex-session-primary"><span class="codex-session-version">${escapeHtml(version)}</span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong></span>
+    <small class="codex-session-chapter">${escapeHtml(item.chapterTitle || '未命名章节')}</small>
+    <span class="codex-session-meta"><em>${running ? '处理中' : `${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮`}</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span>
+  </button>`;
 }
 
 function updateTopbar() {
@@ -1953,6 +2005,7 @@ function codexLineEditorHtml(line, index) {
 function codexStudioHtml() {
   const chapter = currentChapter();
   const sessions = codexSessions(chapter);
+  const projectSessions = allCodexSessions();
   const session = currentCodexSession();
   const readiness = codexReadiness();
   const messages = session?.messages || [];
@@ -1976,12 +2029,14 @@ function codexStudioHtml() {
     ? `<button class="button primary small" data-action="start-codex-login" ${busy ? 'disabled' : ''}>${loginActive ? '查看登录' : '登录 Codex'}</button>`
     : '';
   return `<header class="codex-room-head"><div class="codex-room-title"><button class="button ghost codex-room-back" data-action="leave-codex-room" ${state.codexBusy ? 'disabled' : ''}>‹ 返回制作台</button><div><span class="eyebrow">CODEX SCRIPT ROOM</span><h1>Codex 剧本协作室</h1><p>${escapeHtml(chapter?.title || '当前章节')} · 多轮调整与逐句校对</p></div></div><div class="codex-room-head-actions"><span class="codex-room-status ${readiness.ready ? 'ready' : 'warn'}"><i></i>${escapeHtml(readiness.label)}</span></div></header>
-    <div class="codex-room-grid">
+    <div class="codex-room-grid" style="--codex-session-width:${Math.round(state.codexSessionPaneWidth)}px;--codex-script-width:${Math.round(state.codexScriptPaneWidth)}px">
       <aside class="codex-session-panel" aria-label="Codex 会话历史">
-        <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>本章会话</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新会话</button></div>
-        <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${busy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(codexSessionRuntimeLabel(item))}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
+        <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>版本会话</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新版本</button></div>
+        <p class="codex-session-hint">每个 Session 是一条独立版本线；章节名仅用于标识归属。</p>
+        <div class="codex-session-list">${projectSessions.length ? projectSessions.map((item, index) => codexSessionItemHtml(item, index, session?.id, state.codexBusy)).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有版本会话</strong><small>新建 Session 后，可以在同一章节保留多条独立调整路线。</small></div>'}</div>
         <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${busy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
       </aside>
+      <div class="codex-splitter codex-splitter-left" data-codex-splitter="left" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整 Session 列表宽度"></div>
       <section class="codex-chat-panel" aria-label="Codex 对话与任务进度" aria-busy="${busy}">
         <div class="codex-chat-toolbar">
           <label class="codex-model-control"><span>模型（默认 Terra，可输入 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}" value="${escapeHtml(model)}" placeholder="gpt-5.6-terra" title="以字母或数字开头，最多 100 个字符" autocomplete="off" spellcheck="false" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" title="使用推荐模型 gpt-5.6-terra" ${busy ? 'disabled' : ''}>Terra</button></div></label>
@@ -1992,16 +2047,81 @@ function codexStudioHtml() {
           <div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small><fieldset class="codex-observability-controls"><legend class="sr-only">Codex 进度显示设置</legend><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label><label class="codex-progress-visibility codex-activity-visibility"><input type="checkbox" id="codex-activity-visible" ${state.codexActivityVisible ? 'checked' : ''} aria-describedby="codex-activity-setting-help"><span>显示推理摘要与活动日志 <em>非隐藏思维链</em></span></label><small id="codex-activity-setting-help">摘要采集模式在发送新任务时确定；关闭显示不会停止后台处理</small></fieldset></div>
         </div>
         <div class="sr-only" id="codex-progress-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
-        <div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>
-        <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一章</h3><p>第一次发送会创建会话并更新右侧剧本。之后可以继续要求修正角色、语气或某一段台词。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 Codex 后台任务</strong><small>收到任务编号后即可返回制作台，处理会在后台继续。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
+        <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一版</h3><p>新建 Session 会创建独立版本线；继续发送则沿当前 Session 迭代。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}<div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 Codex 后台任务</strong><small>收到任务编号后会转为流式运行记录。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
         <form class="codex-composer" id="codex-chat-form" novalidate><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以返回制作台，稍后再进入本页查看。' : readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
       </section>
+      <div class="codex-splitter codex-splitter-right" data-codex-splitter="right" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整对话与剧本宽度比例"></div>
       <aside class="codex-script-panel" aria-label="当前剧本逐句编辑">
         <div class="codex-panel-title"><div><span class="eyebrow">LIVE SCRIPT</span><strong>当前剧本</strong></div><span class="codex-line-count">${lines.length} 句</span></div>
         <p class="codex-script-hint">可直接修改台词、角色、情绪与节奏；每项改动都会自动保存。</p>
         <div class="codex-script-list">${lines.length ? lines.map(codexLineEditorHtml).join('') : '<div class="codex-empty-script"><span>▤</span><strong>本章还没有剧本</strong><small>向 Codex 发送第一条要求后，生成结果会显示在这里。</small></div>'}</div>
       </aside>
     </div>`;
+}
+
+function codexPaneBounds(grid, side) {
+  const width = grid?.getBoundingClientRect().width || 0;
+  if (side === 'left') return { min: 180, max: Math.max(180, Math.min(360, width - state.codexScriptPaneWidth - 520)) };
+  return { min: 300, max: Math.max(300, Math.min(720, width - state.codexSessionPaneWidth - 520)) };
+}
+
+function setCodexPaneWidth(grid, side, rawValue, { persist = false } = {}) {
+  const bounds = codexPaneBounds(grid, side);
+  const value = Math.round(Math.min(bounds.max, Math.max(bounds.min, Number(rawValue) || bounds.min)));
+  if (side === 'left') {
+    state.codexSessionPaneWidth = value;
+    grid.style.setProperty('--codex-session-width', `${value}px`);
+    if (persist) writeLocalNumber(CODEX_SESSION_PANE_WIDTH_KEY, value);
+  } else {
+    state.codexScriptPaneWidth = value;
+    grid.style.setProperty('--codex-script-width', `${value}px`);
+    if (persist) writeLocalNumber(CODEX_SCRIPT_PANE_WIDTH_KEY, value);
+  }
+  const separator = $(`[data-codex-splitter="${side}"]`, grid);
+  if (separator) {
+    separator.setAttribute('aria-valuemin', String(bounds.min));
+    separator.setAttribute('aria-valuemax', String(bounds.max));
+    separator.setAttribute('aria-valuenow', String(value));
+  }
+}
+
+function setupCodexSplitters() {
+  const grid = $('.codex-room-grid');
+  if (!grid) return;
+  for (const splitter of $$('[data-codex-splitter]', grid)) {
+    const side = splitter.dataset.codexSplitter;
+    setCodexPaneWidth(grid, side, side === 'left' ? state.codexSessionPaneWidth : state.codexScriptPaneWidth);
+    splitter.addEventListener('pointerdown', (event) => {
+      if (matchMedia('(max-width: 1100px)').matches || event.button !== 0) return;
+      event.preventDefault();
+      splitter.setPointerCapture?.(event.pointerId);
+      document.documentElement.classList.add('codex-resizing');
+      const rect = grid.getBoundingClientRect();
+      const move = (moveEvent) => setCodexPaneWidth(
+        grid,
+        side,
+        side === 'left' ? moveEvent.clientX - rect.left : rect.right - moveEvent.clientX
+      );
+      const stop = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+        window.removeEventListener('pointercancel', stop);
+        document.documentElement.classList.remove('codex-resizing');
+        setCodexPaneWidth(grid, side, side === 'left' ? state.codexSessionPaneWidth : state.codexScriptPaneWidth, { persist: true });
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop, { once: true });
+      window.addEventListener('pointercancel', stop, { once: true });
+    });
+    splitter.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+      event.preventDefault();
+      const current = side === 'left' ? state.codexSessionPaneWidth : state.codexScriptPaneWidth;
+      const direction = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+      const next = event.key === 'Home' ? (side === 'left' ? 224 : 430) : current + direction * (event.shiftKey ? 40 : 16) * (side === 'right' ? -1 : 1);
+      setCodexPaneWidth(grid, side, next, { persist: true });
+    });
+  }
 }
 
 function renderCodexStudio({ focus = '' } = {}) {
@@ -2012,6 +2132,7 @@ function renderCodexStudio({ focus = '' } = {}) {
   $('#transport').hidden = true;
   startCodexProgressElapsedTimer();
   requestAnimationFrame(() => {
+    setupCodexSplitters();
     const conversation = $('#codex-conversation');
     if (conversation) conversation.scrollTop = conversation.scrollHeight;
     const activityLog = $('[data-codex-activity-log]');
@@ -2084,19 +2205,42 @@ function startNewCodexSession() {
   renderCodexStudio({ focus: 'composer' });
 }
 
-function selectCodexSession(sessionId) {
-  if (codexRoomBusy() || !sessionId || sessionId === state.codexSessionId) return;
+async function selectCodexSession(sessionId, chapterId = '') {
+  if (state.codexBusy || !sessionId) return;
+  let target = findCodexSessionAcrossProject(sessionId, chapterId);
+  if (!target) return;
+  if (sessionId === state.codexSessionId && target.chapterId === currentChapter()?.id) return;
   rememberCodexComposer();
+  const targetChapter = state.project?.chapters.find((chapter) => chapter.id === target.chapterId);
+  if (targetChapter?.activeCodexSessionId !== target.id) {
+    if (!target.versionAvailable) {
+      toast('这个旧 Session 无法恢复版本', '它创建于版本快照功能之前；可以查看当前版本，或新建 Session 继续制作。', 'warn');
+      return;
+    }
+    try {
+      await waitForPendingLineSaves(state.project.id, state.codexRequestId);
+      const result = await api(`/api/projects/${encodeURIComponent(state.project.id)}/chapters/${encodeURIComponent(target.chapterId)}/codex-sessions/${encodeURIComponent(target.id)}/activate`, { method: 'POST' });
+      if (result?.project) state.project = result.project;
+      target = findCodexSessionAcrossProject(sessionId, chapterId) || target;
+    } catch (error) {
+      toast('无法切换 Session 版本', error.message, 'warn');
+      return;
+    }
+  }
+  closeCodexProgressConnection(codexProgressKey(), { paused: true });
+  state.selectedChapterId = target.chapterId;
   state.codexSessionId = sessionId;
-  const chapterId = currentChapter()?.id;
-  if (chapterId) state.codexSessionByChapter.set(chapterId, sessionId);
+  if (target.chapterId) state.codexSessionByChapter.set(target.chapterId, sessionId);
   const session = currentCodexSession();
   state.codexModel = normalizeCodexModel(session?.model);
   state.codexReasoningEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
   state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(session?.timeoutMinutes);
   if (session?.mode) state.codexMode = session.mode;
   state.codexError = '';
+  const hash = `#/codex/${state.project.id}/${target.chapterId}`;
+  if (location.hash !== hash) history.pushState(null, '', hash);
   renderCodexStudio({ focus: 'composer' });
+  void recoverCodexProgress();
 }
 
 async function waitForPendingLineSaves(projectId, requestId, timeoutMs = 8000) {
@@ -2784,7 +2928,7 @@ document.addEventListener('click', async (event) => {
     if (action === 'open-script-modal') { showModal(scriptModalHtml(), 'wide'); return; }
     if (action === 'run-script') { await runScript(); return; }
     if (action === 'new-codex-session') { startNewCodexSession(); return; }
-    if (action === 'select-codex-session') { selectCodexSession(target.dataset.sessionId); return; }
+    if (action === 'select-codex-session') { await selectCodexSession(target.dataset.sessionId, target.dataset.chapterId); return; }
     if (action === 'toggle-codex-progress') {
       const progress = currentCodexProgress();
       if (!progress) return;
