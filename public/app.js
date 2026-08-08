@@ -1,6 +1,21 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+const CODEX_PROGRESS_PREFERENCE_KEY = 'novelVoiceStudio.codexProgressVisible.v1';
+
+function readLocalBoolean(key, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : value === 'true';
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocalBoolean(key, value) {
+  try { localStorage.setItem(key, value ? 'true' : 'false'); } catch {}
+}
+
 const state = {
   bootstrap: null,
   view: 'projects',
@@ -42,6 +57,12 @@ const state = {
   codexBusy: false,
   codexError: '',
   codexRequestId: 0,
+  codexProgressVisible: readLocalBoolean(CODEX_PROGRESS_PREFERENCE_KEY, true),
+  codexProgressByChapter: new Map(),
+  codexProgressSources: new Map(),
+  codexProgressGeneration: 0,
+  codexProgressRecoveryId: 0,
+  codexProgressElapsedTimer: null,
   codexLogin: null,
   codexLoginPanelOpen: false,
   codexLoginTimer: null,
@@ -133,6 +154,8 @@ function showModal(content, className = '') {
     && !targetClasses.includes('codex-room-modal')
     && !targetClasses.includes('codex-login-modal');
   if (replacingCodexRoom) {
+    rememberCodexComposer();
+    closeCodexProgressConnection(codexProgressKey(), { paused: true });
     stopCodexLoginPolling({ invalidate: true });
     state.codexLoginPanelOpen = false;
     state.codexLoginAction = '';
@@ -147,8 +170,9 @@ function showModal(content, className = '') {
 
 function closeModal() {
   const closingCodexLogin = Boolean($('#modal-root .codex-login-modal'));
-  if ($('#modal-root .codex-room-modal') && state.codexBusy) {
-    toast('Codex 正在处理', '本轮完成前请保持协作室打开，避免剧本结果丢失。', 'warn');
+  const closingCodexRoom = Boolean($('#modal-root .codex-room-modal'));
+  if (closingCodexRoom && state.codexBusy) {
+    toast('正在提交 Codex 任务', '收到后台任务编号前请保持协作室打开。', 'warn');
     return false;
   }
   if (state.voiceExtractSubmitting) {
@@ -161,6 +185,14 @@ function closeModal() {
   state.codexLoginPanelOpen = false;
   state.codexLoginAction = '';
   if (closingCodexLogin && !state.codexLoginPopupNavigated) clearCodexLoginNavigation({ clearUrl: false });
+  if (closingCodexRoom) {
+    rememberCodexComposer();
+    const backgroundProgress = currentCodexProgress();
+    closeCodexProgressConnection(codexProgressKey(), { paused: true });
+    if (codexProgressIsActive(backgroundProgress)) {
+      toast('Codex 已转到后台处理', '重新打开协作室即可继续查看进度。');
+    }
+  }
   state.codexRequestId += 1;
   state.codexBusy = false;
   state.codexError = '';
@@ -799,6 +831,444 @@ function codexStatusLabel(status) {
   return ({ processing: '处理中', running: '处理中', completed: '已完成', ready: '可继续对话', failed: '处理失败' })[status] || '可继续对话';
 }
 
+const CODEX_PROGRESS_TYPES = new Set(['queued', 'starting', 'thread', 'turn', 'stage', 'completed', 'failed']);
+const CODEX_PROGRESS_PRESENTATION = {
+  queued: { label: '任务已排队', short: '排队中', tone: 'active' },
+  starting: { label: '正在准备章节与本轮要求', short: '准备中', tone: 'active' },
+  thread: { label: '正在创建 Codex 会话', short: '创建会话', tone: 'active' },
+  turn: { label: '正在继续当前 Codex 会话', short: '继续会话', tone: 'active' },
+  stage: { label: '正在生成并校验结构化剧本', short: '处理中', tone: 'active' },
+  completed: { label: '本轮处理完成', short: '已完成', tone: 'success' },
+  failed: { label: '本轮处理未完成', short: '失败', tone: 'error' }
+};
+const CODEX_PROGRESS_PHASE_MESSAGES = {
+  'queued:waiting': '请求已进入本章处理队列。',
+  'starting:preparing': '正在准备 Codex 剧本协作环境。',
+  'thread:started': 'Codex 会话已建立。',
+  'turn:started': 'Codex 已开始处理本轮请求。',
+  'turn:completed': 'Codex 已完成本轮生成，正在校验结果。',
+  'stage:analyzing': '正在分析章节结构与角色关系。',
+  'stage:drafting': '正在整理台词、角色与表演标注。',
+  'stage:processing': '正在处理剧本协作任务。',
+  'stage:validating': '正在校验剧本结构。',
+  'stage:saving': '正在安全保存本轮剧本。',
+  'completed:completed': '本轮剧本协作已完成。',
+  'failed:failed': '本轮剧本协作未完成，请检查 Codex 状态后重试。'
+};
+
+function codexProgressKey(projectId = state.project?.id, chapterId = currentChapter()?.id) {
+  return projectId && chapterId ? `${projectId}:${chapterId}` : '';
+}
+
+function currentCodexProgress() {
+  return state.codexProgressByChapter.get(codexProgressKey()) || null;
+}
+
+function codexProgressIsActive(progress = currentCodexProgress()) {
+  return Boolean(progress && !progress.terminal && !['completed', 'failed'].includes(progress.type));
+}
+
+function codexRoomBusy() {
+  return state.codexBusy || codexProgressIsActive();
+}
+
+function safeCodexProgressId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  return /^codexprog_[0-9a-f]{32}$/.test(id) ? id : '';
+}
+
+function safeCodexProgressPhase(value = '') {
+  const phase = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return /^[a-z][a-z0-9_-]{0,40}$/.test(phase) ? phase : '';
+}
+
+function fixedCodexProgressMessage(type, phase) {
+  return CODEX_PROGRESS_PHASE_MESSAGES[`${type}:${phase}`]
+    || CODEX_PROGRESS_PRESENTATION[type]?.label
+    || CODEX_PROGRESS_PRESENTATION.stage.label;
+}
+
+function normalizeCodexProgressEventsUrl(value, { projectId, chapterId, progressId }) {
+  if (typeof value !== 'string' || value.length > 2_000) return '';
+  try {
+    const url = new URL(value, location.origin);
+    const expectedPath = `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-progress/${encodeURIComponent(progressId)}`;
+    if (url.origin !== location.origin || url.pathname !== expectedPath || url.search || url.username || url.password || url.hash) return '';
+    return url.pathname;
+  } catch {
+    return '';
+  }
+}
+
+function normalizeCodexProgressEvent(value, expectedProgressId = '') {
+  if (!value || typeof value !== 'object') return null;
+  const progressId = safeCodexProgressId(value.progressId);
+  const phase = safeCodexProgressPhase(value.phase);
+  const progressState = typeof value.state === 'string' ? value.state : '';
+  let type = CODEX_PROGRESS_TYPES.has(value.type) ? value.type : '';
+  if (!type && ['queued', 'completed', 'failed'].includes(progressState)) type = progressState;
+  if (!type && progressState === 'running') {
+    type = phase === 'preparing' ? 'starting' : phase === 'thread' ? 'thread' : phase === 'turn' ? 'turn' : 'stage';
+  }
+  if (!progressId || (expectedProgressId && progressId !== expectedProgressId) || !type) return null;
+  const elapsedMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Number(value.elapsedMs) || 0));
+  const atValue = typeof value.at === 'string' ? value.at : '';
+  const at = Number.isFinite(Date.parse(atValue)) ? atValue : new Date().toISOString();
+  return {
+    progressId,
+    type,
+    phase,
+    message: fixedCodexProgressMessage(type, phase),
+    elapsedMs,
+    at,
+    terminal: value.terminal === true || type === 'completed' || type === 'failed'
+  };
+}
+
+function appendCodexProgressEvent(progress, event, eventId = '') {
+  if (!progress || !event || progress.progressId !== event.progressId) return false;
+  if (!progress.eventIds) progress.eventIds = new Set();
+  const normalizedEventId = typeof eventId === 'string' ? eventId.slice(0, 160) : '';
+  if (normalizedEventId && progress.eventIds.has(normalizedEventId)) return false;
+  if (normalizedEventId) progress.eventIds.add(normalizedEventId);
+  const signature = `${event.type}:${event.phase}:${event.message}:${event.at}`;
+  if (progress.lastEventSignature === signature) return false;
+  progress.lastEventSignature = signature;
+  progress.type = event.type;
+  progress.phase = event.phase;
+  progress.message = event.message;
+  progress.elapsedMs = event.elapsedMs;
+  progress.lastEventReceivedAt = Date.now();
+  progress.at = event.at;
+  progress.terminal = event.terminal;
+  progress.timeline = [...(progress.timeline || []), event].slice(-12);
+  return true;
+}
+
+function createCodexProgressSnapshot(raw, context, existing = null) {
+  const progressId = safeCodexProgressId(raw?.progressId);
+  if (!progressId) return null;
+  const base = existing?.progressId === progressId ? existing : {
+    progressId,
+    projectId: context.projectId,
+    chapterId: context.chapterId,
+    sessionId: context.sessionId || null,
+    promptDraftKey: context.promptDraftKey || `${context.chapterId}:${context.sessionId || 'new'}`,
+    type: 'queued',
+    phase: '',
+    message: '',
+    elapsedMs: 0,
+    lastEventReceivedAt: Date.now(),
+    at: new Date().toISOString(),
+    terminal: false,
+    expanded: true,
+    connection: 'connecting',
+    timeline: [],
+    eventIds: new Set(),
+    finalized: false,
+    finalizing: false
+  };
+  const eventsUrl = normalizeCodexProgressEventsUrl(raw?.eventsUrl || base.eventsUrl, {
+    projectId: context.projectId, chapterId: context.chapterId, progressId
+  });
+  if (!eventsUrl) return null;
+  base.eventsUrl = eventsUrl;
+  const timeline = Array.isArray(raw?.events) ? raw.events : [];
+  for (const item of timeline) {
+    const event = normalizeCodexProgressEvent(item, progressId);
+    if (event) appendCodexProgressEvent(base, event, item.id);
+  }
+  const hasCurrentEvent = ['type', 'phase', 'elapsedMs', 'at', 'terminal']
+    .some((key) => Object.hasOwn(raw || {}, key));
+  if (hasCurrentEvent) {
+    const current = normalizeCodexProgressEvent({ ...raw, progressId }, progressId);
+    if (current) {
+      base.type = current.type;
+      base.phase = current.phase;
+      base.message = current.message;
+      base.elapsedMs = current.elapsedMs;
+      base.lastEventReceivedAt = Date.now();
+      base.at = current.at;
+      base.terminal = current.terminal;
+    }
+  } else if (['queued', 'completed', 'failed'].includes(raw?.state)) {
+    base.type = raw.state;
+    base.terminal = raw.state === 'completed' || raw.state === 'failed';
+  }
+  return base;
+}
+
+function codexProgressElapsedMs(progress) {
+  if (!progress) return 0;
+  const extra = codexProgressIsActive(progress) ? Math.max(0, Date.now() - Number(progress.lastEventReceivedAt || Date.now())) : 0;
+  return Math.max(0, Number(progress.elapsedMs || 0) + extra);
+}
+
+function formatCodexProgressElapsed(progress) {
+  const seconds = Math.floor(codexProgressElapsedMs(progress) / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+}
+
+function codexProgressConnectionLabel(progress) {
+  if (!progress || progress.terminal) return progress?.type === 'failed' ? '任务已结束' : '结果已同步';
+  return ({ open: '实时连接正常', connecting: '正在连接进度', reconnecting: '连接中断，正在自动重连', paused: '面板已关闭，任务仍在后台' })[progress.connection] || '正在连接进度';
+}
+
+function codexProgressTimelineHtml(progress) {
+  const events = progress?.timeline || [];
+  return events.map((event, index) => {
+    const presentation = CODEX_PROGRESS_PRESENTATION[event.type] || CODEX_PROGRESS_PRESENTATION.stage;
+    const current = index === events.length - 1;
+    return `<li class="${presentation.tone} ${current ? 'current' : ''}" ${current ? 'aria-current="step"' : ''}><i aria-hidden="true"></i><div><strong>${escapeHtml(presentation.short)}</strong>${event.message ? `<small>${escapeHtml(event.message)}</small>` : ''}</div></li>`;
+  }).join('');
+}
+
+function codexProgressPanelHtml(progress) {
+  if (!progress) return '';
+  const presentation = CODEX_PROGRESS_PRESENTATION[progress.type] || CODEX_PROGRESS_PRESENTATION.stage;
+  const bodyId = `codex-progress-body-${progress.progressId}`;
+  return `<section class="codex-progress-panel ${presentation.tone}" data-progress-id="${escapeHtml(progress.progressId)}" role="region" aria-labelledby="codex-progress-title">
+    <header><div class="codex-progress-heading"><i aria-hidden="true"></i><div><strong id="codex-progress-title" data-codex-progress-title>${escapeHtml(presentation.label)}</strong><small data-codex-progress-connection>${escapeHtml(codexProgressConnectionLabel(progress))}</small></div></div><div class="codex-progress-meta"><time data-codex-progress-elapsed datetime="PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S" aria-label="已用时 ${escapeHtml(formatCodexProgressElapsed(progress))}">${escapeHtml(formatCodexProgressElapsed(progress))}</time><button class="icon-button" type="button" data-action="toggle-codex-progress" aria-expanded="${progress.expanded !== false}" aria-controls="${bodyId}" aria-label="${progress.expanded === false ? '展开处理进度' : '折叠处理进度'}">${progress.expanded === false ? '⌄' : '⌃'}</button></div></header>
+    <div class="codex-progress-body" id="${bodyId}" ${progress.expanded === false ? 'hidden' : ''}><p class="codex-progress-summary" data-codex-progress-summary>${escapeHtml(progress.message || presentation.label)}</p><ol class="codex-progress-timeline" data-codex-progress-timeline>${codexProgressTimelineHtml(progress)}</ol><p class="codex-progress-disclosure"><span aria-hidden="true">◇</span><span><strong>这是任务进度摘要，不是隐藏思维链</strong><small>这里只显示阶段、耗时和安全摘要，不展示模型内部推理或凭据。</small></span></p></div>
+  </section>`;
+}
+
+function announceCodexProgress(text) {
+  const announcer = $('#codex-progress-announcer');
+  if (announcer) announcer.textContent = text;
+}
+
+function updateCodexProgressPanel({ announce = '' } = {}) {
+  const modal = $('#modal-root .codex-room-modal');
+  if (!modal) return;
+  const toggle = $('#codex-progress-visible', modal);
+  if (toggle) toggle.checked = state.codexProgressVisible;
+  const slot = $('#codex-progress-slot', modal);
+  if (!slot) return;
+  const progress = currentCodexProgress();
+  if (!state.codexProgressVisible || !progress) {
+    slot.innerHTML = '';
+    const announcer = $('#codex-progress-announcer', modal);
+    if (announcer) announcer.textContent = '';
+    return;
+  }
+  let panel = $('.codex-progress-panel', slot);
+  if (!panel || panel.dataset.progressId !== progress.progressId) {
+    slot.innerHTML = codexProgressPanelHtml(progress);
+    panel = $('.codex-progress-panel', slot);
+  } else {
+    const presentation = CODEX_PROGRESS_PRESENTATION[progress.type] || CODEX_PROGRESS_PRESENTATION.stage;
+    panel.className = `codex-progress-panel ${presentation.tone}`;
+    const title = $('[data-codex-progress-title]', panel);
+    const connection = $('[data-codex-progress-connection]', panel);
+    const summary = $('[data-codex-progress-summary]', panel);
+    const timeline = $('[data-codex-progress-timeline]', panel);
+    const elapsed = $('[data-codex-progress-elapsed]', panel);
+    const body = $('.codex-progress-body', panel);
+    const collapse = $('[data-action="toggle-codex-progress"]', panel);
+    if (title) title.textContent = presentation.label;
+    if (connection) connection.textContent = codexProgressConnectionLabel(progress);
+    if (summary) summary.textContent = progress.message || presentation.label;
+    if (timeline) timeline.innerHTML = codexProgressTimelineHtml(progress);
+    if (elapsed) {
+      elapsed.textContent = formatCodexProgressElapsed(progress);
+      elapsed.dateTime = `PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S`;
+      elapsed.setAttribute('aria-label', `已用时 ${formatCodexProgressElapsed(progress)}`);
+    }
+    if (body) body.hidden = progress.expanded === false;
+    if (collapse) {
+      collapse.setAttribute('aria-expanded', String(progress.expanded !== false));
+      collapse.setAttribute('aria-label', progress.expanded === false ? '展开处理进度' : '折叠处理进度');
+      collapse.textContent = progress.expanded === false ? '⌄' : '⌃';
+    }
+  }
+  if (announce) announceCodexProgress(announce);
+}
+
+function stopCodexProgressElapsedTimer() {
+  if (state.codexProgressElapsedTimer) clearInterval(state.codexProgressElapsedTimer);
+  state.codexProgressElapsedTimer = null;
+}
+
+function startCodexProgressElapsedTimer() {
+  stopCodexProgressElapsedTimer();
+  if (!$('#modal-root .codex-room-modal') || !codexProgressIsActive()) return;
+  state.codexProgressElapsedTimer = setInterval(() => {
+    const elapsed = $('#modal-root .codex-room-modal [data-codex-progress-elapsed]');
+    const progress = currentCodexProgress();
+    if (!elapsed || !progress || !codexProgressIsActive(progress)) return;
+    elapsed.textContent = formatCodexProgressElapsed(progress);
+    elapsed.dateTime = `PT${Math.floor(codexProgressElapsedMs(progress) / 1000)}S`;
+    elapsed.setAttribute('aria-label', `已用时 ${formatCodexProgressElapsed(progress)}`);
+  }, 1_000);
+}
+
+function closeCodexProgressConnection(key = codexProgressKey(), { paused = false } = {}) {
+  const entry = state.codexProgressSources.get(key);
+  if (entry) {
+    try { entry.source.close(); } catch {}
+    state.codexProgressSources.delete(key);
+  }
+  state.codexProgressGeneration += 1;
+  const progress = state.codexProgressByChapter.get(key);
+  if (paused && codexProgressIsActive(progress)) progress.connection = 'paused';
+  if (key === codexProgressKey()) {
+    stopCodexProgressElapsedTimer();
+    updateCodexProgressPanel();
+  }
+}
+
+async function finalizeCodexProgress(progress, { recovered = false } = {}) {
+  if (!progress || progress.finalizing || progress.finalized) return;
+  const key = codexProgressKey(progress.projectId, progress.chapterId);
+  if (state.codexProgressByChapter.get(key)?.progressId !== progress.progressId) return;
+  progress.finalizing = true;
+  closeCodexProgressConnection(key);
+  const targetsCurrentChapter = state.project?.id === progress.projectId && currentChapter()?.id === progress.chapterId;
+  if (progress.type === 'failed' && targetsCurrentChapter) state.codexError = fixedCodexProgressMessage('failed', 'failed');
+  try {
+    if (progress.type === 'completed') {
+      const refreshed = await api(`/api/projects/${encodeURIComponent(progress.projectId)}`);
+      if (state.codexProgressByChapter.get(key)?.progressId !== progress.progressId) return;
+      if (state.project?.id === progress.projectId) {
+        state.project = refreshed;
+        const chapter = refreshed.chapters?.find((item) => item.id === progress.chapterId);
+        if (chapter && currentChapter()?.id === progress.chapterId) {
+          const sessions = codexSessions(chapter);
+          state.codexSessionId = chapter.activeCodexSessionId || sessions[0]?.id || progress.sessionId || null;
+          if (state.codexSessionId) state.codexSessionByChapter.set(progress.chapterId, state.codexSessionId);
+          state.codexDrafts.delete(progress.promptDraftKey);
+          state.codexDrafts.set(`${progress.chapterId}:${state.codexSessionId || 'new'}`, '');
+          state.codexError = '';
+        }
+      }
+    }
+  } catch (error) {
+    if (progress.type === 'completed') {
+      progress.message = '本轮处理已完成，但项目刷新暂时失败；请重新检测。';
+    }
+  } finally {
+    progress.finalizing = false;
+    progress.finalized = true;
+    progress.connection = 'closed';
+  }
+  const roomMatches = Boolean($('#modal-root .codex-room-modal'))
+    && state.project?.id === progress.projectId
+    && currentChapter()?.id === progress.chapterId;
+  if (roomMatches) renderCodexStudio({ focus: progress.type === 'failed' ? 'composer' : '' });
+  else updateCodexProgressPanel();
+  if (!recovered || progress.type === 'failed') {
+    if (progress.type === 'completed') toast('Codex 已在后台更新本章剧本', '重新打开协作室可继续对话和逐句调整。');
+    else toast('Codex 本轮没有完成', fixedCodexProgressMessage('failed', 'failed'), 'error');
+  }
+}
+
+function connectCodexProgress(progress) {
+  if (!progress || !codexProgressIsActive(progress) || !progress.eventsUrl) return;
+  const key = codexProgressKey(progress.projectId, progress.chapterId);
+  if (!key || key !== codexProgressKey() || !$('#modal-root .codex-room-modal')) return;
+  const currentEntry = state.codexProgressSources.get(key);
+  if (currentEntry?.progressId === progress.progressId) return;
+  if (currentEntry) closeCodexProgressConnection(key);
+  if (typeof EventSource !== 'function') {
+    progress.connection = 'reconnecting';
+    updateCodexProgressPanel({ announce: '无法建立实时进度连接，任务仍在后台运行。' });
+    return;
+  }
+  const generation = ++state.codexProgressGeneration;
+  progress.connection = 'connecting';
+  updateCodexProgressPanel();
+  let source;
+  try {
+    source = new EventSource(progress.eventsUrl);
+  } catch {
+    progress.connection = 'reconnecting';
+    updateCodexProgressPanel({ announce: '进度连接中断，任务仍在后台运行。' });
+    return;
+  }
+  const entry = { source, progressId: progress.progressId, generation };
+  state.codexProgressSources.set(key, entry);
+  const isCurrent = () => {
+    const activeEntry = state.codexProgressSources.get(key);
+    const activeProgress = state.codexProgressByChapter.get(key);
+    return activeEntry === entry
+      && activeEntry.generation === generation
+      && activeProgress?.progressId === progress.progressId;
+  };
+  const handleEvent = (streamEvent) => {
+    if (!isCurrent()) return;
+    let payload;
+    try { payload = JSON.parse(streamEvent.data); } catch { return; }
+    const event = normalizeCodexProgressEvent(payload, progress.progressId);
+    if (!event || !appendCodexProgressEvent(progress, event, streamEvent.lastEventId)) return;
+    progress.connection = event.terminal ? 'closed' : 'open';
+    const presentation = CODEX_PROGRESS_PRESENTATION[event.type] || CODEX_PROGRESS_PRESENTATION.stage;
+    updateCodexProgressPanel({ announce: presentation.label });
+    startCodexProgressElapsedTimer();
+    if (event.terminal) void finalizeCodexProgress(progress);
+  };
+  source.onmessage = handleEvent;
+  for (const type of CODEX_PROGRESS_TYPES) source.addEventListener(type, handleEvent);
+  source.onopen = () => {
+    if (!isCurrent()) return;
+    const wasInterrupted = progress.connection === 'reconnecting';
+    progress.connection = 'open';
+    updateCodexProgressPanel({ announce: wasInterrupted ? '实时进度连接已恢复。' : '' });
+    startCodexProgressElapsedTimer();
+  };
+  source.onerror = () => {
+    if (!isCurrent() || progress.terminal) return;
+    const firstInterruption = progress.connection !== 'reconnecting';
+    progress.connection = 'reconnecting';
+    updateCodexProgressPanel({ announce: firstInterruption ? '进度连接中断，正在自动重连；任务仍在后台运行。' : '' });
+  };
+  startCodexProgressElapsedTimer();
+}
+
+async function recoverCodexProgress() {
+  const projectId = state.project?.id;
+  const chapterId = currentChapter()?.id;
+  const key = codexProgressKey(projectId, chapterId);
+  if (!key) return;
+  const recoveryId = ++state.codexProgressRecoveryId;
+  const existing = state.codexProgressByChapter.get(key) || null;
+  try {
+    const payload = await api(`/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-progress`);
+    if (recoveryId !== state.codexProgressRecoveryId || codexProgressKey() !== key) return;
+    const liveProgress = state.codexProgressByChapter.get(key) || null;
+    if (liveProgress && liveProgress.progressId !== existing?.progressId && codexProgressIsActive(liveProgress)) return;
+    const raw = payload?.progress;
+    if (!raw) {
+      if (codexProgressIsActive(existing)) connectCodexProgress(existing);
+      updateCodexProgressPanel();
+      return;
+    }
+    const progress = createCodexProgressSnapshot(raw, {
+      projectId,
+      chapterId,
+      sessionId: state.codexSessionId,
+      promptDraftKey: existing?.promptDraftKey
+    }, existing);
+    if (!progress) return;
+    state.codexProgressByChapter.set(key, progress);
+    updateCodexProgressPanel();
+    if (progress.terminal) await finalizeCodexProgress(progress, { recovered: true });
+    else connectCodexProgress(progress);
+  } catch {
+    if (recoveryId !== state.codexProgressRecoveryId || codexProgressKey() !== key) return;
+    if (codexProgressIsActive(existing)) {
+      existing.connection = 'reconnecting';
+      updateCodexProgressPanel({ announce: '暂时无法恢复进度快照，正在重新连接；任务仍在后台运行。' });
+      connectCodexProgress(existing);
+    }
+  }
+}
+
 function codexDraftKey(sessionId = state.codexSessionId) {
   return `${currentChapter()?.id || 'chapter'}:${sessionId || 'new'}`;
 }
@@ -1157,11 +1627,12 @@ function codexMessageHtml(message) {
 
 function codexLineEditorHtml(line, index) {
   const role = roleForLine(line);
-  const locked = state.codexBusy ? 'disabled' : '';
+  const busy = codexRoomBusy();
+  const locked = busy ? 'disabled' : '';
   const roleOptions = state.project.characters.map((item) => `<option value="${item.id}" ${item.id === role?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('');
   const emotionOptions = state.bootstrap.emotions.map((emotion) => `<option value="${emotion.id}" ${emotion.id === line.emotion ? 'selected' : ''}>${escapeHtml(emotion.label)}</option>`).join('');
   return `<article class="codex-script-line" data-codex-line-id="${line.id}">
-    <header><span class="codex-line-number">${String(index + 1).padStart(2, '0')}</span><span class="codex-line-kind">${line.kind === 'dialogue' ? '对白' : '旁白'}</span>${line.needsReview ? '<span class="review-flag">待确认</span>' : ''}<small>${state.codexBusy ? 'Codex 处理中暂锁定' : '修改自动保存'}</small></header>
+    <header><span class="codex-line-number">${String(index + 1).padStart(2, '0')}</span><span class="codex-line-kind">${line.kind === 'dialogue' ? '对白' : '旁白'}</span>${line.needsReview ? '<span class="review-flag">待确认</span>' : ''}<small>${busy ? 'Codex 处理中暂锁定' : '修改自动保存'}</small></header>
     <textarea class="codex-line-text" rows="2" aria-label="第 ${index + 1} 句朗读文本" data-line-input="spokenText" data-line-id="${line.id}" ${locked}>${escapeHtml(line.spokenText || '')}</textarea>
     <div class="codex-line-selects"><label><span>角色</span><select class="select-field" data-line-field="speakerId" data-line-id="${line.id}" ${locked}>${roleOptions}</select></label><label><span>情绪</span><select class="select-field" data-line-field="emotion" data-line-id="${line.id}" ${locked}>${emotionOptions}</select></label></div>
     <div class="codex-line-ranges">
@@ -1179,25 +1650,29 @@ function codexStudioHtml() {
   const readiness = codexReadiness();
   const messages = session?.messages || [];
   const lines = chapter?.scenes?.flatMap((scene) => scene.lines || []) || [];
+  const progress = currentCodexProgress();
+  const busy = codexRoomBusy();
   const model = session?.model ?? state.codexModel ?? '';
   const mode = session?.mode || state.codexMode || 'faithful';
-  const sessionStatus = state.codexBusy ? '处理中' : session ? codexStatusLabel(session.status) : '新会话';
-  const canSend = readiness.ready && !state.codexBusy;
+  const sessionStatus = busy ? (CODEX_PROGRESS_PRESENTATION[progress?.type]?.short || '提交中') : session ? codexStatusLabel(session.status) : '新会话';
+  const canSend = readiness.ready && !busy;
   const loginActive = CODEX_LOGIN_ACTIVE_STATES.has(currentCodexLogin().state);
   const loginButton = readiness.authRequired
-    ? `<button class="button primary small" data-action="start-codex-login" ${state.codexBusy ? 'disabled' : ''}>${loginActive ? '查看登录' : '登录 Codex'}</button>`
+    ? `<button class="button primary small" data-action="start-codex-login" ${busy ? 'disabled' : ''}>${loginActive ? '查看登录' : '登录 Codex'}</button>`
     : '';
   return `<header class="modal-head codex-room-head"><div><span class="eyebrow">CODEX SCRIPT ROOM</span><h2>Codex 剧本协作室</h2><p>${escapeHtml(chapter?.title || '当前章节')} · 多轮调整与逐句校对</p></div><div class="codex-room-head-actions"><span class="codex-room-status ${readiness.ready ? 'ready' : 'warn'}"><i></i>${escapeHtml(readiness.label)}</span><button class="icon-button" data-action="close-modal" aria-label="关闭 Codex 剧本协作室">×</button></div></header>
     <div class="codex-room-grid">
       <aside class="codex-session-panel" aria-label="Codex 会话历史">
-        <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>本章会话</strong></div><button class="button small" data-action="new-codex-session" ${state.codexBusy ? 'disabled' : ''}>＋ 新会话</button></div>
-        <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${state.codexBusy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(item.model || 'Codex 默认')}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
-        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${state.codexBusy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
+        <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>本章会话</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新会话</button></div>
+        <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${busy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(item.model || 'Codex 默认')}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
+        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${busy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
       </aside>
-      <main class="codex-chat-panel" aria-busy="${state.codexBusy}">
-        <div class="codex-chat-toolbar"><label><span>模型（可输入完整 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" value="${escapeHtml(model)}" placeholder="Codex 默认" ${state.codexBusy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" ${state.codexBusy ? 'disabled' : ''}>默认</button></div></label><datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist><label><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || state.codexBusy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label><div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small></div></div>
-        <div class="codex-conversation" id="codex-conversation" aria-live="polite">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一章</h3><p>第一次发送会创建会话并更新右侧剧本。之后可以继续要求修正角色、语气或某一段台词。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${state.codexBusy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${state.codexBusy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>Codex 正在处理当前章节</strong><small>请保持窗口打开，完成后剧本会同步到右侧。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
-        <form class="codex-composer" id="codex-chat-form"><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${state.codexBusy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${state.codexBusy ? '处理中…' : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
+      <main class="codex-chat-panel" aria-busy="${busy}">
+        <div class="codex-chat-toolbar"><label><span>模型（可输入完整 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" value="${escapeHtml(model)}" placeholder="Codex 默认" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" ${busy ? 'disabled' : ''}>默认</button></div></label><datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist><label><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || busy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label><div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label></div></div>
+        <div class="sr-only" id="codex-progress-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+        <div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>
+        <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一章</h3><p>第一次发送会创建会话并更新右侧剧本。之后可以继续要求修正角色、语气或某一段台词。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 Codex 后台任务</strong><small>收到任务编号后即可关闭协作室，处理会在后台继续。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
+        <form class="codex-composer" id="codex-chat-form"><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以关闭协作室，稍后回来继续查看。' : readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
       </main>
       <aside class="codex-script-panel" aria-label="当前剧本逐句编辑">
         <div class="codex-panel-title"><div><span class="eyebrow">LIVE SCRIPT</span><strong>当前剧本</strong></div><span class="codex-line-count">${lines.length} 句</span></div>
@@ -1209,6 +1684,7 @@ function codexStudioHtml() {
 
 function renderCodexStudio({ focus = '' } = {}) {
   showModal(codexStudioHtml(), 'codex-room-modal');
+  startCodexProgressElapsedTimer();
   requestAnimationFrame(() => {
     const conversation = $('#codex-conversation');
     if (conversation) conversation.scrollTop = conversation.scrollHeight;
@@ -1229,9 +1705,11 @@ function openCodexStudio(mode = state.codexMode) {
   if (session?.mode) state.codexMode = session.mode;
   renderCodexStudio({ focus: state.codexSessionId ? '' : 'composer' });
   recoverCodexLogin();
+  void recoverCodexProgress();
 }
 
 function startNewCodexSession() {
+  if (codexRoomBusy()) return;
   rememberCodexComposer();
   const chapterId = currentChapter()?.id;
   if (chapterId) state.codexSessionByChapter.delete(chapterId);
@@ -1242,7 +1720,7 @@ function startNewCodexSession() {
 }
 
 function selectCodexSession(sessionId) {
-  if (!sessionId || sessionId === state.codexSessionId) return;
+  if (codexRoomBusy() || !sessionId || sessionId === state.codexSessionId) return;
   rememberCodexComposer();
   state.codexSessionId = sessionId;
   const chapterId = currentChapter()?.id;
@@ -1268,7 +1746,7 @@ async function waitForPendingLineSaves(projectId, requestId, timeoutMs = 8000) {
 }
 
 async function submitCodexMessage() {
-  if (state.codexBusy) return;
+  if (codexRoomBusy()) return;
   const readiness = codexReadiness();
   if (!readiness.ready) return toast(readiness.label, readiness.authRequired ? '请点击左侧“登录 Codex”完成官方网页登录，或使用任务包交接。' : '请使用任务包完成手工交接。', 'warn');
   rememberCodexComposer();
@@ -1280,6 +1758,7 @@ async function submitCodexMessage() {
   const sessionId = state.codexSessionId;
   const model = String($('#codex-model')?.value ?? state.codexModel ?? '').trim();
   const mode = String($('#codex-room-mode')?.value || currentCodexSession()?.mode || state.codexMode || 'faithful');
+  state.codexProgressRecoveryId += 1;
   const requestId = ++state.codexRequestId;
   state.codexModel = model;
   state.codexMode = mode;
@@ -1292,9 +1771,26 @@ async function submitCodexMessage() {
     const endpoint = sessionId
       ? `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions/${encodeURIComponent(sessionId)}/messages`
       : `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions`;
-    const body = sessionId ? { model, prompt } : { mode, model, prompt };
+    const body = sessionId ? { model, prompt, stream: true } : { mode, model, prompt, stream: true };
     const result = await api(endpoint, { method: 'POST', body });
     if (requestId !== state.codexRequestId) return;
+    if (result?.progressId && result?.eventsUrl) {
+      const key = codexProgressKey(projectId, chapterId);
+      const progress = createCodexProgressSnapshot(result, {
+        projectId,
+        chapterId,
+        sessionId,
+        promptDraftKey: `${chapterId}:${sessionId || 'new'}`
+      });
+      if (!progress) throw new Error('Codex 已接收任务，但返回的进度地址无效。');
+      state.codexProgressByChapter.set(key, progress);
+      state.codexBusy = false;
+      state.codexError = '';
+      renderCodexStudio();
+      connectCodexProgress(progress);
+      toast('Codex 已开始后台处理', '现在可以关闭协作室，稍后回来继续查看进度。');
+      return;
+    }
     if (result.project && state.project?.id === projectId) state.project = result.project;
     state.codexSessionId = result.session?.id || sessionId;
     if (state.codexSessionId) state.codexSessionByChapter.set(chapterId, state.codexSessionId);
@@ -1884,6 +2380,13 @@ document.addEventListener('click', async (event) => {
     if (action === 'run-script') { await runScript(); return; }
     if (action === 'new-codex-session') { startNewCodexSession(); return; }
     if (action === 'select-codex-session') { selectCodexSession(target.dataset.sessionId); return; }
+    if (action === 'toggle-codex-progress') {
+      const progress = currentCodexProgress();
+      if (!progress) return;
+      progress.expanded = progress.expanded === false;
+      updateCodexProgressPanel();
+      return;
+    }
     if (action === 'use-codex-default-model') {
       state.codexModel = '';
       const model = $('#codex-model');
@@ -1895,6 +2398,7 @@ document.addEventListener('click', async (event) => {
       await api('/api/system?refresh=1');
       await refreshBootstrap();
       renderCodexStudio({ focus: 'composer' });
+      await recoverCodexProgress();
       toast('Codex 状态已重新检测', codexReadiness().label);
       return;
     }
@@ -2003,6 +2507,12 @@ document.addEventListener('change', async (event) => {
   }
   if (input.id === 'codex-model') { state.codexModel = input.value.trim(); return; }
   if (input.id === 'codex-room-mode') { state.codexMode = CODEX_MODE_LABELS[input.value] ? input.value : 'faithful'; return; }
+  if (input.id === 'codex-progress-visible') {
+    state.codexProgressVisible = input.checked;
+    writeLocalBoolean(CODEX_PROGRESS_PREFERENCE_KEY, state.codexProgressVisible);
+    updateCodexProgressPanel();
+    return;
+  }
   if (input.id === 'modal-book-file') {
     state.bookFile = input.files[0] || null;
     if (state.bookFile) {
@@ -2152,9 +2662,19 @@ audio.addEventListener('pause', () => { if (!audio.ended) $('.play-main').textCo
 
 window.addEventListener('hashchange', async () => {
   if ($('#modal-root .codex-login-modal')) closeModal();
+  else if ($('#modal-root .codex-room-modal') && !state.codexBusy) closeModal();
   const route = parseRoute();
   if (route.view === 'studio' && route.id) await loadProject(route.id).catch(() => {});
   state.view = route.view; renderView();
+});
+
+window.addEventListener('pagehide', () => {
+  for (const { source } of state.codexProgressSources.values()) {
+    try { source.close(); } catch {}
+  }
+  state.codexProgressSources.clear();
+  state.codexProgressGeneration += 1;
+  stopCodexProgressElapsedTimer();
 });
 
 async function boot() {

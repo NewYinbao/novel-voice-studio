@@ -1,14 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 import {
   buildCodexExecArgs,
   buildCodexFollowUpPrompt,
   chapterToScriptSnapshot,
   codexProcessEnv,
+  createCodexJsonlProgressParser,
+  mapCodexJsonlProgress,
   normalizeImportedScript,
   parseCodexJsonl,
-  resolveCodexModel
+  resolveCodexModel,
+  runCodexSession
 } from '../src/lib/script-engine.js';
 
 test('Codex 初始会话使用 JSONL 和 Schema，且不使用 ephemeral', () => {
@@ -87,8 +92,91 @@ test('Codex 续问嵌入用户手工编辑后的完整剧本快照', () => {
 test('Codex JSONL 错误事件会转成可识别错误', () => {
   assert.throws(
     () => parseCodexJsonl(JSON.stringify({ type: 'turn.failed', error: { message: '会话已失效' } })),
-    (error) => error.code === 'CODEX_TURN_FAILED' && /会话已失效/.test(error.message)
+    (error) => error.code === 'CODEX_TURN_FAILED'
   );
+});
+
+test('Codex JSONL 进度按 UTF-8 分块实时解析且只输出固定白名单字段', () => {
+  const received = [];
+  const parser = createCodexJsonlProgressParser((event) => received.push(event));
+  const secret = '绝不能返回的小说原文、reasoning、C:\\private\\schema.json 和 thread-secret';
+  const payload = Buffer.from(`\uFEFF${[
+    JSON.stringify({ type: 'thread.started', thread_id: 'thread-secret' }),
+    JSON.stringify({ type: 'turn.started', prompt: secret }),
+    JSON.stringify({ type: 'item.updated', item: { type: 'reasoning', text: secret } }),
+    JSON.stringify({ type: 'item.updated', item: { type: 'agent_message', text: secret } }),
+    JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: secret, output: secret } }),
+    JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 999 } })
+  ].join('\n')}\n`, 'utf8');
+  // Split inside a multi-byte Chinese sequence as well as across JSONL boundaries.
+  for (let offset = 0; offset < payload.length; offset += 7) parser.push(payload.subarray(offset, offset + 7));
+  parser.end();
+
+  assert.deepEqual(received, [
+    { type: 'thread', phase: 'started' },
+    { type: 'turn', phase: 'started' },
+    { type: 'stage', phase: 'analyzing' },
+    { type: 'stage', phase: 'drafting' },
+    { type: 'stage', phase: 'processing' },
+    { type: 'turn', phase: 'completed' }
+  ]);
+  const publicValue = JSON.stringify(received);
+  assert.doesNotMatch(publicValue, /小说原文|reasoning|private|thread-secret|tokens|999/i);
+});
+
+test('Codex JSONL 进度忽略错误正文和事件洪泛', () => {
+  assert.equal(mapCodexJsonlProgress({ type: 'turn.failed', error: { message: 'secret' } }), null);
+  assert.deepEqual(
+    mapCodexJsonlProgress({ type: 'item.started', item: { type: 'web_search', query: 'secret query' } }),
+    { type: 'stage', phase: 'processing' }
+  );
+  const received = [];
+  const parser = createCodexJsonlProgressParser((event) => received.push(event), { maxParsedLines: 2 });
+  parser.push(`${JSON.stringify({ type: 'unknown' })}\n${JSON.stringify({ type: 'unknown' })}\n`);
+  parser.push(`${JSON.stringify({ type: 'thread.started', thread_id: 'too-late' })}\n`);
+  parser.end();
+  assert.deepEqual(received, []);
+});
+
+test('Codex runner 收到 abort 后终止受控子进程且不等待真实 CLI', async () => {
+  const controller = new AbortController();
+  let child;
+  let signalSpawned;
+  const spawned = new Promise((resolve) => { signalSpawned = resolve; });
+  const run = runCodexSession({
+    project: { id: 'project_abort' },
+    chapter: { id: 'chapter_abort', title: '取消测试', sourceText: '测试原文。' },
+    settings: { codexCommand: 'fake-codex' },
+    signal: controller.signal,
+    spawnProcess(command, args, options) {
+      assert.equal(command, 'fake-codex');
+      assert.equal(args[0], 'exec');
+      assert.equal(options.shell, false);
+      assert.equal(options.detached, undefined);
+      child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.killCalls = 0;
+      child.kill = () => {
+        child.killCalls += 1;
+        child.signalCode = 'SIGTERM';
+        queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+        return true;
+      };
+      signalSpawned();
+      return child;
+    }
+  });
+  await spawned;
+  controller.abort();
+  await assert.rejects(run, (error) => error.code === 'CODEX_CANCELLED');
+  assert.equal(child.killCalls, 1);
+  child.stdout.destroy();
+  child.stderr.destroy();
+  child.stdin.destroy();
 });
 
 test('Codex 子进程只继承白名单环境变量', () => {

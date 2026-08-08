@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { SCRIPT_SCHEMA_PATH } from './config.js';
 import { clamp, id, stripCodeFence } from './utils.js';
 
@@ -286,9 +287,100 @@ export function resolveCodexModel(model, settings = {}, project = null) {
     : String(model || '');
 }
 
-function codexEventError(event) {
-  const detail = event?.error?.message || event?.message || event?.error || event?.detail;
-  return typeof detail === 'string' ? detail : detail ? JSON.stringify(detail) : '未知错误';
+/**
+ * Convert an official `codex exec --json` event to a fixed public progress signal.
+ * No property from the source event is copied into the returned object.
+ */
+export function mapCodexJsonlProgress(event) {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  if (type === 'thread.started') return { type: 'thread', phase: 'started' };
+  if (type === 'turn.started') return { type: 'turn', phase: 'started' };
+  if (type === 'turn.completed') return { type: 'turn', phase: 'completed' };
+  if (type === 'turn.failed' || type === 'error') return null;
+  if (!['item.started', 'item.updated', 'item.completed'].includes(type)) return null;
+
+  const itemType = typeof event?.item?.type === 'string' ? event.item.type : '';
+  if (itemType === 'reasoning') return { type: 'stage', phase: 'analyzing' };
+  if (itemType === 'agent_message') {
+    return type === 'item.completed'
+      ? { type: 'stage', phase: 'validating' }
+      : { type: 'stage', phase: 'drafting' };
+  }
+  if (['command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'todo_list'].includes(itemType)) {
+    return { type: 'stage', phase: 'processing' };
+  }
+  return null;
+}
+
+/** Incrementally decodes JSONL chunks while exposing only the fixed signals above. */
+export function createCodexJsonlProgressParser(onProgress, {
+  maxEvents = 64,
+  maxParsedLines = 512,
+  maxBufferChars = CODEX_PROCESS_LIMITS.stdoutBytes
+} = {}) {
+  const decoder = new StringDecoder('utf8');
+  const emitted = new Set();
+  let lineBuffer = '';
+  let disabled = typeof onProgress !== 'function';
+  let eventCount = 0;
+  let parsedLineCount = 0;
+  let firstLine = true;
+
+  const emitLine = (line) => {
+    if (disabled) return;
+    const candidate = firstLine ? line.replace(/^\uFEFF/, '') : line;
+    firstLine = false;
+    if (!candidate.trim()) return;
+    parsedLineCount += 1;
+    if (parsedLineCount > maxParsedLines) {
+      lineBuffer = '';
+      disabled = true;
+      return;
+    }
+    let event;
+    try { event = JSON.parse(candidate); } catch { return; }
+    const progress = mapCodexJsonlProgress(event);
+    if (!progress) return;
+    const key = `${progress.type}:${progress.phase}`;
+    if (emitted.has(key) || eventCount >= maxEvents) return;
+    emitted.add(key);
+    eventCount += 1;
+    try { onProgress({ ...progress }); } catch { /* progress must never affect the Codex result */ }
+  };
+
+  const consume = (text) => {
+    if (disabled || !text) return;
+    lineBuffer += text;
+    if (lineBuffer.length > maxBufferChars) {
+      lineBuffer = '';
+      disabled = true;
+      return;
+    }
+    let newline;
+    while ((newline = lineBuffer.indexOf('\n')) >= 0) {
+      const line = lineBuffer.slice(0, newline).replace(/\r$/, '');
+      lineBuffer = lineBuffer.slice(newline + 1);
+      emitLine(line);
+    }
+  };
+
+  return {
+    push(chunk) {
+      if (disabled || chunk === undefined || chunk === null) return;
+      consume(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))));
+    },
+    end() {
+      if (disabled) return;
+      consume(decoder.end());
+      if (lineBuffer) emitLine(lineBuffer.replace(/\r$/, ''));
+      lineBuffer = '';
+      disabled = true;
+    },
+    cancel() {
+      lineBuffer = '';
+      disabled = true;
+    }
+  };
 }
 
 export function parseCodexJsonl(value) {
@@ -305,12 +397,12 @@ export function parseCodexJsonl(value) {
     try {
       event = JSON.parse(line);
     } catch (error) {
-      throw Object.assign(new Error(`Codex JSONL 第 ${index + 1} 行无法解析：${error.message}`), {
-        code: 'CODEX_JSONL_INVALID',
-        detail: line.slice(0, 240)
-      });
+      throw Object.assign(new Error(`Codex JSONL 第 ${index + 1} 行无法解析。`), { code: 'CODEX_JSONL_INVALID' });
     }
     eventCount += 1;
+    if (eventCount > 20_000) {
+      throw Object.assign(new Error('Codex JSONL 事件数量超过安全上限。'), { code: 'CODEX_OUTPUT_TOO_LARGE' });
+    }
     if (event.type === 'thread.started' && (event.thread_id || event.threadId)) {
       threadId = String(event.thread_id || event.threadId);
     }
@@ -321,9 +413,7 @@ export function parseCodexJsonl(value) {
       usage = { ...event.usage };
     }
     if (event.type === 'turn.failed' || event.type === 'error') {
-      throw Object.assign(new Error(`Codex 会话执行失败：${codexEventError(event)}`), {
-        code: 'CODEX_TURN_FAILED', detail: event
-      });
+      throw Object.assign(new Error('Codex 会话执行失败。'), { code: 'CODEX_TURN_FAILED' });
     }
   }
 
@@ -381,7 +471,7 @@ function processErrorMessage(error) {
   if (code === 'ENOENT') {
     return '找不到 Codex CLI。请先安装 Codex，或在设置中填写可执行文件的完整路径。';
   }
-  return `无法启动 Codex CLI：${error?.message || '未知错误'}`;
+  return '无法启动 Codex CLI，请检查本机安装与执行权限。';
 }
 
 function runProcess(command, args, stdin, {
@@ -389,14 +479,21 @@ function runProcess(command, args, stdin, {
   env = codexProcessEnv(),
   timeoutMs = 10 * 60_000,
   maxStdoutBytes = CODEX_PROCESS_LIMITS.stdoutBytes,
-  maxStderrBytes = CODEX_PROCESS_LIMITS.stderrBytes
+  maxStderrBytes = CODEX_PROCESS_LIMITS.stderrBytes,
+  onProgress,
+  signal,
+  spawnProcess = spawn
 } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(Object.assign(new Error('Codex 请求已取消。'), { code: 'CODEX_CANCELLED' }));
+      return;
+    }
     let child;
     try {
-      child = spawn(command, args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawnProcess(command, args, { cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (error) {
-      reject(Object.assign(new Error(processErrorMessage(error)), { code: 'CODEX_UNAVAILABLE', detail: error.message }));
+      reject(Object.assign(new Error(processErrorMessage(error)), { code: 'CODEX_UNAVAILABLE' }));
       return;
     }
     const stdout = [];
@@ -404,11 +501,20 @@ function runProcess(command, args, stdin, {
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
+    let abortHandler = null;
+    const progressParser = createCodexJsonlProgressParser(onProgress, { maxBufferChars: maxStdoutBytes });
+
+    const detachAbort = () => {
+      if (abortHandler) signal?.removeEventListener('abort', abortHandler);
+      abortHandler = null;
+    };
 
     const fail = (error, { terminate = true } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      detachAbort();
+      progressParser.cancel();
       if (terminate && child.exitCode === null && child.signalCode === null) {
         try { child.kill(); } catch { /* process is already gone */ }
       }
@@ -419,6 +525,7 @@ function runProcess(command, args, stdin, {
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
+      if (settled) return;
       stdoutBytes += chunk.length;
       if (stdoutBytes > maxStdoutBytes) {
         fail(Object.assign(new Error(`Codex 输出超过安全上限（${Math.round(maxStdoutBytes / 1024 / 1024)} MB）`), {
@@ -427,8 +534,10 @@ function runProcess(command, args, stdin, {
         return;
       }
       stdout.push(chunk);
+      progressParser.push(chunk);
     });
     child.stderr.on('data', (chunk) => {
+      if (settled) return;
       stderrBytes += chunk.length;
       if (stderrBytes > maxStderrBytes) {
         fail(Object.assign(new Error(`Codex 诊断输出超过安全上限（${Math.round(maxStderrBytes / 1024 / 1024)} MB）`), {
@@ -439,19 +548,16 @@ function runProcess(command, args, stdin, {
       stderr.push(chunk);
     });
     child.on('error', (error) => {
-      fail(Object.assign(new Error(processErrorMessage(error)), {
-        code: 'CODEX_UNAVAILABLE', detail: error.message
-      }), { terminate: false });
+      fail(Object.assign(new Error(processErrorMessage(error)), { code: 'CODEX_UNAVAILABLE' }), { terminate: false });
     });
     child.on('close', (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      detachAbort();
+      progressParser.end();
       if (code !== 0) {
-        const detail = Buffer.concat(stderr).toString('utf8').trim().slice(0, CODEX_PROCESS_LIMITS.errorDetailChars);
-        reject(Object.assign(new Error(detail ? `Codex CLI 执行失败（退出码 ${code}）：${detail}` : `Codex CLI 执行失败（退出码 ${code}）`), {
-          code: 'CODEX_FAILED', detail
-        }));
+        reject(Object.assign(new Error(`Codex CLI 执行失败（退出码 ${code}）。`), { code: 'CODEX_FAILED' }));
         return;
       }
       resolve({
@@ -464,7 +570,12 @@ function runProcess(command, args, stdin, {
         fail(Object.assign(new Error(`无法向 Codex 发送提示词：${error.message}`), { code: 'CODEX_STDIN_FAILED' }));
       }
     });
-    child.stdin.end(String(stdin || ''), 'utf8');
+    if (signal) {
+      abortHandler = () => fail(Object.assign(new Error('Codex 请求已取消。'), { code: 'CODEX_CANCELLED' }));
+      signal.addEventListener('abort', abortHandler, { once: true });
+      if (signal.aborted) abortHandler();
+    }
+    if (!settled) child.stdin.end(String(stdin || ''), 'utf8');
   });
 }
 
@@ -483,7 +594,10 @@ export async function runCodexSession({
   model,
   sessionId = '',
   prompt = '',
-  timeoutMs = 10 * 60_000
+  timeoutMs = 10 * 60_000,
+  onProgress,
+  signal,
+  spawnProcess
 } = {}) {
   if (!chapter || typeof chapter !== 'object') {
     throw Object.assign(new Error('缺少待处理的章节'), { code: 'CODEX_INPUT_INVALID' });
@@ -496,7 +610,9 @@ export async function runCodexSession({
   const stdin = resumeId
     ? buildCodexFollowUpPrompt({ chapter, project, prompt })
     : buildInitialSessionPrompt(chapter, mode, prompt);
-  const output = await runProcess(command, args, stdin, { cwd: runtime.cwd, timeoutMs });
+  const output = await runProcess(command, args, stdin, {
+    cwd: runtime.cwd, timeoutMs, onProgress, signal, spawnProcess
+  });
   const parsed = parseCodexJsonl(output.stdout);
   const threadId = parsed.threadId || resumeId;
   if (!threadId) {
@@ -516,8 +632,7 @@ export async function runCodexSession({
   } catch (error) {
     if (error.code) throw error;
     throw Object.assign(new Error(`Codex 返回内容不是有效剧本 JSON：${error.message}`), {
-      code: 'SCRIPT_SCHEMA_INVALID',
-      detail: parsed.assistantText.slice(0, CODEX_PROCESS_LIMITS.errorDetailChars)
+      code: 'SCRIPT_SCHEMA_INVALID'
     });
   }
 }

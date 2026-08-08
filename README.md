@@ -10,7 +10,7 @@
 - 中文章节标题识别，无标题长文自动按段落安全切块。
 - 三档剧本策略：忠实朗读、轻度剧本化、广播剧化。
 - 本地规则引擎可立即识别引号对白、推断角色并标注情绪；低置信度结果会标为“待确认”。
-- Codex 多轮剧本协作室：持久 session、模型选择、对话微调、逐句人工编辑，以及任务包手工交接。
+- Codex 多轮剧本协作室：持久 session、模型选择、对话微调、可恢复的后台进度、逐句人工编辑，以及任务包手工交接。
 - 多角色编辑器：说话人、朗读文本、情绪、强度、语速、停顿均可局部修改。
 - 音色库：麦克风录制、短音频导入，以及从长视频/音频中定位、试听并裁剪 3–60 秒素材；保留参考文本、标签、授权确认和来源区间。
 - 角色—音色绑定，单句/本章/整书 TTS 队列，按句缓存和失败隔离。
@@ -160,6 +160,8 @@ RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttentio
 
 Codex 剧本协作室使用持久会话：首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。窗口支持每轮选择模型、查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
 
+协作室可选择是否显示实时处理进度。发送后任务会转到后台执行，页面通过可断线恢复的事件流展示排队、准备、分析、结构化校验和保存等安全阶段摘要；隐藏面板、关闭协作窗口或刷新页面都不会取消任务。进度摘要不是模型隐藏思维链，不会包含原始推理、小说正文、提示词、命令、文件路径、Codex thread ID 或令牌信息。
+
 Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。未登录时，可在 Codex 剧本协作室或模型中心点击“登录 Codex”：本地服务会启动官方 `codex login` 浏览器认证，并在界面中等待结果。若 CLI 没有自动唤起系统浏览器，工作台会从 CLI 输出中提取、严格校验本次临时的 OpenAI 官方授权地址，再打开独立标签页；弹窗内也会保留手动打开入口。授权地址只存在于当前登录进程的内存中，完成、取消或超时后立即清除。账号、密码、验证码和令牌始终由 OpenAI 登录页与 Codex CLI 处理，不会进入本项目的页面、日志或项目数据。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。认证方式见 [OpenAI Authentication](https://learn.chatgpt.com/docs/auth)。
 
 直接使用 Codex 会把当前章节原文以及后续轮次的当前剧本发送给已登录的 Codex 服务；本地规则和 Ollama 路径不会。任务包只有在你主动复制给 Codex 时才会离开本机。
@@ -209,6 +211,8 @@ POST   /api/projects/:id/script
 GET    /api/projects/:id/chapters/:chapterId/codex-sessions
 POST   /api/projects/:id/chapters/:chapterId/codex-sessions
 POST   /api/projects/:id/chapters/:chapterId/codex-sessions/:sessionId/messages
+GET    /api/projects/:id/chapters/:chapterId/codex-progress
+GET    /api/projects/:id/chapters/:chapterId/codex-progress/:progressId
 GET    /api/projects/:id/chapters/:chapterId/codex-package
 POST   /api/projects/:id/chapters/:chapterId/script-import
 PATCH  /api/projects/:id/lines/:lineId

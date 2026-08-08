@@ -23,6 +23,7 @@ import {
 import {
   assertLocalHostRequest, assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
 } from './lib/codex-login.js';
+import { CodexProgressManager } from './lib/codex-progress.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
 import {
@@ -197,11 +198,71 @@ async function assertNoCodexAuthOptions(req) {
 }
 
 function codexFailureStatus(error) {
-  if (error.statusCode) return error;
-  if (error.code === 'CODEX_TIMEOUT') error.statusCode = 504;
-  else if (error.code === 'CODEX_UNAVAILABLE') error.statusCode = 503;
-  else if (error.code === 'SCRIPT_SCHEMA_INVALID' || String(error.code || '').startsWith('CODEX_')) error.statusCode = 502;
-  return error;
+  const code = String(error?.code || 'CODEX_REQUEST_FAILED').toUpperCase();
+  const statusCode = error?.statusCode
+    || (code === 'CODEX_TIMEOUT' ? 504 : code === 'CODEX_UNAVAILABLE' ? 503 : 502);
+  const messages = {
+    CODEX_AUTH_REQUIRED: 'Codex CLI 尚未登录，请先完成本机登录。',
+    CODEX_CANCELLED: 'Codex 请求已因服务关闭而取消。',
+    CODEX_CHAPTER_CHANGED: '处理期间本章已被修改，本轮结果没有覆盖最新内容。',
+    CODEX_TIMEOUT: 'Codex 处理超时，请稍后重试。',
+    CODEX_UNAVAILABLE: 'Codex CLI 当前不可用，请检查模型中心状态。',
+    SCRIPT_SCHEMA_INVALID: 'Codex 返回的剧本结构未通过校验，当前章节未被覆盖。'
+  };
+  return Object.assign(new Error(messages[code] || 'Codex 本轮处理失败，请检查状态后重试。'), {
+    statusCode,
+    code: /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'CODEX_REQUEST_FAILED'
+  });
+}
+
+function assertCodexWorkspaceRequest(req) {
+  assertLoopbackRequest(req);
+  assertLocalHostRequest(req);
+  assertSameOriginRequest(req);
+}
+
+function codexAsyncRequested(body) {
+  return body?.stream === true;
+}
+
+function codexAccepted(progress) {
+  return { progressId: progress.progressId, state: progress.state, eventsUrl: progress.eventsUrl };
+}
+
+function assertCodexRunActive(signal) {
+  if (!signal?.aborted) return;
+  throw Object.assign(new Error('Codex 请求已因服务关闭而取消。'), {
+    statusCode: 503,
+    code: 'CODEX_CANCELLED'
+  });
+}
+
+function trackCodexOperation(progressManager, progress, scope, operation) {
+  const task = Promise.resolve().then(operation);
+  progressManager.track(progress.progressId, scope.projectId, scope.chapterId, task);
+  return task;
+}
+
+function runCodexInBackground(progressManager, progress, scope, operation) {
+  const progressId = progress.progressId;
+  const task = trackCodexOperation(progressManager, progress, scope, operation).then(
+    () => progressManager.complete(progressId),
+    (error) => progressManager.fail(progressId, error?.code)
+  );
+  void task.catch(() => {});
+  return task;
+}
+
+const CODEX_RUNNER_PROGRESS = new Set([
+  'thread:started', 'turn:started', 'turn:completed',
+  'stage:analyzing', 'stage:drafting', 'stage:processing', 'stage:validating'
+]);
+
+function publishCodexRunnerProgress(progressManager, progressId, event) {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  const phase = typeof event?.phase === 'string' ? event.phase : '';
+  if (!CODEX_RUNNER_PROGRESS.has(`${type}:${phase}`)) return;
+  progressManager.publish(progressId, { type, phase });
 }
 
 function assertUsableScript(script, chapter, statusCode = 422) {
@@ -278,6 +339,7 @@ async function handleApi(req, res, url, {
   codexRunner = runCodexSession,
   codexSettingsResolver = codexRuntimeSettings,
   codexLoginManager: loginManager,
+  codexProgressManager: progressManager,
   systemProfileResolver = getSystemProfile
 } = {}) {
   const { pathname } = url;
@@ -321,6 +383,25 @@ async function handleApi(req, res, url, {
     }
     throw Object.assign(new Error('请求方法不支持'), { statusCode: 405, code: 'METHOD_NOT_ALLOWED' });
   }
+  let params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-progress/:progressId');
+  if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
+    const project = await getProject(params.projectId);
+    findChapter(project, params.chapterId);
+    return progressManager.subscribe(req, res, {
+      ...params,
+      lastEventId: req.headers['last-event-id']
+    });
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-progress');
+  if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
+    const project = await getProject(params.projectId);
+    findChapter(project, params.chapterId);
+    return json(res, 200, { progress: progressManager.latest(params.projectId, params.chapterId) });
+  }
+
   if (method === 'PATCH' && pathname === '/api/settings') {
     const settings = await updateSettings(await parseJsonBody(req, MAX_JSON_BYTES));
     return json(res, 200, settings);
@@ -363,7 +444,7 @@ async function handleApi(req, res, url, {
     return json(res, 201, source);
   }
 
-  let params = routeMatch(pathname, '/api/jobs/:jobId');
+  params = routeMatch(pathname, '/api/jobs/:jobId');
   if (params && method === 'GET') return json(res, 200, jobs.get(params.jobId));
 
   params = routeMatch(pathname, '/api/voice-sources/:sourceId/extract');
@@ -458,10 +539,18 @@ async function handleApi(req, res, url, {
 
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/messages');
   if (params && method === 'POST') {
+    assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const prompt = codexPrompt(body.prompt, { required: true });
+    const scopeProject = await getProject(params.projectId);
+    const scopeChapter = findChapter(scopeProject, params.chapterId);
+    findCodexSession(scopeChapter, params.sessionId);
+    const progress = progressManager.create(params);
+    const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
-    const result = await withCodexSessionLock(lockKey, async () => {
+    const operation = () => withCodexSessionLock(lockKey, async () => {
+      assertCodexRunActive(signal);
+      progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
       const settings = await codexSettingsResolver(await getSettings());
       const project = await getProject(params.projectId);
       const chapter = findChapter(project, params.chapterId);
@@ -473,15 +562,18 @@ async function handleApi(req, res, url, {
         });
       }
       const model = codexModel(Object.hasOwn(body, 'model') ? body.model : session.model);
-      let turn;
-      try {
-        turn = await codexRunner({
-          chapter, project, settings, mode: session.mode, model,
-          sessionId: session.codexThreadId, prompt
-        });
-      } catch (error) { throw codexFailureStatus(error); }
+      assertCodexRunActive(signal);
+      const turn = await codexRunner({
+        chapter, project, settings, mode: session.mode, model,
+        sessionId: session.codexThreadId, prompt,
+        signal,
+        onProgress: (event) => publishCodexRunnerProgress(progressManager, progress.progressId, event)
+      });
+      assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
+      progressManager.publish(progress.progressId, { type: 'stage', phase: 'saving' });
       return mutateProject(params.projectId, (draft) => {
+        assertCodexRunActive(signal);
         const targetChapter = findChapter(draft, params.chapterId);
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
         const targetSession = findCodexSession(targetChapter, params.sessionId);
@@ -493,37 +585,63 @@ async function handleApi(req, res, url, {
         return { project: draft, session: publicCodexSession(targetSession) };
       });
     });
-    return json(res, 200, { ...result, project: publicProject(result.project) });
+    if (codexAsyncRequested(body)) {
+      runCodexInBackground(progressManager, progress, params, operation);
+      return json(res, 202, codexAccepted(progress));
+    }
+    try {
+      const result = await trackCodexOperation(progressManager, progress, params, operation);
+      progressManager.complete(progress.progressId);
+      return json(res, 200, { ...result, project: publicProject(result.project), progressId: progress.progressId });
+    } catch (error) {
+      const failure = codexFailureStatus(error);
+      progressManager.fail(progress.progressId, failure.code);
+      failure.progressId = progress.progressId;
+      throw failure;
+    }
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions');
   if (params && method === 'GET') {
+    assertCodexWorkspaceRequest(req);
     const project = await getProject(params.projectId);
     const chapter = findChapter(project, params.chapterId);
     return json(res, 200, { activeSessionId: chapter.activeCodexSessionId || null, sessions: publicCodexSessions(chapter) });
   }
   if (params && method === 'POST') {
+    assertCodexWorkspaceRequest(req);
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const mode = codexMode(body.mode);
     const model = codexModel(body.model);
     const prompt = codexPrompt(body.prompt);
+    const scopeProject = await getProject(params.projectId);
+    findChapter(scopeProject, params.chapterId);
+    const progress = progressManager.create(params);
+    const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
-    const result = await withCodexSessionLock(lockKey, async () => {
+    const operation = () => withCodexSessionLock(lockKey, async () => {
+      assertCodexRunActive(signal);
+      progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
       const settings = await codexSettingsResolver(await getSettings());
       const project = await getProject(params.projectId);
       const chapter = findChapter(project, params.chapterId);
       const chapterVersion = codexChapterVersion(chapter);
-      let turn;
-      try {
-        turn = await codexRunner({ chapter, project, settings, mode, model, prompt });
-      } catch (error) { throw codexFailureStatus(error); }
+      assertCodexRunActive(signal);
+      const turn = await codexRunner({
+        chapter, project, settings, mode, model, prompt,
+        signal,
+        onProgress: (event) => publishCodexRunnerProgress(progressManager, progress.progressId, event)
+      });
+      assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
       if (!turn.threadId) {
         throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
           statusCode: 502, code: 'CODEX_THREAD_MISSING'
         });
       }
+      progressManager.publish(progress.progressId, { type: 'stage', phase: 'saving' });
       return mutateProject(params.projectId, (draft) => {
+        assertCodexRunActive(signal);
         const targetChapter = findChapter(draft, params.chapterId);
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
         applyScript(draft, targetChapter, turn.script);
@@ -537,7 +655,20 @@ async function handleApi(req, res, url, {
         return { project: draft, session: publicCodexSession(session) };
       });
     });
-    return json(res, 201, { ...result, project: publicProject(result.project) });
+    if (codexAsyncRequested(body)) {
+      runCodexInBackground(progressManager, progress, params, operation);
+      return json(res, 202, codexAccepted(progress));
+    }
+    try {
+      const result = await trackCodexOperation(progressManager, progress, params, operation);
+      progressManager.complete(progress.progressId);
+      return json(res, 201, { ...result, project: publicProject(result.project), progressId: progress.progressId });
+    } catch (error) {
+      const failure = codexFailureStatus(error);
+      progressManager.fail(progress.progressId, failure.code);
+      failure.progressId = progress.progressId;
+      throw failure;
+    }
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-package');
@@ -681,7 +812,8 @@ async function handleStatic(req, res, pathname) {
 export function createServer(options = {}) {
   const serverOptions = {
     ...options,
-    codexLoginManager: options.codexLoginManager || new CodexLoginManager()
+    codexLoginManager: options.codexLoginManager || new CodexLoginManager(),
+    codexProgressManager: options.codexProgressManager || new CodexProgressManager()
   };
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
@@ -695,10 +827,28 @@ export function createServer(options = {}) {
       if (res.headersSent) return res.destroy(error);
       const status = error.statusCode || (error.code === 'ENOENT' ? 404 : 500);
       if (status >= 500) console.error(error);
-      return json(res, status, { error: error.code || 'REQUEST_FAILED', message: error.message || '未知错误' });
+      const body = { error: error.code || 'REQUEST_FAILED', message: error.message || '未知错误' };
+      if (/^codexprog_[0-9a-f]{32}$/.test(String(error.progressId || ''))) body.progressId = error.progressId;
+      return json(res, status, body);
     }
   });
-  server.once('close', () => serverOptions.codexLoginManager.shutdown());
+  let managersClosed = false;
+  let managersShutdown = Promise.resolve();
+  const shutdownManagers = () => {
+    if (managersClosed) return managersShutdown;
+    managersClosed = true;
+    managersShutdown = Promise.resolve(serverOptions.codexProgressManager.shutdown()).catch(() => {});
+    serverOptions.codexLoginManager.shutdown();
+    return managersShutdown;
+  };
+  const closeServer = server.close.bind(server);
+  server.close = (callback) => {
+    const pending = shutdownManagers();
+    return closeServer((error) => {
+      void pending.then(() => callback?.(error));
+    });
+  };
+  server.once('close', shutdownManagers);
   return server;
 }
 

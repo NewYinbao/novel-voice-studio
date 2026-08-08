@@ -100,7 +100,17 @@ export function saveCodexSession(chapter, session) {
 export function publicCodexSession(session) {
   if (!session) return null;
   const { codexThreadId: _privateThreadId, ...publicValue } = session;
-  return publicValue;
+  return {
+    ...publicValue,
+    messages: Array.isArray(publicValue.messages) ? publicValue.messages.map((item) => {
+      if (!item?.meta || typeof item.meta !== 'object') return { ...item };
+      const { usage: _privateUsage, ...safeMeta } = item.meta;
+      const result = { ...item };
+      if (Object.keys(safeMeta).length) result.meta = safeMeta;
+      else delete result.meta;
+      return result;
+    }) : publicValue.messages
+  };
 }
 
 export function publicCodexSessions(chapter) {
