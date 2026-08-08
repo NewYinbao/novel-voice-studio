@@ -20,6 +20,9 @@ import {
   appendCodexTurn, createCodexSession, findCodexSession, publicCodexSession,
   publicCodexSessions, saveCodexSession
 } from './lib/codex-sessions.js';
+import {
+  assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
+} from './lib/codex-login.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
 import {
@@ -173,6 +176,26 @@ async function codexRuntimeSettings(settings) {
   return { ...settings, codexCommand: command };
 }
 
+function resolveCodexLogin(profile) {
+  const tool = profile?.tools?.codex || {};
+  if (tool.runnable || tool.state === 'ready') return { authenticated: true };
+  if (tool.state !== 'authRequired' || !tool.resolvedCommand) {
+    throw Object.assign(new Error('Codex CLI 当前不可用，请先在模型中心检查安装状态。'), {
+      statusCode: 409, code: 'CODEX_UNAVAILABLE'
+    });
+  }
+  return { authenticated: false, command: tool.resolvedCommand };
+}
+
+async function assertNoCodexAuthOptions(req) {
+  const body = await parseJsonBody(req, 1_024);
+  if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).length) {
+    throw Object.assign(new Error('Codex 登录不接受命令、参数或其他客户端选项。'), {
+      statusCode: 400, code: 'CODEX_AUTH_OPTIONS_NOT_ALLOWED'
+    });
+  }
+}
+
 function codexFailureStatus(error) {
   if (error.statusCode) return error;
   if (error.code === 'CODEX_TIMEOUT') error.statusCode = 504;
@@ -253,7 +276,9 @@ async function getBootstrap() {
 
 async function handleApi(req, res, url, {
   codexRunner = runCodexSession,
-  codexSettingsResolver = codexRuntimeSettings
+  codexSettingsResolver = codexRuntimeSettings,
+  codexLoginManager: loginManager = defaultCodexLoginManager,
+  systemProfileResolver = getSystemProfile
 } = {}) {
   const { pathname } = url;
   const method = req.method;
@@ -268,6 +293,32 @@ async function handleApi(req, res, url, {
     const settings = await getSettings();
     const profile = await getSystemProfile(settings, { refresh: url.searchParams.get('refresh') === '1' });
     return json(res, 200, { profile, engines: engineCompatibility(profile, settings.selectedEngine, settings.qualityMode) });
+  }
+  if (pathname === '/api/codex/auth/login') {
+    assertLoopbackRequest(req);
+    if (method === 'GET') return json(res, 200, { login: loginManager.snapshot() });
+    if (method === 'DELETE') {
+      assertSameOriginRequest(req);
+      await assertNoCodexAuthOptions(req);
+      return json(res, 200, { login: loginManager.cancel() });
+    }
+    if (method === 'POST') {
+      assertSameOriginRequest(req);
+      await assertNoCodexAuthOptions(req);
+      const login = await loginManager.start({
+        resolveCommand: async () => {
+          const settings = await getSettings();
+          return resolveCodexLogin(await systemProfileResolver(settings, { refresh: true }));
+        },
+        verifyAuthenticated: async () => {
+          const settings = await getSettings();
+          const profile = await systemProfileResolver(settings, { refresh: true });
+          return profile?.tools?.codex?.runnable === true || profile?.tools?.codex?.state === 'ready';
+        }
+      });
+      return json(res, login.state === 'succeeded' ? 200 : 202, { login });
+    }
+    throw Object.assign(new Error('请求方法不支持'), { statusCode: 405, code: 'METHOD_NOT_ALLOWED' });
   }
   if (method === 'PATCH' && pathname === '/api/settings') {
     const settings = await updateSettings(await parseJsonBody(req, MAX_JSON_BYTES));
@@ -627,12 +678,16 @@ async function handleStatic(req, res, pathname) {
 }
 
 export function createServer(options = {}) {
-  return http.createServer(async (req, res) => {
+  const serverOptions = {
+    ...options,
+    codexLoginManager: options.codexLoginManager || new CodexLoginManager()
+  };
+  const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');
     try {
       const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
-      if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url, options);
+      if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url, serverOptions);
       if (url.pathname.startsWith('/media/')) return await handleMedia(req, res, url.pathname);
       return await handleStatic(req, res, url.pathname);
     } catch (error) {
@@ -642,6 +697,8 @@ export function createServer(options = {}) {
       return json(res, status, { error: error.code || 'REQUEST_FAILED', message: error.message || '未知错误' });
     }
   });
+  server.once('close', () => serverOptions.codexLoginManager.shutdown());
+  return server;
 }
 
 async function main() {

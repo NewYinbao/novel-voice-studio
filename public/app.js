@@ -42,6 +42,13 @@ const state = {
   codexBusy: false,
   codexError: '',
   codexRequestId: 0,
+  codexLogin: null,
+  codexLoginPanelOpen: false,
+  codexLoginTimer: null,
+  codexLoginRequestId: 0,
+  codexLoginAction: '',
+  codexLoginPollInFlight: false,
+  codexLoginOrigin: '',
   modalTrigger: null
 };
 
@@ -117,6 +124,15 @@ function toast(title, message = '', type = 'success', timeout = 4200) {
 }
 
 function showModal(content, className = '') {
+  const targetClasses = String(className).split(/\s+/);
+  const replacingCodexRoom = Boolean($('#modal-root .codex-room-modal'))
+    && !targetClasses.includes('codex-room-modal')
+    && !targetClasses.includes('codex-login-modal');
+  if (replacingCodexRoom) {
+    stopCodexLoginPolling({ invalidate: true });
+    state.codexLoginPanelOpen = false;
+    state.codexLoginAction = '';
+  }
   if (!$('#modal-root .modal')) state.modalTrigger = document.activeElement;
   $('#modal-root').innerHTML = `<div class="modal-backdrop" data-action="modal-backdrop"><section class="modal ${className}" role="dialog" aria-modal="true">${content}</section></div>`;
   const modal = $('#modal-root .modal');
@@ -136,6 +152,9 @@ function closeModal() {
   }
   stopRecorderTracks({ discard: true });
   resetVoiceSource({ discardRemote: true });
+  stopCodexLoginPolling({ invalidate: true });
+  state.codexLoginPanelOpen = false;
+  state.codexLoginAction = '';
   state.codexRequestId += 1;
   state.codexBusy = false;
   state.codexError = '';
@@ -298,6 +317,343 @@ function codexReadiness() {
     .replace(/\s+/g, ' ').trim().slice(0, 220);
   if (tool.state === 'authRequired') return { ready: false, authRequired: true, label: 'Codex CLI 等待登录', detail };
   return { ready: false, authRequired: false, label: 'Codex CLI 当前不可直接调用', detail };
+}
+
+const CODEX_LOGIN_ACTIVE_STATES = new Set(['starting', 'waiting']);
+const CODEX_LOGIN_TERMINAL_STATES = new Set(['succeeded', 'failed', 'cancelled', 'timedOut']);
+const CODEX_LOGIN_KNOWN_STATES = new Set(['idle', ...CODEX_LOGIN_ACTIVE_STATES, ...CODEX_LOGIN_TERMINAL_STATES]);
+
+function safeCodexLoginMessage(value = '') {
+  return String(value)
+    .replace(/(?:https?:\/\/|www\.)\S+/gi, '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+}
+
+function normalizeCodexLogin(payload, fallbackState = 'idle') {
+  const source = payload?.login && typeof payload.login === 'object' ? payload.login : payload || {};
+  const aliases = { canceled: 'cancelled', timeout: 'timedOut', timed_out: 'timedOut', completed: 'succeeded', success: 'succeeded' };
+  let loginState = aliases[source.state] || source.state || fallbackState;
+  if (source.authenticated === true) loginState = 'succeeded';
+  if (!CODEX_LOGIN_KNOWN_STATES.has(loginState)) loginState = fallbackState;
+  return {
+    state: loginState,
+    message: safeCodexLoginMessage(source.message),
+    startedAt: source.startedAt || null,
+    finishedAt: source.finishedAt || null,
+    timeoutAt: source.timeoutAt || null,
+    authenticated: source.authenticated === true
+  };
+}
+
+function currentCodexLogin() {
+  return normalizeCodexLogin(state.codexLogin || { state: 'idle' });
+}
+
+function codexLoginPresentation(loginState) {
+  return ({
+    idle: {
+      tone: 'idle', icon: '↗', eyebrow: 'SECURE SIGN-IN', title: '登录 Codex',
+      detail: '将由本机 Codex CLI 打开 OpenAI 官方登录页。登录完成后会自动返回工作台。', status: '等待开始登录'
+    },
+    starting: {
+      tone: 'active', icon: '↗', eyebrow: 'OPENING BROWSER', title: '正在打开 OpenAI 登录页',
+      detail: '请稍候，工作台正在启动本机 Codex 登录流程。', status: '正在连接本机 Codex CLI'
+    },
+    waiting: {
+      tone: 'active', icon: '↗', eyebrow: 'AWAITING CONFIRMATION', title: '请在浏览器中完成登录',
+      detail: '在 OpenAI 官方页面选择账号与工作区；完成后留在此页，状态会自动更新。', status: '等待浏览器确认'
+    },
+    succeeded: {
+      tone: 'success', icon: '✓', eyebrow: 'SIGNED IN', title: 'Codex 登录成功',
+      detail: '本机 Codex CLI 已就绪，现在可以在同一会话中生成和调整剧本。', status: '身份验证已完成'
+    },
+    failed: {
+      tone: 'error', icon: '!', eyebrow: 'SIGN-IN FAILED', title: 'Codex 登录没有完成',
+      detail: '可以重试浏览器登录，或重新检测本机 Codex 状态。', status: '登录流程失败'
+    },
+    cancelled: {
+      tone: 'idle', icon: '×', eyebrow: 'SIGN-IN CANCELLED', title: '已取消 Codex 登录',
+      detail: '没有删除已有账号信息；需要时可以重新发起登录。', status: '登录流程已取消'
+    },
+    timedOut: {
+      tone: 'error', icon: '!', eyebrow: 'SIGN-IN TIMED OUT', title: 'Codex 登录已超时',
+      detail: '浏览器确认等待时间已结束。请检查网络后重试。', status: '等待浏览器确认超时'
+    }
+  })[loginState] || null;
+}
+
+function codexLoginElapsed(startedAt) {
+  const started = Date.parse(startedAt || '');
+  if (!Number.isFinite(started)) return '';
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  return `已等待 ${minutes ? `${minutes} 分 ` : ''}${String(seconds % 60).padStart(2, '0')} 秒`;
+}
+
+function codexLoginStepClass(loginState, index) {
+  if (loginState === 'succeeded') return 'done';
+  if (loginState === 'starting') return index === 0 ? 'current' : '';
+  if (loginState === 'waiting') return index === 0 ? 'done' : index === 1 ? 'current' : '';
+  if (['failed', 'cancelled', 'timedOut'].includes(loginState)) return index === 0 ? 'done' : index === 1 ? 'current interrupted' : '';
+  return index === 0 ? 'current' : '';
+}
+
+function codexLoginModalHtml() {
+  const login = currentCodexLogin();
+  const presentation = codexLoginPresentation(login.state);
+  const active = CODEX_LOGIN_ACTIVE_STATES.has(login.state);
+  const actionPending = Boolean(state.codexLoginAction);
+  const message = login.message || presentation.status;
+  const elapsed = codexLoginElapsed(login.startedAt);
+  const closeLabel = active ? '关闭登录面板；登录流程会继续在后台运行' : '关闭登录面板';
+  const steps = ['启动本机 CLI', '完成官方网页登录', '返回工作台'];
+  const actions = active
+    ? `<button class="button ghost" data-action="dismiss-codex-login">在后台继续</button><button class="button danger" data-action="cancel-codex-login" ${actionPending ? 'disabled' : ''}>${state.codexLoginAction === 'cancel' ? '取消中…' : '取消登录'}</button>`
+    : login.state === 'succeeded'
+      ? `<button class="button ghost" data-action="recheck-codex-login" ${actionPending ? 'disabled' : ''}>${state.codexLoginAction === 'recheck' ? '检测中…' : '重新检测'}</button><button class="button primary" data-action="dismiss-codex-login">开始使用 Codex</button>`
+      : `<button class="button ghost" data-action="dismiss-codex-login">稍后处理</button><button class="button ghost" data-action="recheck-codex-login" ${actionPending ? 'disabled' : ''}>${state.codexLoginAction === 'recheck' ? '检测中…' : '重新检测'}</button><button class="button primary" data-action="start-codex-login" ${actionPending ? 'disabled' : ''}>${state.codexLoginAction === 'start' ? '正在申请…' : login.state === 'idle' ? '登录 Codex' : '重新登录'}</button>`;
+  return `<header class="modal-head codex-login-head"><div><span class="eyebrow">CODEX ACCOUNT</span><h2>${escapeHtml(presentation.title)}</h2></div><button class="icon-button" data-action="dismiss-codex-login" aria-label="${closeLabel}">×</button></header>
+    <div class="modal-body codex-login-body ${presentation.tone}">
+      <div class="codex-login-hero"><span class="codex-login-icon" aria-hidden="true">${presentation.icon}</span><div><span class="eyebrow">${presentation.eyebrow}</span><p id="codex-login-description">${escapeHtml(presentation.detail)}</p></div></div>
+      <div class="codex-login-live" role="status" aria-live="polite" aria-atomic="true"><i aria-hidden="true"></i><div><strong data-codex-login-message>${escapeHtml(message)}</strong><small data-codex-login-elapsed>${escapeHtml(elapsed)}</small></div></div>
+      <ol class="codex-login-steps" aria-label="Codex 登录进度">${steps.map((label, index) => `<li class="${codexLoginStepClass(login.state, index)}"><span>${index + 1}</span><small>${label}</small></li>`).join('')}</ol>
+      <div class="codex-login-privacy"><span aria-hidden="true">⌾</span><p><strong>凭据不会经过本工作台</strong><small>密码、验证码与访问令牌只由 OpenAI 官方页面和本机 Codex CLI 处理；这里仅查看脱敏后的登录状态。</small></p></div>
+      ${login.state === 'timedOut' ? '<p class="codex-login-help">如果浏览器无法回到本机应用，可在终端尝试 <code>codex login --device-auth</code>。</p>' : ''}
+    </div>
+    <footer class="modal-foot codex-login-actions">${actions}</footer>`;
+}
+
+function showCodexLoginModal({ focus = true } = {}) {
+  state.codexLoginPanelOpen = true;
+  showModal(codexLoginModalHtml(), 'codex-login-modal');
+  const modal = $('#modal-root .codex-login-modal');
+  if (modal) {
+    modal.dataset.loginState = currentCodexLogin().state;
+    modal.setAttribute('aria-describedby', 'codex-login-description');
+  }
+  if (focus) requestAnimationFrame(() => modal?.querySelector('.codex-login-head [data-action="dismiss-codex-login"]')?.focus());
+}
+
+function updateCodexLoginModal({ force = false, focusAction = '' } = {}) {
+  if (!state.codexLoginPanelOpen) return;
+  const modal = $('#modal-root .codex-login-modal');
+  if (!modal) return showCodexLoginModal({ focus: Boolean(focusAction) });
+  const login = currentCodexLogin();
+  const presentation = codexLoginPresentation(login.state);
+  if (!force && modal.dataset.loginState === login.state) {
+    const message = modal.querySelector('[data-codex-login-message]');
+    const elapsed = modal.querySelector('[data-codex-login-elapsed]');
+    if (message) message.textContent = login.message || presentation.status;
+    if (elapsed) elapsed.textContent = codexLoginElapsed(login.startedAt);
+    return;
+  }
+  const previousAction = document.activeElement?.dataset?.action || '';
+  modal.innerHTML = codexLoginModalHtml();
+  modal.dataset.loginState = login.state;
+  const title = modal.querySelector('h2');
+  if (title) { title.id = 'active-modal-title'; modal.setAttribute('aria-labelledby', title.id); }
+  modal.setAttribute('aria-describedby', 'codex-login-description');
+  requestAnimationFrame(() => {
+    const action = focusAction || previousAction;
+    (action ? modal.querySelector(`[data-action="${action}"]:not([disabled])`) : null)?.focus();
+  });
+}
+
+function stopCodexLoginPolling({ invalidate = false } = {}) {
+  if (state.codexLoginTimer) clearTimeout(state.codexLoginTimer);
+  state.codexLoginTimer = null;
+  if (invalidate) state.codexLoginRequestId += 1;
+  state.codexLoginPollInFlight = false;
+}
+
+function scheduleCodexLoginPoll() {
+  if (state.codexLoginTimer) clearTimeout(state.codexLoginTimer);
+  state.codexLoginTimer = null;
+  if (!state.codexLoginPanelOpen || !CODEX_LOGIN_ACTIVE_STATES.has(currentCodexLogin().state)) return;
+  state.codexLoginTimer = setTimeout(() => { pollCodexLogin(); }, 1200);
+}
+
+async function completeCodexLogin(login, requestId = state.codexLoginRequestId) {
+  stopCodexLoginPolling();
+  state.codexLogin = { ...login, state: 'succeeded', authenticated: true };
+  state.codexLoginAction = 'refresh';
+  updateCodexLoginModal({ force: true });
+  try {
+    await api('/api/system?refresh=1');
+    await refreshBootstrap({ render: state.codexLoginOrigin !== 'room' });
+    if (requestId !== state.codexLoginRequestId) return;
+    if (!codexReadiness().ready) throw new Error('登录已返回，但 Codex CLI 尚未就绪。请重新检测后再试。');
+    state.codexLoginAction = '';
+    updateCodexLoginModal({ force: true, focusAction: 'dismiss-codex-login' });
+    toast('Codex 登录成功', '现在可以直接在协作室中进行多轮剧本调整。');
+  } catch (error) {
+    if (requestId !== state.codexLoginRequestId) return;
+    state.codexLoginAction = '';
+    state.codexLogin = { ...login, state: 'failed', authenticated: false, message: safeCodexLoginMessage(error.message) };
+    updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
+  }
+}
+
+async function pollCodexLogin() {
+  state.codexLoginTimer = null;
+  if (!state.codexLoginPanelOpen || state.codexLoginPollInFlight) return;
+  const requestId = state.codexLoginRequestId;
+  state.codexLoginPollInFlight = true;
+  try {
+    const payload = await api('/api/codex/auth/login');
+    if (requestId !== state.codexLoginRequestId || !state.codexLoginPanelOpen) return;
+    const login = normalizeCodexLogin(payload, 'waiting');
+    state.codexLogin = login;
+    updateCodexLoginModal({ force: login.state !== $('#modal-root .codex-login-modal')?.dataset.loginState });
+    if (login.state === 'succeeded') await completeCodexLogin(login, requestId);
+    else if (CODEX_LOGIN_ACTIVE_STATES.has(login.state)) scheduleCodexLoginPoll();
+    else stopCodexLoginPolling();
+  } catch (error) {
+    if (requestId !== state.codexLoginRequestId || !state.codexLoginPanelOpen) return;
+    state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '无法读取本机登录状态' };
+    updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
+  } finally {
+    if (requestId === state.codexLoginRequestId) state.codexLoginPollInFlight = false;
+  }
+}
+
+async function startCodexLogin() {
+  if (state.codexLoginAction) return;
+  if (codexReadiness().ready) return toast('Codex 已登录', '本机 CLI 已经可以直接使用。');
+  const roomWasOpen = Boolean($('#modal-root .codex-room-modal'));
+  if (!state.codexLoginPanelOpen) {
+    state.codexLoginOrigin = roomWasOpen ? 'room' : state.view;
+    if (roomWasOpen) rememberCodexComposer();
+  }
+  stopCodexLoginPolling({ invalidate: true });
+  const requestId = state.codexLoginRequestId;
+  state.codexLoginAction = 'start';
+  state.codexLogin = { ...currentCodexLogin(), state: 'starting', message: '正在检查本机 Codex 登录状态' };
+  showCodexLoginModal();
+  try {
+    const currentPayload = await api('/api/codex/auth/login');
+    if (requestId !== state.codexLoginRequestId) return;
+    const current = normalizeCodexLogin(currentPayload);
+    if (current.state === 'succeeded') {
+      state.codexLoginAction = '';
+      await completeCodexLogin(current, requestId);
+      return;
+    }
+    if (CODEX_LOGIN_ACTIVE_STATES.has(current.state)) {
+      state.codexLogin = current;
+      state.codexLoginAction = '';
+      updateCodexLoginModal({ force: true, focusAction: 'cancel-codex-login' });
+      scheduleCodexLoginPoll();
+      return;
+    }
+    state.codexLogin = { ...current, state: 'starting', message: '正在打开 OpenAI 官方登录页' };
+    updateCodexLoginModal();
+    const payload = await api('/api/codex/auth/login', { method: 'POST' });
+    if (requestId !== state.codexLoginRequestId) return;
+    const login = normalizeCodexLogin(payload, 'waiting');
+    state.codexLogin = login;
+    state.codexLoginAction = '';
+    updateCodexLoginModal({ force: true, focusAction: login.state === 'succeeded' ? 'dismiss-codex-login' : 'cancel-codex-login' });
+    if (login.state === 'succeeded') await completeCodexLogin(login, requestId);
+    else if (CODEX_LOGIN_ACTIVE_STATES.has(login.state)) scheduleCodexLoginPoll();
+  } catch (error) {
+    if (requestId !== state.codexLoginRequestId) return;
+    state.codexLoginAction = '';
+    state.codexLogin = { ...currentCodexLogin(), state: 'failed', authenticated: false, message: safeCodexLoginMessage(error.message) || '无法启动本机 Codex 登录' };
+    updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
+  }
+}
+
+async function cancelCodexLogin() {
+  if (state.codexLoginAction) return;
+  stopCodexLoginPolling({ invalidate: true });
+  const requestId = state.codexLoginRequestId;
+  state.codexLoginAction = 'cancel';
+  updateCodexLoginModal({ force: true });
+  try {
+    const payload = await api('/api/codex/auth/login', { method: 'DELETE' });
+    if (requestId !== state.codexLoginRequestId) return;
+    state.codexLogin = normalizeCodexLogin(payload, 'cancelled');
+    state.codexLoginAction = '';
+    updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
+    toast('Codex 登录已取消', '需要时可以再次发起登录。', 'warn');
+  } catch (error) {
+    if (requestId !== state.codexLoginRequestId) return;
+    state.codexLoginAction = '';
+    state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '取消登录失败' };
+    updateCodexLoginModal({ force: true, focusAction: 'recheck-codex-login' });
+  }
+}
+
+async function recheckCodexLogin() {
+  if (state.codexLoginAction) return;
+  stopCodexLoginPolling({ invalidate: true });
+  const requestId = state.codexLoginRequestId;
+  state.codexLoginAction = 'recheck';
+  updateCodexLoginModal({ force: true });
+  try {
+    const payload = await api('/api/codex/auth/login');
+    if (requestId !== state.codexLoginRequestId) return;
+    const login = normalizeCodexLogin(payload);
+    state.codexLogin = login;
+    if (login.state === 'succeeded') {
+      state.codexLoginAction = '';
+      await completeCodexLogin(login, requestId);
+      return;
+    }
+    await api('/api/system?refresh=1');
+    await refreshBootstrap({ render: state.codexLoginOrigin !== 'room' });
+    if (requestId !== state.codexLoginRequestId) return;
+    if (codexReadiness().ready) {
+      state.codexLoginAction = '';
+      await completeCodexLogin({ ...login, state: 'succeeded', authenticated: true }, requestId);
+      return;
+    }
+    state.codexLoginAction = '';
+    updateCodexLoginModal({ force: true, focusAction: CODEX_LOGIN_ACTIVE_STATES.has(login.state) ? 'cancel-codex-login' : 'start-codex-login' });
+    if (CODEX_LOGIN_ACTIVE_STATES.has(login.state)) scheduleCodexLoginPoll();
+    else toast('Codex 仍未登录', '可以重新发起官方浏览器登录。', 'warn');
+  } catch (error) {
+    if (requestId !== state.codexLoginRequestId) return;
+    state.codexLoginAction = '';
+    state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '重新检测失败' };
+    updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
+  }
+}
+
+function dismissCodexLogin() {
+  const origin = state.codexLoginOrigin;
+  stopCodexLoginPolling({ invalidate: true });
+  state.codexLoginPanelOpen = false;
+  state.codexLoginAction = '';
+  if (origin === 'room' && state.project) renderCodexStudio({ focus: 'composer' });
+  else closeModal();
+}
+
+async function recoverCodexLogin() {
+  if (!codexReadiness().authRequired || state.codexLoginPanelOpen || state.codexLoginAction) return;
+  const requestId = ++state.codexLoginRequestId;
+  state.codexLoginAction = 'recover';
+  try {
+    const payload = await api('/api/codex/auth/login');
+    if (requestId !== state.codexLoginRequestId) return;
+    const login = normalizeCodexLogin(payload);
+    state.codexLogin = login;
+    if (CODEX_LOGIN_ACTIVE_STATES.has(login.state) || login.state === 'succeeded') {
+      state.codexLoginOrigin = 'room';
+      state.codexLoginAction = '';
+      showCodexLoginModal();
+      if (login.state === 'succeeded') await completeCodexLogin(login, requestId);
+      else scheduleCodexLoginPoll();
+    }
+  } catch {
+    // 协作室仍可显示任务包；登录状态由用户点击“登录 Codex”时再次检测。
+  } finally {
+    if (requestId === state.codexLoginRequestId && state.codexLoginAction === 'recover') state.codexLoginAction = '';
+  }
 }
 
 function codexStatusLabel(status) {
@@ -517,6 +873,7 @@ function voiceCardHtml(voice) {
 function modelsHtml() {
   const { system, engines, settings } = state.bootstrap;
   const codex = codexReadiness();
+  const loginActive = CODEX_LOGIN_ACTIVE_STATES.has(currentCodexLogin().state);
   return `<section class="page models-page">
     <div class="page-head"><div><span class="eyebrow">MODEL & HARDWARE</span><h1>模型中心</h1><p>按本机显存自动选择最合适的开源语音模型，也可为单个项目手动指定。</p></div><div class="head-actions"><button class="button" data-action="refresh-system">↻ 重新检测</button></div></div>
     <div class="models-layout">
@@ -530,7 +887,7 @@ function modelsHtml() {
       <div class="models-main">
         <section class="panel settings-strip"><strong>自动选择偏好</strong><div class="segmented">${[['speed','速度优先'],['balanced','均衡'],['quality','效果优先']].map(([id,label]) => `<button data-action="set-quality" data-quality="${id}" class="${settings.qualityMode === id ? 'active' : ''}">${label}</button>`).join('')}</div></section>
         <div class="engine-list">${engines.map(engineCardHtml).join('')}</div>
-        <section class="panel integration-panel"><span class="eyebrow">SCRIPT POLISH</span><h3>Codex 剧本集成</h3><div class="integration-row"><div><label class="form-label">Codex CLI 命令</label><input class="field" value="${escapeHtml(settings.codexCommand)}" data-setting="codexCommand"><div class="tool-state ${codex.ready ? 'online' : ''}"><i></i><span><strong>${escapeHtml(codex.label)}</strong> · ${escapeHtml(codex.detail)}</span></div></div><button class="button" data-action="save-command">保存并检测</button></div></section>
+        <section class="panel integration-panel"><span class="eyebrow">SCRIPT POLISH</span><h3>Codex 剧本集成</h3><div class="integration-row"><div><label class="form-label">Codex CLI 命令</label><input class="field" value="${escapeHtml(settings.codexCommand)}" data-setting="codexCommand"><div class="tool-state ${codex.ready ? 'online' : ''}"><i></i><span><strong>${escapeHtml(codex.label)}</strong> · ${escapeHtml(codex.detail)}</span></div></div><div class="integration-actions">${codex.authRequired || loginActive ? `<button class="button primary" data-action="start-codex-login">${loginActive ? '查看登录进度' : '登录 Codex'}</button>` : ''}<button class="button" data-action="save-command">保存并检测</button></div></div></section>
         <section class="panel integration-panel"><span class="eyebrow">WORKER</span><h3>本地模型工作器</h3><div class="integration-row"><div><label class="form-label">服务地址</label><input class="field" value="${escapeHtml(settings.workerUrl)}" data-setting="workerUrl"><div class="tool-state ${system.worker.online ? 'online' : ''}"><i></i>${system.worker.online ? '连接正常，可进行真实语音生成' : '未连接；制作台可生成明确标记的演示音轨，用于先验收流程'}</div></div><button class="button" data-action="save-worker">保存并检测</button></div></section>
       </div>
     </div>
@@ -687,17 +1044,21 @@ function codexStudioHtml() {
   const mode = session?.mode || state.codexMode || 'faithful';
   const sessionStatus = state.codexBusy ? '处理中' : session ? codexStatusLabel(session.status) : '新会话';
   const canSend = readiness.ready && !state.codexBusy;
+  const loginActive = CODEX_LOGIN_ACTIVE_STATES.has(currentCodexLogin().state);
+  const loginButton = readiness.authRequired
+    ? `<button class="button primary small" data-action="start-codex-login" ${state.codexBusy ? 'disabled' : ''}>${loginActive ? '查看登录' : '登录 Codex'}</button>`
+    : '';
   return `<header class="modal-head codex-room-head"><div><span class="eyebrow">CODEX SCRIPT ROOM</span><h2>Codex 剧本协作室</h2><p>${escapeHtml(chapter?.title || '当前章节')} · 多轮调整与逐句校对</p></div><div class="codex-room-head-actions"><span class="codex-room-status ${readiness.ready ? 'ready' : 'warn'}"><i></i>${escapeHtml(readiness.label)}</span><button class="icon-button" data-action="close-modal" aria-label="关闭 Codex 剧本协作室">×</button></div></header>
     <div class="codex-room-grid">
       <aside class="codex-session-panel" aria-label="Codex 会话历史">
         <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>本章会话</strong></div><button class="button small" data-action="new-codex-session" ${state.codexBusy ? 'disabled' : ''}>＋ 新会话</button></div>
         <div class="codex-session-list">${sessions.length ? sessions.map((item, index) => `<button class="codex-session-item ${item.id === session?.id ? 'active' : ''}" data-action="select-codex-session" data-session-id="${item.id}" ${state.codexBusy ? 'disabled' : ''}><span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong><small>${escapeHtml(CODEX_MODE_LABELS[item.mode] || item.mode || '忠实朗读')} · ${escapeHtml(item.model || 'Codex 默认')}</small></span><span><em>${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span></button>`).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有协作记录</strong><small>从一个明确目标开始，后续可在同一会话继续调整。</small></div>'}</div>
-        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div><button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${state.codexBusy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
+        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${state.codexBusy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
       </aside>
       <main class="codex-chat-panel" aria-busy="${state.codexBusy}">
         <div class="codex-chat-toolbar"><label><span>模型（可输入完整 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" value="${escapeHtml(model)}" placeholder="Codex 默认" ${state.codexBusy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" ${state.codexBusy ? 'disabled' : ''}>默认</button></div></label><datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist><label><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || state.codexBusy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label><div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small></div></div>
         <div class="codex-conversation" id="codex-conversation" aria-live="polite">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一章</h3><p>第一次发送会创建会话并更新右侧剧本。之后可以继续要求修正角色、语气或某一段台词。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${state.codexBusy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${state.codexBusy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>Codex 正在处理当前章节</strong><small>请保持窗口打开，完成后剧本会同步到右侧。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
-        <form class="codex-composer" id="codex-chat-form"><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${state.codexBusy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先在本机终端完成 codex login；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${state.codexBusy ? '处理中…' : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
+        <form class="codex-composer" id="codex-chat-form"><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${state.codexBusy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${state.codexBusy ? '处理中…' : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
       </main>
       <aside class="codex-script-panel" aria-label="当前剧本逐句编辑">
         <div class="codex-panel-title"><div><span class="eyebrow">LIVE SCRIPT</span><strong>当前剧本</strong></div><span class="codex-line-count">${lines.length} 句</span></div>
@@ -728,6 +1089,7 @@ function openCodexStudio(mode = state.codexMode) {
   if (session?.model) state.codexModel = session.model;
   if (session?.mode) state.codexMode = session.mode;
   renderCodexStudio({ focus: state.codexSessionId ? '' : 'composer' });
+  recoverCodexLogin();
 }
 
 function startNewCodexSession() {
@@ -769,7 +1131,7 @@ async function waitForPendingLineSaves(projectId, requestId, timeoutMs = 8000) {
 async function submitCodexMessage() {
   if (state.codexBusy) return;
   const readiness = codexReadiness();
-  if (!readiness.ready) return toast(readiness.label, readiness.authRequired ? '请先在本机终端完成 codex login，或使用任务包交接。' : '请使用任务包完成手工交接。', 'warn');
+  if (!readiness.ready) return toast(readiness.label, readiness.authRequired ? '请点击左侧“登录 Codex”完成官方网页登录，或使用任务包交接。' : '请使用任务包完成手工交接。', 'warn');
   rememberCodexComposer();
   const prompt = String($('#codex-chat-prompt')?.value || codexDraft()).trim();
   if (!prompt) return toast('先写下本轮目标', '说明希望 Codex 生成或调整什么内容。', 'warn');
@@ -1355,8 +1717,16 @@ document.addEventListener('click', async (event) => {
       if (demo) await navigate('studio', demo.id); else showModal(projectModalHtml()); return;
     }
     if (action === 'open-project') { await navigate('studio', target.dataset.projectId); return; }
+    if (action === 'start-codex-login') { await startCodexLogin(); return; }
+    if (action === 'cancel-codex-login') { await cancelCodexLogin(); return; }
+    if (action === 'recheck-codex-login') { await recheckCodexLogin(); return; }
+    if (action === 'dismiss-codex-login') { dismissCodexLogin(); return; }
     if (action === 'close-modal') { closeModal(); return; }
-    if (action === 'modal-backdrop' && event.target === target) { closeModal(); return; }
+    if (action === 'modal-backdrop' && event.target === target) {
+      if ($('#modal-root .codex-login-modal')) dismissCodexLogin();
+      else closeModal();
+      return;
+    }
     if (action === 'open-jobs') { openJobs(); return; }
     if (action === 'close-jobs') { closeJobs(); return; }
     if (action === 'select-chapter') { resetPlayback(); state.selectedChapterId = target.dataset.chapterId; state.selectedLineId = null; renderView(); return; }
@@ -1574,7 +1944,8 @@ document.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
-    if ($('#modal-root .modal')) closeModal();
+    if ($('#modal-root .codex-login-modal')) dismissCodexLogin();
+    else if ($('#modal-root .modal')) closeModal();
     else if ($('#job-drawer').classList.contains('open')) closeJobs();
     return;
   }
@@ -1641,6 +2012,7 @@ audio.addEventListener('ended', () => { $('.play-main').textContent = '▶'; });
 audio.addEventListener('pause', () => { if (!audio.ended) $('.play-main').textContent = '▶'; });
 
 window.addEventListener('hashchange', async () => {
+  if ($('#modal-root .codex-login-modal')) closeModal();
   const route = parseRoute();
   if (route.view === 'studio' && route.id) await loadProject(route.id).catch(() => {});
   state.view = route.view; renderView();

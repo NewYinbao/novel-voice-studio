@@ -160,7 +160,7 @@ RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttentio
 
 Codex 剧本协作室使用持久会话：首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。窗口支持每轮选择模型、查看会话历史，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
 
-Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。直接协作需要先在终端完成 `codex login`。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。
+Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。未登录时，可在 Codex 剧本协作室或模型中心点击“登录 Codex”：本地服务会启动官方 `codex login` 浏览器认证，并在界面中等待结果。账号、密码、验证码和令牌始终由 OpenAI 登录页与 Codex CLI 处理，不会进入本项目的页面、接口响应或项目数据。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。认证方式见 [OpenAI Authentication](https://learn.chatgpt.com/docs/auth)。
 
 直接使用 Codex 会把当前章节原文以及后续轮次的当前剧本发送给已登录的 Codex 服务；本地规则和 Ollama 路径不会。任务包只有在你主动复制给 Codex 时才会离开本机。
 
@@ -200,6 +200,9 @@ novel-voice-studio/
 ```text
 GET    /api/bootstrap
 GET    /api/system?refresh=1
+GET    /api/codex/auth/login
+POST   /api/codex/auth/login
+DELETE /api/codex/auth/login
 POST   /api/projects
 POST   /api/projects/:id/import
 POST   /api/projects/:id/script
