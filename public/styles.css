@@ -329,7 +329,7 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 12px; heigh
 .modal { width: min(560px, 95vw); max-height: 90vh; overflow-y: auto; border: 1px solid var(--line-strong); background: #151a1a; border-radius: 19px; box-shadow: 0 40px 120px rgba(0,0,0,.55); animation: modalIn .22s ease; }
 @keyframes modalIn { from { transform: translateY(10px) scale(.985); opacity: 0; } }
 .modal.wide { width: min(760px, 95vw); }
-.modal.codex-login-modal { width: min(590px, calc(100vw - 24px)); overflow: hidden; }
+.modal.codex-login-modal { width: min(590px, calc(100vw - 24px)); overflow-y: auto; }
 .modal.codex-room-modal { width: min(1480px, calc(100vw - 32px)); height: min(900px, calc(100vh - 32px)); max-height: none; overflow: hidden; display: flex; flex-direction: column; }
 .modal-head { display: flex; justify-content: space-between; align-items: flex-start; padding: 24px 25px 18px; border-bottom: 1px solid var(--line); }
 .modal-head h2 { font-size: 18px; margin: 5px 0 0; }
@@ -414,6 +414,12 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 12px; heigh
 .codex-login-live strong, .codex-login-live small { display: block; }
 .codex-login-live strong { font-size: 10px; overflow-wrap: anywhere; }
 .codex-login-live small { min-height: 12px; margin-top: 4px; color: var(--muted-2); font-size: 8px; font-variant-numeric: tabular-nums; }
+.codex-login-browser-action { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px; border: 1px solid rgba(120,223,201,.2); border-radius: 11px; background: rgba(120,223,201,.045); }
+.codex-login-browser-action > div { min-width: 0; }
+.codex-login-browser-action strong, .codex-login-browser-action small { display: block; }
+.codex-login-browser-action strong { color: var(--text); font-size: 9px; }
+.codex-login-browser-action small { margin-top: 4px; color: var(--muted); font-size: 8px; line-height: 1.55; }
+.codex-login-browser-action .button { flex: none; text-decoration: none; white-space: nowrap; }
 .codex-login-steps { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; padding: 2px 0 0; list-style: none; }
 .codex-login-steps li { position: relative; display: grid; justify-items: center; gap: 6px; color: var(--muted-2); text-align: center; }
 .codex-login-steps li::after { content: ''; position: absolute; z-index: 0; top: 11px; left: calc(50% + 14px); width: calc(100% - 28px); height: 1px; background: var(--line-strong); }
@@ -612,6 +618,8 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 12px; heigh
   .integration-row { grid-template-columns: 1fr; }
   .integration-actions { grid-template-columns: 1fr 1fr; }
   .codex-login-body { padding-inline: 17px; }
+  .codex-login-browser-action { align-items: stretch; flex-direction: column; }
+  .codex-login-browser-action .button { width: 100%; }
   .codex-login-actions { align-items: stretch; }
   .codex-login-actions .button { flex: 1 1 100%; }
   .codex-login-steps small { max-width: 88px; }

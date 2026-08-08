@@ -4,6 +4,12 @@ const LOGIN_ARGS = Object.freeze(['login']);
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const TERMINATE_GRACE_MS = 2_000;
 const FORCE_KILL_GRACE_MS = 2_000;
+const MAX_LOGIN_URL_LENGTH = 8_192;
+const MAX_LOGIN_OUTPUT_BUFFER = 32_768;
+const MAX_LOGIN_OUTPUT_CHUNK = 65_536;
+const LOGIN_CALLBACK_PORTS = new Set(['1455', '1457']);
+const LOGIN_URL_PATTERN = /https:\/\/[^\s"'<>`\u0000-\u001f]+(?=[\s"'<>`\u0000-\u001f])/g;
+const LOGIN_REDIRECT_PATTERN = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):(?:1455|1457)\/auth\/callback$/i;
 
 function nowIso() {
   return new Date().toISOString();
@@ -41,6 +47,67 @@ function baseState() {
   };
 }
 
+export function validateCodexLoginUrl(value) {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  if (!candidate || candidate.length > MAX_LOGIN_URL_LENGTH) return null;
+  let loginUrl;
+  try { loginUrl = new URL(candidate); } catch { return null; }
+  if (loginUrl.protocol !== 'https:'
+    || loginUrl.hostname !== 'auth.openai.com'
+    || loginUrl.port
+    || loginUrl.pathname !== '/oauth/authorize'
+    || loginUrl.username
+    || loginUrl.password
+    || loginUrl.hash) return null;
+
+  const redirectValues = loginUrl.searchParams.getAll('redirect_uri');
+  if (redirectValues.length !== 1 || !LOGIN_REDIRECT_PATTERN.test(redirectValues[0])) return null;
+  let redirect;
+  try { redirect = new URL(redirectValues[0]); } catch { return null; }
+  if (redirect.protocol !== 'http:'
+    || !['localhost', '127.0.0.1', '[::1]'].includes(redirect.hostname)
+    || !LOGIN_CALLBACK_PORTS.has(redirect.port)
+    || redirect.pathname !== '/auth/callback'
+    || redirect.username
+    || redirect.password
+    || redirect.search
+    || redirect.hash) return null;
+  return loginUrl.href;
+}
+
+export function createCodexLoginOutputParser(onLoginUrl) {
+  let buffer = '';
+  let found = false;
+  const scan = () => {
+    LOGIN_URL_PATTERN.lastIndex = 0;
+    for (const match of buffer.matchAll(LOGIN_URL_PATTERN)) {
+      const loginUrl = validateCodexLoginUrl(match[0]);
+      if (!loginUrl) continue;
+      found = true;
+      buffer = '';
+      onLoginUrl(loginUrl);
+      return;
+    }
+  };
+  return {
+    push(chunk) {
+      if (found || chunk === undefined || chunk === null) return;
+      let text;
+      if (Buffer.isBuffer(chunk)) text = chunk.subarray(0, MAX_LOGIN_OUTPUT_CHUNK).toString('utf8');
+      else text = String(chunk).slice(0, MAX_LOGIN_OUTPUT_CHUNK);
+      for (let offset = 0; offset < text.length && !found; offset += 4_096) {
+        buffer += text.slice(offset, offset + 4_096);
+        if (buffer.length > MAX_LOGIN_OUTPUT_BUFFER) buffer = buffer.slice(-MAX_LOGIN_OUTPUT_BUFFER);
+        scan();
+      }
+    },
+    clear() {
+      buffer = '';
+      found = true;
+    }
+  };
+}
+
 export function isLoopbackAddress(address) {
   const value = String(address || '').trim().toLowerCase().split('%')[0];
   if (value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
@@ -57,6 +124,16 @@ export function assertLoopbackRequest(req) {
   });
 }
 
+export function assertLocalHostRequest(req) {
+  const host = String(req?.headers?.host || '').trim();
+  const localPort = String(req?.socket?.localPort || '');
+  const match = host.match(/^(?:localhost|127\.0\.0\.1|\[::1\]):([0-9]{1,5})$/i);
+  if (match && match[1] === localPort) return;
+  throw Object.assign(new Error('Codex 登录请求的本机 Host 无效。'), {
+    code: 'CODEX_AUTH_HOST_INVALID', statusCode: 403
+  });
+}
+
 export function assertSameOriginRequest(req) {
   const origin = String(req?.headers?.origin || '').trim();
   if (!origin) return;
@@ -70,10 +147,7 @@ export function assertSameOriginRequest(req) {
   });
 }
 
-/**
- * Owns the single local `codex login` process. CLI output is deliberately ignored:
- * the app never needs to inspect or relay OAuth URLs, authorization codes, or tokens.
- */
+/** Owns one local `codex login` process and exposes only its validated fallback URL. */
 export class CodexLoginManager {
   constructor({
     spawnProcess = spawn,
@@ -91,7 +165,12 @@ export class CodexLoginManager {
   }
 
   snapshot() {
-    return { ...this.state };
+    const snapshot = { ...this.state };
+    if (this.active && this.state.state === 'waiting' && this.active.loginUrl) {
+      snapshot.loginUrl = this.active.loginUrl;
+      snapshot.browserActionRequired = true;
+    }
+    return snapshot;
   }
 
   reportAuthenticated() {
@@ -123,6 +202,8 @@ export class CodexLoginManager {
       timeoutTimer: null,
       terminateTimer: null,
       forceTimer: null,
+      loginUrl: null,
+      outputReaders: [],
       verifyAuthenticated
     };
     this.active = active;
@@ -162,7 +243,7 @@ export class CodexLoginManager {
       child = this.spawnProcess(command, LOGIN_ARGS, {
         shell: false,
         windowsHide: true,
-        stdio: ['ignore', 'ignore', 'ignore']
+        stdio: ['ignore', 'pipe', 'pipe']
       });
     } catch (error) {
       return this.#finish(active, 'failed', safeSpawnMessage(error));
@@ -178,6 +259,8 @@ export class CodexLoginManager {
       state: 'waiting',
       message: '浏览器登录已发起，请在 OpenAI 页面完成授权。'
     };
+    this.#captureOutput(active, child.stdout);
+    this.#captureOutput(active, child.stderr);
     let settled = false;
     const settle = (error, code, signal) => {
       if (settled) return;
@@ -195,6 +278,7 @@ export class CodexLoginManager {
   async #processSettled(active, { error, code }) {
     if (!this.#isCurrent(active)) return;
     active.child = null;
+    this.#clearLoginMaterial(active);
     this.#clear(active.timeoutTimer);
     this.#clear(active.terminateTimer);
     this.#clear(active.forceTimer);
@@ -246,6 +330,7 @@ export class CodexLoginManager {
     if (!this.#isCurrent(active) || active.reason) return;
     active.reason = reason;
     this.#clear(active.timeoutTimer);
+    this.#clearLoginMaterial(active);
     this.state = {
       ...this.state,
       state: reason,
@@ -273,6 +358,7 @@ export class CodexLoginManager {
 
   #finish(active, state, message, authenticated = false) {
     if (!this.#isCurrent(active)) return this.snapshot();
+    this.#clearLoginMaterial(active);
     this.#clear(active.timeoutTimer);
     this.#clear(active.terminateTimer);
     this.#clear(active.forceTimer);
@@ -290,6 +376,35 @@ export class CodexLoginManager {
 
   #isCurrent(active) {
     return this.active === active && active.generation === this.generation;
+  }
+
+  #captureOutput(active, stream) {
+    if (!stream || typeof stream.on !== 'function') return;
+    const parser = createCodexLoginOutputParser((loginUrl) => {
+      if (!this.#isCurrent(active) || this.state.state !== 'waiting' || active.loginUrl) return;
+      active.loginUrl = loginUrl;
+      for (const reader of active.outputReaders) reader.parser.clear();
+      this.state = {
+        ...this.state,
+        message: 'OpenAI 登录链接已准备好，请在浏览器中继续。'
+      };
+    });
+    const onData = (chunk) => parser.push(chunk);
+    const onError = () => {};
+    active.outputReaders.push({ stream, parser, onData, onError });
+    stream.on('data', onData);
+    stream.on('error', onError);
+  }
+
+  #clearLoginMaterial(active) {
+    active.loginUrl = null;
+    for (const reader of active.outputReaders || []) {
+      reader.parser.clear();
+      reader.stream.removeListener?.('data', reader.onData);
+      reader.stream.removeListener?.('error', reader.onError);
+      reader.stream.resume?.();
+    }
+    active.outputReaders = [];
   }
 
   #timer(callback, delay) {

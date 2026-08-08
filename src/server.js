@@ -21,7 +21,7 @@ import {
   publicCodexSessions, saveCodexSession
 } from './lib/codex-sessions.js';
 import {
-  assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
+  assertLocalHostRequest, assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
 } from './lib/codex-login.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
@@ -277,7 +277,7 @@ async function getBootstrap() {
 async function handleApi(req, res, url, {
   codexRunner = runCodexSession,
   codexSettingsResolver = codexRuntimeSettings,
-  codexLoginManager: loginManager = defaultCodexLoginManager,
+  codexLoginManager: loginManager,
   systemProfileResolver = getSystemProfile
 } = {}) {
   const { pathname } = url;
@@ -296,6 +296,7 @@ async function handleApi(req, res, url, {
   }
   if (pathname === '/api/codex/auth/login') {
     assertLoopbackRequest(req);
+    assertLocalHostRequest(req);
     if (method === 'GET') return json(res, 200, { login: loginManager.snapshot() });
     if (method === 'DELETE') {
       assertSameOriginRequest(req);

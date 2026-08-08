@@ -49,6 +49,10 @@ const state = {
   codexLoginAction: '',
   codexLoginPollInFlight: false,
   codexLoginOrigin: '',
+  codexLoginPopup: null,
+  codexLoginPopupNavigated: false,
+  codexLoginPopupBlocked: false,
+  codexLoginOpenedUrl: '',
   modalTrigger: null
 };
 
@@ -142,6 +146,7 @@ function showModal(content, className = '') {
 }
 
 function closeModal() {
+  const closingCodexLogin = Boolean($('#modal-root .codex-login-modal'));
   if ($('#modal-root .codex-room-modal') && state.codexBusy) {
     toast('Codex 正在处理', '本轮完成前请保持协作室打开，避免剧本结果丢失。', 'warn');
     return false;
@@ -155,6 +160,7 @@ function closeModal() {
   stopCodexLoginPolling({ invalidate: true });
   state.codexLoginPanelOpen = false;
   state.codexLoginAction = '';
+  if (closingCodexLogin && !state.codexLoginPopupNavigated) clearCodexLoginNavigation({ clearUrl: false });
   state.codexRequestId += 1;
   state.codexBusy = false;
   state.codexError = '';
@@ -322,6 +328,7 @@ function codexReadiness() {
 const CODEX_LOGIN_ACTIVE_STATES = new Set(['starting', 'waiting']);
 const CODEX_LOGIN_TERMINAL_STATES = new Set(['succeeded', 'failed', 'cancelled', 'timedOut']);
 const CODEX_LOGIN_KNOWN_STATES = new Set(['idle', ...CODEX_LOGIN_ACTIVE_STATES, ...CODEX_LOGIN_TERMINAL_STATES]);
+const CODEX_LOGIN_WINDOW_NAME = 'novel-voice-studio-codex-login';
 
 function safeCodexLoginMessage(value = '') {
   return String(value)
@@ -332,24 +339,124 @@ function safeCodexLoginMessage(value = '') {
     .slice(0, 180);
 }
 
+function normalizeCodexLoginUrl(value) {
+  if (typeof value !== 'string' || value.length > 8_192) return '';
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'auth.openai.com') return '';
+    if (url.pathname !== '/oauth/authorize' || url.port || url.username || url.password || url.hash) return '';
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
 function normalizeCodexLogin(payload, fallbackState = 'idle') {
   const source = payload?.login && typeof payload.login === 'object' ? payload.login : payload || {};
   const aliases = { canceled: 'cancelled', timeout: 'timedOut', timed_out: 'timedOut', completed: 'succeeded', success: 'succeeded' };
   let loginState = aliases[source.state] || source.state || fallbackState;
   if (source.authenticated === true) loginState = 'succeeded';
   if (!CODEX_LOGIN_KNOWN_STATES.has(loginState)) loginState = fallbackState;
+  const loginUrl = normalizeCodexLoginUrl(source.loginUrl);
   return {
     state: loginState,
     message: safeCodexLoginMessage(source.message),
     startedAt: source.startedAt || null,
     finishedAt: source.finishedAt || null,
     timeoutAt: source.timeoutAt || null,
-    authenticated: source.authenticated === true
+    authenticated: source.authenticated === true,
+    loginUrl,
+    browserActionRequired: source.browserActionRequired === true
   };
 }
 
 function currentCodexLogin() {
   return normalizeCodexLogin(state.codexLogin || { state: 'idle' });
+}
+
+function codexLoginPopupIsOpen() {
+  try {
+    return Boolean(state.codexLoginPopup && !state.codexLoginPopup.closed);
+  } catch {
+    return false;
+  }
+}
+
+function renderCodexLoginWaitingPage(popup) {
+  try {
+    const doc = popup.document;
+    doc.title = '正在准备 Codex 登录';
+    doc.documentElement.lang = 'zh-CN';
+    doc.documentElement.style.colorScheme = 'dark';
+    doc.body.innerHTML = '<main><span>CODEX SIGN-IN</span><h1>正在准备 OpenAI 登录页</h1><p>请保留此窗口。验证地址准备好后会自动打开。</p><i aria-hidden="true"></i></main>';
+    doc.body.style.cssText = 'margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0e0e;color:#edf7f3;font-family:system-ui,sans-serif';
+    const main = doc.querySelector('main');
+    if (main) main.style.cssText = 'max-width:420px;padding:36px;text-align:center';
+    const eyebrow = doc.querySelector('span');
+    if (eyebrow) eyebrow.style.cssText = 'color:#78dfc9;font-size:12px;letter-spacing:.16em';
+    const heading = doc.querySelector('h1');
+    if (heading) heading.style.cssText = 'margin:14px 0 10px;font-size:24px';
+    const copy = doc.querySelector('p');
+    if (copy) copy.style.cssText = 'margin:0;color:#91a09b;font-size:14px;line-height:1.7';
+    const dot = doc.querySelector('i');
+    if (dot) dot.style.cssText = 'display:block;width:9px;height:9px;margin:24px auto 0;border-radius:50%;background:#78dfc9;box-shadow:0 0 0 7px rgba(120,223,201,.08)';
+  } catch {
+    // about:blank may already have been replaced by the browser; navigation can still continue.
+  }
+}
+
+function prepareCodexLoginPopup() {
+  if (codexLoginPopupIsOpen()) return state.codexLoginPopup;
+  let popup = null;
+  try {
+    popup = window.open('about:blank', CODEX_LOGIN_WINDOW_NAME, 'popup,width=760,height=860');
+  } catch {}
+  state.codexLoginPopup = popup;
+  state.codexLoginPopupNavigated = false;
+  state.codexLoginOpenedUrl = '';
+  state.codexLoginPopupBlocked = !popup;
+  if (!popup) return null;
+  renderCodexLoginWaitingPage(popup);
+  try { popup.opener = null; } catch {}
+  return popup;
+}
+
+function navigateCodexLoginPopup(login = currentCodexLogin()) {
+  const loginUrl = normalizeCodexLoginUrl(login.loginUrl);
+  if (!loginUrl || state.codexLoginPopupNavigated || state.codexLoginOpenedUrl === loginUrl) return false;
+  const popup = state.codexLoginPopup;
+  if (!codexLoginPopupIsOpen()) {
+    if (popup) state.codexLoginPopupBlocked = true;
+    return false;
+  }
+  try {
+    popup.opener = null;
+    popup.location.replace(loginUrl);
+    state.codexLoginPopupNavigated = true;
+    state.codexLoginOpenedUrl = loginUrl;
+    state.codexLoginPopupBlocked = false;
+    return true;
+  } catch {
+    if (codexLoginPopupIsOpen()) {
+      try { popup.close(); } catch {}
+    }
+    state.codexLoginPopup = null;
+    state.codexLoginPopupBlocked = true;
+    return false;
+  }
+}
+
+function clearCodexLoginNavigation({ clearUrl = true } = {}) {
+  if (codexLoginPopupIsOpen() && !state.codexLoginPopupNavigated) {
+    try { state.codexLoginPopup.close(); } catch {}
+  }
+  state.codexLoginPopup = null;
+  state.codexLoginPopupNavigated = false;
+  state.codexLoginPopupBlocked = false;
+  state.codexLoginOpenedUrl = '';
+  if (clearUrl && state.codexLogin) {
+    state.codexLogin = { ...state.codexLogin, loginUrl: '', browserActionRequired: false };
+  }
 }
 
 function codexLoginPresentation(loginState) {
@@ -410,6 +517,16 @@ function codexLoginModalHtml() {
   const elapsed = codexLoginElapsed(login.startedAt);
   const closeLabel = active ? '关闭登录面板；登录流程会继续在后台运行' : '关闭登录面板';
   const steps = ['启动本机 CLI', '完成官方网页登录', '返回工作台'];
+  const browserLinkTitle = state.codexLoginPopupBlocked
+    ? '浏览器阻止了自动打开'
+    : state.codexLoginPopupNavigated
+      ? 'OpenAI 登录页已在新窗口打开'
+      : login.browserActionRequired
+        ? '需要手动打开官方登录页'
+        : '打开 OpenAI 官方登录页';
+  const browserLink = login.loginUrl
+    ? `<div class="codex-login-browser-action" role="group" aria-label="OpenAI 官方登录页"><div><strong>${browserLinkTitle}</strong><small>${state.codexLoginPopupNavigated ? '如果没有看到登录窗口，可以从这里重新打开。' : '链接只在本次本机登录期间有效，将在完成、取消或超时后清除。'}</small></div><a class="button ${state.codexLoginPopupNavigated ? 'ghost' : 'primary'}" href="${escapeHtml(login.loginUrl)}" target="_blank" rel="noopener noreferrer">↗ 打开 OpenAI 登录页</a></div>`
+    : '';
   const actions = active
     ? `<button class="button ghost" data-action="dismiss-codex-login">在后台继续</button><button class="button danger" data-action="cancel-codex-login" ${actionPending ? 'disabled' : ''}>${state.codexLoginAction === 'cancel' ? '取消中…' : '取消登录'}</button>`
     : login.state === 'succeeded'
@@ -419,6 +536,7 @@ function codexLoginModalHtml() {
     <div class="modal-body codex-login-body ${presentation.tone}">
       <div class="codex-login-hero"><span class="codex-login-icon" aria-hidden="true">${presentation.icon}</span><div><span class="eyebrow">${presentation.eyebrow}</span><p id="codex-login-description">${escapeHtml(presentation.detail)}</p></div></div>
       <div class="codex-login-live" role="status" aria-live="polite" aria-atomic="true"><i aria-hidden="true"></i><div><strong data-codex-login-message>${escapeHtml(message)}</strong><small data-codex-login-elapsed>${escapeHtml(elapsed)}</small></div></div>
+      ${browserLink}
       <ol class="codex-login-steps" aria-label="Codex 登录进度">${steps.map((label, index) => `<li class="${codexLoginStepClass(login.state, index)}"><span>${index + 1}</span><small>${label}</small></li>`).join('')}</ol>
       <div class="codex-login-privacy"><span aria-hidden="true">⌾</span><p><strong>凭据不会经过本工作台</strong><small>密码、验证码与访问令牌只由 OpenAI 官方页面和本机 Codex CLI 处理；这里仅查看脱敏后的登录状态。</small></p></div>
       ${login.state === 'timedOut' ? '<p class="codex-login-help">如果浏览器无法回到本机应用，可在终端尝试 <code>codex login --device-auth</code>。</p>' : ''}
@@ -479,6 +597,7 @@ function scheduleCodexLoginPoll() {
 async function completeCodexLogin(login, requestId = state.codexLoginRequestId) {
   stopCodexLoginPolling();
   state.codexLogin = { ...login, state: 'succeeded', authenticated: true };
+  clearCodexLoginNavigation();
   state.codexLoginAction = 'refresh';
   updateCodexLoginModal({ force: true });
   try {
@@ -493,6 +612,7 @@ async function completeCodexLogin(login, requestId = state.codexLoginRequestId) 
     if (requestId !== state.codexLoginRequestId) return;
     state.codexLoginAction = '';
     state.codexLogin = { ...login, state: 'failed', authenticated: false, message: safeCodexLoginMessage(error.message) };
+    clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
   }
 }
@@ -506,14 +626,19 @@ async function pollCodexLogin() {
     const payload = await api('/api/codex/auth/login');
     if (requestId !== state.codexLoginRequestId || !state.codexLoginPanelOpen) return;
     const login = normalizeCodexLogin(payload, 'waiting');
+    const previous = currentCodexLogin();
     state.codexLogin = login;
-    updateCodexLoginModal({ force: login.state !== $('#modal-root .codex-login-modal')?.dataset.loginState });
+    const popupNavigated = navigateCodexLoginPopup(login);
+    const loginLinkChanged = login.loginUrl !== previous.loginUrl || login.browserActionRequired !== previous.browserActionRequired;
+    if (!CODEX_LOGIN_ACTIVE_STATES.has(login.state) && login.state !== 'succeeded') clearCodexLoginNavigation();
+    updateCodexLoginModal({ force: popupNavigated || loginLinkChanged || login.state !== $('#modal-root .codex-login-modal')?.dataset.loginState });
     if (login.state === 'succeeded') await completeCodexLogin(login, requestId);
     else if (CODEX_LOGIN_ACTIVE_STATES.has(login.state)) scheduleCodexLoginPoll();
     else stopCodexLoginPolling();
   } catch (error) {
     if (requestId !== state.codexLoginRequestId || !state.codexLoginPanelOpen) return;
     state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '无法读取本机登录状态' };
+    clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
   } finally {
     if (requestId === state.codexLoginRequestId) state.codexLoginPollInFlight = false;
@@ -528,6 +653,9 @@ async function startCodexLogin() {
     state.codexLoginOrigin = roomWasOpen ? 'room' : state.view;
     if (roomWasOpen) rememberCodexComposer();
   }
+  const existingLogin = currentCodexLogin();
+  prepareCodexLoginPopup();
+  navigateCodexLoginPopup(existingLogin);
   stopCodexLoginPolling({ invalidate: true });
   const requestId = state.codexLoginRequestId;
   state.codexLoginAction = 'start';
@@ -544,6 +672,7 @@ async function startCodexLogin() {
     }
     if (CODEX_LOGIN_ACTIVE_STATES.has(current.state)) {
       state.codexLogin = current;
+      navigateCodexLoginPopup(current);
       state.codexLoginAction = '';
       updateCodexLoginModal({ force: true, focusAction: 'cancel-codex-login' });
       scheduleCodexLoginPoll();
@@ -555,6 +684,8 @@ async function startCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     const login = normalizeCodexLogin(payload, 'waiting');
     state.codexLogin = login;
+    navigateCodexLoginPopup(login);
+    if (!CODEX_LOGIN_ACTIVE_STATES.has(login.state) && login.state !== 'succeeded') clearCodexLoginNavigation();
     state.codexLoginAction = '';
     updateCodexLoginModal({ force: true, focusAction: login.state === 'succeeded' ? 'dismiss-codex-login' : 'cancel-codex-login' });
     if (login.state === 'succeeded') await completeCodexLogin(login, requestId);
@@ -563,6 +694,7 @@ async function startCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     state.codexLoginAction = '';
     state.codexLogin = { ...currentCodexLogin(), state: 'failed', authenticated: false, message: safeCodexLoginMessage(error.message) || '无法启动本机 Codex 登录' };
+    clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
   }
 }
@@ -577,6 +709,7 @@ async function cancelCodexLogin() {
     const payload = await api('/api/codex/auth/login', { method: 'DELETE' });
     if (requestId !== state.codexLoginRequestId) return;
     state.codexLogin = normalizeCodexLogin(payload, 'cancelled');
+    clearCodexLoginNavigation();
     state.codexLoginAction = '';
     updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
     toast('Codex 登录已取消', '需要时可以再次发起登录。', 'warn');
@@ -584,6 +717,7 @@ async function cancelCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     state.codexLoginAction = '';
     state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '取消登录失败' };
+    clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: 'recheck-codex-login' });
   }
 }
@@ -599,6 +733,7 @@ async function recheckCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     const login = normalizeCodexLogin(payload);
     state.codexLogin = login;
+    navigateCodexLoginPopup(login);
     if (login.state === 'succeeded') {
       state.codexLoginAction = '';
       await completeCodexLogin(login, requestId);
@@ -613,6 +748,7 @@ async function recheckCodexLogin() {
       return;
     }
     state.codexLoginAction = '';
+    if (!CODEX_LOGIN_ACTIVE_STATES.has(login.state)) clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: CODEX_LOGIN_ACTIVE_STATES.has(login.state) ? 'cancel-codex-login' : 'start-codex-login' });
     if (CODEX_LOGIN_ACTIVE_STATES.has(login.state)) scheduleCodexLoginPoll();
     else toast('Codex 仍未登录', '可以重新发起官方浏览器登录。', 'warn');
@@ -620,6 +756,7 @@ async function recheckCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     state.codexLoginAction = '';
     state.codexLogin = { ...currentCodexLogin(), state: 'failed', message: safeCodexLoginMessage(error.message) || '重新检测失败' };
+    clearCodexLoginNavigation();
     updateCodexLoginModal({ force: true, focusAction: 'start-codex-login' });
   }
 }
@@ -629,6 +766,7 @@ function dismissCodexLogin() {
   stopCodexLoginPolling({ invalidate: true });
   state.codexLoginPanelOpen = false;
   state.codexLoginAction = '';
+  if (!state.codexLoginPopupNavigated) clearCodexLoginNavigation({ clearUrl: false });
   if (origin === 'room' && state.project) renderCodexStudio({ focus: 'composer' });
   else closeModal();
 }
@@ -642,6 +780,7 @@ async function recoverCodexLogin() {
     if (requestId !== state.codexLoginRequestId) return;
     const login = normalizeCodexLogin(payload);
     state.codexLogin = login;
+    navigateCodexLoginPopup(login);
     if (CODEX_LOGIN_ACTIVE_STATES.has(login.state) || login.state === 'succeeded') {
       state.codexLoginOrigin = 'room';
       state.codexLoginAction = '';
