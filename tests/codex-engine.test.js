@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
 import { PassThrough } from 'node:stream';
 
 import {
@@ -15,15 +16,26 @@ import {
   normalizeImportedScript,
   parseCodexJsonl,
   resolveCodexModel,
-  runCodexSession
+  rulesToScript,
+  runCodexSession,
+  runOllamaSession
 } from '../src/lib/script-engine.js';
 import {
   codexTimeoutMinutesToMs,
   normalizeCodexModel,
   normalizeCodexReasoningEffort,
-  normalizeCodexTimeoutMinutes
+  normalizeCodexTimeoutMinutes,
+  normalizeOllamaModel
 } from '../src/lib/codex-options.js';
-import { appendCodexTurn, createCodexSession, publicCodexSession } from '../src/lib/codex-sessions.js';
+import {
+  appendCodexTurn,
+  createCodexSession,
+  MAX_SESSIONS_PER_CHAPTER,
+  normalizeScriptSessionProvider,
+  publicCodexSession,
+  saveCodexSession
+} from '../src/lib/codex-sessions.js';
+import { SCRIPT_STRUCTURE_LIMITS } from '../src/lib/script-limits.js';
 
 test('Codex Session 保存私有剧本版本快照且公开接口只暴露可用标记', () => {
   const script = {
@@ -35,6 +47,9 @@ test('Codex Session 保存私有剧本版本快照且公开接口只暴露可用
     threadId: 'thread-a', model: 'gpt-5.6-terra', reasoningEffort: 'medium', timeoutMinutes: 10,
     mode: 'faithful', prompt: '生成版本', script
   });
+  const chapter = { codexSessions: [], activeCodexSessionId: null };
+  saveCodexSession(chapter, session);
+  assert.equal(session.versionOrdinal, 1);
   script.scenes[0].lines[0].spokenText = '外部修改';
   assert.equal(session.scriptSnapshot.scenes[0].lines[0].spokenText, '版本一');
   const nextScript = structuredClone(session.scriptSnapshot);
@@ -43,11 +58,215 @@ test('Codex Session 保存私有剧本版本快照且公开接口只暴露可用
     prompt: '继续修改', model: 'gpt-5.6-terra', reasoningEffort: 'medium', timeoutMinutes: 10,
     script: nextScript
   });
+  saveCodexSession(chapter, session);
+  assert.equal(session.versionOrdinal, 1);
   assert.equal(session.scriptSnapshot.scenes[0].lines[0].spokenText, '版本二');
   const publicValue = publicCodexSession(session);
   assert.equal(publicValue.versionAvailable, true);
   assert.equal('scriptSnapshot' in publicValue, false);
   assert.equal('codexThreadId' in publicValue, false);
+});
+
+test('通用剧本版本保留超过 8 个可恢复快照且到硬上限不静默淘汰', () => {
+  const chapter = { codexSessions: [], activeCodexSessionId: null };
+  for (let index = 0; index < MAX_SESSIONS_PER_CHAPTER; index += 1) {
+    const script = {
+      chapterTitle: '版本测试', roles: [], warnings: [],
+      scenes: [{ title: '场景', context: '', lines: [{
+        kind: 'narration', speaker: '旁白', sourceText: '原文', spokenText: `版本 ${index}`
+      }] }]
+    };
+    saveCodexSession(chapter, createCodexSession({
+      provider: 'rules', source: 'rules', title: `规则版本 ${index}`, script
+    }));
+  }
+  assert.equal(chapter.codexSessions.length, 50);
+  assert.deepEqual(
+    [...chapter.codexSessions].map((session) => session.versionOrdinal).sort((a, b) => a - b),
+    Array.from({ length: 50 }, (_value, index) => index + 1)
+  );
+  assert.equal(chapter.codexSessions.every((session) => session.scriptSnapshot?.scenes?.length), true);
+  assert.equal(publicCodexSession(chapter.codexSessions[0]).provider, 'rules');
+  assert.throws(
+    () => saveCodexSession(chapter, createCodexSession({
+      provider: 'import', script: chapter.codexSessions[0].scriptSnapshot
+    })),
+    (error) => error.statusCode === 409 && error.code === 'SCRIPT_SESSION_VERSION_LIMIT'
+  );
+  assert.equal(chapter.codexSessions.length, 50);
+  assert.equal(normalizeScriptSessionProvider(undefined), 'codex');
+  for (const value of [null, '', 'rules', 'import', 'invalid', [], {}]) {
+    assert.throws(
+      () => normalizeScriptSessionProvider(value, { allowed: ['codex', 'ollama'] }),
+      (error) => error.code === 'SCRIPT_SESSION_PROVIDER_INVALID'
+    );
+  }
+});
+
+test('剧本结构、文本、总字节与版本累计快照都执行统一硬预算', async () => {
+  const makeLine = (text = '短台词') => ({
+    kind: 'narration', speaker: '旁白', sourceText: text, spokenText: text,
+    emotion: 'neutral', emotionNote: '', intensity: 0.5, pace: 1,
+    pauseAfterMs: 350, confidence: 1, needsReview: false
+  });
+  const base = {
+    chapterTitle: '预算测试',
+    roles: [{ name: '旁白', aliases: [], description: '', isNarrator: true }],
+    scenes: [{ title: '场景', context: '', lines: [makeLine()] }],
+    warnings: []
+  };
+  const chapter = { title: '预算测试', sourceText: '原文' };
+  const expectInvalid = (script) => assert.throws(
+    () => normalizeImportedScript(script, chapter),
+    (error) => error.code === 'SCRIPT_SCHEMA_INVALID' && error.statusCode === 400
+  );
+
+  const longText = structuredClone(base);
+  longText.scenes[0].lines[0].spokenText = '字'.repeat(SCRIPT_STRUCTURE_LIMITS.lineTextChars + 1);
+  expectInvalid(longText);
+  expectInvalid({ ...base, roles: Array.from({ length: SCRIPT_STRUCTURE_LIMITS.roles + 1 }, (_v, i) => ({
+    name: `角色${i}`, aliases: [], description: '', isNarrator: false
+  })) });
+  expectInvalid({ ...base, scenes: Array.from({ length: SCRIPT_STRUCTURE_LIMITS.scenes + 1 }, () => ({
+    title: '场景', context: '', lines: []
+  })) });
+  expectInvalid({ ...base, scenes: [{
+    title: '场景', context: '',
+    lines: Array.from({ length: SCRIPT_STRUCTURE_LIMITS.linesPerScene + 1 }, () => makeLine())
+  }] });
+  expectInvalid({ ...base, scenes: Array.from({ length: 11 }, () => ({
+    title: '场景', context: '', lines: Array.from({ length: 500 }, () => makeLine())
+  })) });
+  for (const invalid of [
+    { ...base, roles: [null] },
+    { ...base, scenes: [null] },
+    { ...base, scenes: [{ title: '场景', context: '', lines: [null] }] }
+  ]) expectInvalid(invalid);
+  const unpunctuatedRules = rulesToScript({ title: '长段落', sourceText: '长'.repeat(30_000) });
+  assert.ok(unpunctuatedRules.scenes.flatMap((scene) => scene.lines)
+    .every((line) => line.sourceText.length <= 2_000 && line.spokenText.length <= 2_000));
+
+  const multiByte = '字'.repeat(4_000);
+  const largeSnapshot = {
+    ...base,
+    scenes: [{ title: '大场景', context: '', lines: Array.from({ length: 150 }, () => makeLine(multiByte)) }]
+  };
+  const tooLarge = structuredClone(largeSnapshot);
+  tooLarge.scenes[0].lines.push(...Array.from({ length: 50 }, () => makeLine(multiByte)));
+  expectInvalid(tooLarge);
+
+  const versionChapter = { codexSessions: [], activeCodexSessionId: null };
+  let rejected = null;
+  for (let index = 0; index < 20; index += 1) {
+    try {
+      saveCodexSession(versionChapter, createCodexSession({
+        provider: 'import', title: `大版本 ${index}`, script: largeSnapshot
+      }));
+    } catch (error) {
+      rejected = error;
+      break;
+    }
+  }
+  assert.equal(rejected?.code, 'SCRIPT_SESSION_VERSION_LIMIT');
+  assert.equal(rejected?.statusCode, 409);
+  assert.ok(versionChapter.codexSessions.length > 1 && versionChapter.codexSessions.length < 20);
+  const smallActive = createCodexSession({ provider: 'import', title: '小型活动稿', script: base });
+  saveCodexSession(versionChapter, smallActive);
+  assert.throws(
+    () => saveCodexSession(versionChapter, {
+      ...smallActive, scriptSnapshot: structuredClone(largeSnapshot)
+    }),
+    (error) => error.code === 'SCRIPT_SESSION_VERSION_LIMIT' && error.statusCode === 409
+  );
+  assert.equal(versionChapter.activeCodexSessionId, smallActive.id);
+  assert.equal(
+    versionChapter.codexSessions.find((session) => session.id === smallActive.id).scriptSnapshot.scenes[0].lines.length,
+    1
+  );
+
+  const schema = JSON.parse(await fs.readFile(new URL('../schemas/audiobook-script.schema.json', import.meta.url), 'utf8'));
+  assert.equal(schema.properties.roles.maxItems, SCRIPT_STRUCTURE_LIMITS.roles);
+  assert.equal(schema.properties.scenes.maxItems, SCRIPT_STRUCTURE_LIMITS.scenes);
+  assert.equal(schema.properties.scenes.items.properties.lines.maxItems, SCRIPT_STRUCTURE_LIMITS.linesPerScene);
+  assert.equal(
+    schema.properties.scenes.items.properties.lines.items.properties.spokenText.maxLength,
+    SCRIPT_STRUCTURE_LIMITS.lineTextChars
+  );
+});
+
+test('Ollama 会话以制作台当前完整剧本和本轮要求为基线并返回结构化结果', async () => {
+  const progress = [];
+  let request;
+  const chapter = {
+    title: '本地模型章节', sourceText: '小说原文', scriptWarnings: [],
+    scenes: [{ title: '当前场景', context: '', lines: [{
+      kind: 'narration', speaker: '旁白', sourceText: '小说原文', spokenText: '用户手工修改后的当前台词',
+      emotion: 'neutral', intensity: 0.5, pace: 1, pauseAfterMs: 350
+    }] }]
+  };
+  const returned = {
+    chapterTitle: '本地模型章节',
+    roles: [{ name: '旁白', aliases: [], description: '', isNarrator: true }],
+    scenes: [{ title: '当前场景', context: '', lines: [{
+      kind: 'narration', speaker: '旁白', sourceText: '小说原文', spokenText: 'Ollama 调整后的台词',
+      emotion: 'warm', emotionNote: '', intensity: 0.6, pace: 1, pauseAfterMs: 350,
+      confidence: 1, needsReview: false
+    }] }], warnings: []
+  };
+  const result = await runOllamaSession({
+    chapter,
+    settings: { ollamaUrl: 'http://127.0.0.1:11434', ollamaModel: '' },
+    prompt: '语气再温暖一点',
+    timeoutMinutes: 5,
+    onProgress: (event) => progress.push(event),
+    async fetchImpl(url, options) {
+      request = { url, options, body: JSON.parse(options.body) };
+      return new Response(JSON.stringify({ response: JSON.stringify(returned) }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  assert.equal(request.url, 'http://127.0.0.1:11434/api/generate');
+  assert.equal(request.options.redirect, 'error');
+  assert.equal(request.body.model, 'qwen3:8b');
+  assert.match(request.body.prompt, /用户手工修改后的当前台词/);
+  assert.match(request.body.prompt, /语气再温暖一点/);
+  assert.equal(result.script.scenes[0].lines[0].spokenText, 'Ollama 调整后的台词');
+  assert.equal(result.threadId, null);
+  assert.deepEqual(progress.map((event) => event.phase), ['analyzing', 'drafting', 'validating']);
+
+  await assert.rejects(
+    runOllamaSession({
+      chapter, settings: { ollamaUrl: 'http://localhost:11434?redirect=evil', ollamaModel: '' },
+      timeoutMinutes: 5, fetchImpl: async () => { throw new Error('must not run'); }
+    }),
+    (error) => error.code === 'OLLAMA_UNAVAILABLE'
+  );
+  await assert.rejects(
+    runOllamaSession({
+      chapter, settings: { ollamaUrl: 'http://localhost:11434/proxy', ollamaModel: '' },
+      timeoutMinutes: 5, fetchImpl: async () => { throw new Error('must not run'); }
+    }),
+    (error) => error.code === 'OLLAMA_UNAVAILABLE'
+  );
+
+  await assert.rejects(
+    runOllamaSession({
+      chapter, settings: { ollamaUrl: 'https://example.com', ollamaModel: 'qwen3:8b' },
+      timeoutMinutes: 5, fetchImpl: async () => { throw new Error('must not run'); }
+    }),
+    (error) => error.code === 'OLLAMA_UNAVAILABLE'
+  );
+  await assert.rejects(
+    runOllamaSession({
+      chapter, settings: { ollamaUrl: 'http://localhost:11434', ollamaModel: 'qwen3:8b' },
+      timeoutMinutes: 5, timeoutMs: 10,
+      fetchImpl: (_url, options) => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      })
+    }),
+    (error) => error.code === 'OLLAMA_TIMEOUT' && error.timeoutMs === 10
+  );
 });
 
 test('Codex 初始会话使用 JSONL 和 Schema，且不使用 ephemeral', () => {
@@ -311,6 +530,8 @@ test('Codex 模型与推理强度由后端权威默认并拒绝参数注入', ()
   assert.equal(resolveCodexModel(undefined, { codexModel: 'gpt-old' }), 'gpt-old');
   assert.equal(resolveCodexModel('', { codexModel: 'gpt-old' }), 'gpt-5.6-terra');
   assert.equal(normalizeCodexModel(undefined), 'gpt-5.6-terra');
+  assert.equal(normalizeOllamaModel(undefined), 'qwen3:8b');
+  assert.equal(normalizeOllamaModel(''), 'qwen3:8b');
   assert.equal(normalizeCodexReasoningEffort(undefined), 'medium');
   for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
     assert.equal(normalizeCodexReasoningEffort(effort), effort);
@@ -332,6 +553,9 @@ test('Codex 模型与推理强度由后端权威默认并拒绝参数注入', ()
   for (const value of [['gpt-5.6-terra'], { model: 'gpt-5.6-terra' }]) {
     assert.throws(() => normalizeCodexModel(value), (error) => error.code === 'CODEX_MODEL_INVALID');
     assert.throws(() => buildCodexExecArgs({ model: value }), (error) => error.code === 'CODEX_MODEL_INVALID');
+  }
+  for (const value of [['qwen3:8b'], { model: 'qwen3:8b' }, '--remote']) {
+    assert.throws(() => normalizeOllamaModel(value), (error) => error.code === 'OLLAMA_MODEL_INVALID');
   }
   for (const value of [['medium'], { effort: 'medium' }]) {
     assert.throws(

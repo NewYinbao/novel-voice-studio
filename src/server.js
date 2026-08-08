@@ -16,11 +16,13 @@ import {
 } from './lib/store.js';
 import { decodeBook, normalizeNovelText } from './lib/novel.js';
 import {
-  chapterToScriptSnapshot, convertChapter, createCodexPackage, normalizeImportedScript, runCodexSession
+  chapterToScriptSnapshot, convertChapter, createCodexPackage, normalizeImportedScript,
+  runCodexSession, runOllamaSession
 } from './lib/script-engine.js';
 import {
-  appendCodexTurn, createCodexSession, findCodexSession, publicCodexSession,
-  publicCodexSessions, saveCodexSession
+  appendCodexTurn, COLLABORATION_PROVIDERS, createCodexSession, findCodexSession,
+  normalizeScriptSessionProvider, publicCodexSession, publicCodexSessions,
+  saveCodexSession, scriptSessionProvider
 } from './lib/codex-sessions.js';
 import {
   assertLocalHostRequest, assertLoopbackRequest, assertSameOriginRequest, CodexLoginManager
@@ -31,7 +33,8 @@ import {
   DEFAULT_CODEX_TIMEOUT_MINUTES,
   normalizeCodexModel,
   normalizeCodexReasoningEffort,
-  normalizeCodexTimeoutMinutes
+  normalizeCodexTimeoutMinutes,
+  normalizeOllamaModel
 } from './lib/codex-options.js';
 import {
   codexActivitySensitiveTexts,
@@ -39,6 +42,7 @@ import {
   normalizeCodexDetailLevel,
   sanitizeCodexActivitySummary
 } from './lib/codex-activity.js';
+import { assertScriptStructureLimits } from './lib/script-limits.js';
 import { JobManager } from './lib/jobs.js';
 import { exportProjectWav, renderLines } from './lib/tts.js';
 import {
@@ -53,6 +57,17 @@ const jobs = new JobManager(path.join(DATA_DIR, 'jobs.json'));
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 4317);
 const codexSessionLocks = new Map();
+
+function createMutationLock() {
+  let pending = Promise.resolve();
+  return (operation) => {
+    const current = pending.catch(() => {}).then(operation);
+    pending = current;
+    return current;
+  };
+}
+
+const withGlobalVoiceMutationLock = createMutationLock();
 
 function assertLocalOrigin(req) {
   const origin = req.headers.origin;
@@ -165,6 +180,50 @@ function codexModel(value) {
   return normalizeCodexModel(value);
 }
 
+function collaborationProvider(value, fallback = 'codex') {
+  return normalizeScriptSessionProvider(value, {
+    fallback,
+    allowed: COLLABORATION_PROVIDERS
+  });
+}
+
+function scriptJobProvider(value, fallback = 'rules') {
+  return normalizeScriptSessionProvider(value, {
+    fallback,
+    allowed: ['rules', 'codex', 'ollama']
+  });
+}
+
+function collaborationModel(provider, body, settings, session = null) {
+  if (Object.hasOwn(body, 'model') && body.model !== null && body.model !== '') {
+    return provider === 'ollama'
+      ? normalizeOllamaModel(body.model)
+      : normalizeCodexModel(body.model);
+  }
+  if (session && scriptSessionProvider(session) === provider && session.model) {
+    return provider === 'ollama'
+      ? normalizeOllamaModel(session.model)
+      : normalizeCodexModel(session.model);
+  }
+  return provider === 'ollama'
+    ? normalizeOllamaModel(settings?.ollamaModel)
+    : normalizeCodexModel(undefined);
+}
+
+function collaborationReasoningEffort(provider, body, session = null) {
+  if (provider === 'ollama') {
+    if (body.reasoningEffort !== undefined && body.reasoningEffort !== null && body.reasoningEffort !== '') {
+      throw Object.assign(new Error('Ollama provider 不接受 Codex reasoningEffort。'), {
+        statusCode: 400, code: 'SCRIPT_SESSION_OPTION_INVALID'
+      });
+    }
+    return null;
+  }
+  return normalizeCodexReasoningEffort(
+    Object.hasOwn(body, 'reasoningEffort') ? body.reasoningEffort : session?.reasoningEffort
+  );
+}
+
 function codexPrompt(value, { required = false } = {}) {
   const prompt = String(value || '').trim();
   if (required && !prompt) throw Object.assign(new Error('请输入本轮调整要求'), { statusCode: 400, code: 'CODEX_PROMPT_REQUIRED' });
@@ -208,11 +267,13 @@ async function assertNoCodexAuthOptions(req) {
   }
 }
 
-function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES) {
+function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES, provider = 'codex') {
   const code = String(error?.code || 'CODEX_REQUEST_FAILED').toUpperCase();
   const safeTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
   const statusCode = error?.statusCode
-    || (code.startsWith('CODEX_TIMEOUT') ? 504 : code === 'CODEX_UNAVAILABLE' ? 503 : 502);
+    || (code.startsWith('CODEX_TIMEOUT') || code === 'OLLAMA_TIMEOUT'
+      ? 504
+      : ['CODEX_UNAVAILABLE', 'OLLAMA_UNAVAILABLE'].includes(code) ? 503 : 502);
   const messages = {
     CODEX_AUTH_REQUIRED: 'Codex CLI 尚未登录，请先完成本机登录。',
     CODEX_CANCELLED: 'Codex 请求已因服务关闭而取消。',
@@ -221,7 +282,10 @@ function codexFailureStatus(error, timeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTE
     CODEX_TIMEOUT_ACTIVE: `Codex 已开始生成，但未在 ${safeTimeoutMinutes} 分钟内完成，请缩短章节、降低推理强度或延长超时后重试。`,
     CODEX_TIMEOUT_STARTING: `Codex 未能在 ${safeTimeoutMinutes} 分钟内开始响应，请检查网络、登录状态和模型可用性。`,
     CODEX_UNAVAILABLE: 'Codex CLI 当前不可用，请检查模型中心状态。',
-    SCRIPT_SCHEMA_INVALID: 'Codex 返回的剧本结构未通过校验，当前章节未被覆盖。'
+    OLLAMA_FAILED: 'Ollama 本地模型未能完成本轮剧本处理，请检查模型与服务状态。',
+    OLLAMA_TIMEOUT: `Ollama 未能在 ${safeTimeoutMinutes} 分钟内完成处理，可延长超时或缩短章节后重试。`,
+    OLLAMA_UNAVAILABLE: '无法连接本机 Ollama 服务，请确认 Ollama 已启动且模型可用。',
+    SCRIPT_SCHEMA_INVALID: `${provider === 'ollama' ? 'Ollama' : 'Codex'} 返回的剧本结构未通过校验，当前章节未被覆盖。`
   };
   return Object.assign(new Error(messages[code] || 'Codex 本轮处理失败，请检查状态后重试。'), {
     statusCode,
@@ -242,6 +306,7 @@ function codexAsyncRequested(body) {
 function codexAccepted(progress) {
   return {
     progressId: progress.progressId,
+    provider: progress.provider,
     detailLevel: progress.detailLevel,
     model: progress.model,
     reasoningEffort: progress.reasoningEffort,
@@ -322,14 +387,22 @@ function assertUsableScript(script, chapter, statusCode = 422) {
 }
 
 function applyScript(project, chapter, script) {
+  assertScriptStructureLimits(script, { statusCode: 422 });
   assertUsableScript(script, chapter);
   const roleMap = mergeRoles(project, script.roles);
+  const rolesById = new Map(project.characters.map((role) => [role.id, role]));
   const narrator = project.characters.find((role) => role.isNarrator);
   chapter.scenes = script.scenes.map((scene) => ({
     ...scene,
     lines: scene.lines.map((line) => {
-      const role = roleMap.get(line.speaker.toLowerCase()) || narrator;
-      return { ...line, speakerId: role?.id || 'role_narrator' };
+      const role = rolesById.get(line.speakerId)
+        || roleMap.get(String(line.speaker || '').toLowerCase())
+        || narrator;
+      return {
+        ...line,
+        speaker: role?.name || line.speaker,
+        speakerId: role?.id || 'role_narrator'
+      };
     })
   }));
   chapter.scriptWarnings = script.warnings;
@@ -338,16 +411,82 @@ function applyScript(project, chapter, script) {
 }
 
 function chapterSessionSnapshot(project, chapter) {
-  const snapshot = chapterToScriptSnapshot(chapter, project);
+  let snapshot;
+  try { snapshot = chapterToScriptSnapshot(chapter, project); } catch (error) {
+    if (error?.code === 'SCRIPT_SCHEMA_INVALID' && !error.statusCode) error.statusCode = 422;
+    throw error;
+  }
+  const rolesByName = new Map(project.characters.flatMap((role) => (
+    [role.name, ...(role.aliases || [])].map((name) => [String(name || '').trim().toLowerCase(), role])
+  )));
+  snapshot.roles = snapshot.roles.map((role) => ({
+    ...role,
+    id: rolesByName.get(String(role.name || '').trim().toLowerCase())?.id
+  }));
   snapshot.scenes = snapshot.scenes.map((scene, sceneIndex) => ({
     ...scene,
     id: chapter.scenes?.[sceneIndex]?.id,
     lines: scene.lines.map((line, lineIndex) => ({
       ...line,
-      id: chapter.scenes?.[sceneIndex]?.lines?.[lineIndex]?.id
+      id: chapter.scenes?.[sceneIndex]?.lines?.[lineIndex]?.id,
+      speakerId: chapter.scenes?.[sceneIndex]?.lines?.[lineIndex]?.speakerId
     }))
   }));
+  assertScriptStructureLimits(snapshot, { statusCode: 422 });
   return snapshot;
+}
+
+function captureActiveScriptVersion(project, chapter) {
+  const active = (chapter.codexSessions || [])
+    .find((session) => session.id === chapter.activeCodexSessionId);
+  if (active) {
+    const captured = { ...active, scriptSnapshot: chapterSessionSnapshot(project, chapter) };
+    saveCodexSession(chapter, captured);
+    return captured;
+  }
+  if (!Array.isArray(chapter.scenes) || chapter.scenes.length === 0) return null;
+  const baseline = createCodexSession({
+    provider: 'import',
+    source: 'import',
+    title: '当前稿自动备份',
+    prompt: '覆盖或切换版本前自动备份当前制作台剧本',
+    script: chapterSessionSnapshot(project, chapter)
+  });
+  saveCodexSession(chapter, baseline);
+  return baseline;
+}
+
+function applyScriptVersion(project, chapter, script, {
+  provider,
+  source = provider,
+  title,
+  threadId = '',
+  model,
+  reasoningEffort,
+  timeoutMinutes,
+  mode = 'faithful',
+  prompt = '',
+  usage = null
+} = {}) {
+  const normalizedProvider = normalizeScriptSessionProvider(provider);
+  captureActiveScriptVersion(project, chapter);
+  applyScript(project, chapter, script);
+  const persistedSnapshot = chapterSessionSnapshot(project, chapter);
+  const session = createCodexSession({
+    provider: normalizedProvider,
+    source,
+    title,
+    threadId,
+    model,
+    reasoningEffort,
+    timeoutMinutes,
+    mode,
+    prompt,
+    script: persistedSnapshot,
+    usage
+  });
+  saveCodexSession(chapter, session);
+  return session;
 }
 
 function pruneUnusedRoles(project) {
@@ -395,10 +534,13 @@ async function getBootstrap() {
 
 async function handleApi(req, res, url, {
   codexRunner = runCodexSession,
+  ollamaRunner = runOllamaSession,
   codexSettingsResolver = codexRuntimeSettings,
   codexLoginManager: loginManager,
   codexProgressManager: progressManager,
-  systemProfileResolver = getSystemProfile
+  systemProfileResolver = getSystemProfile,
+  withVoiceMutationLock,
+  voiceMutationHook = async () => {}
 } = {}) {
   const { pathname } = url;
   const method = req.method;
@@ -574,25 +716,129 @@ async function handleApi(req, res, url, {
     const chapterIds = Array.isArray(body.chapterIds) && body.chapterIds.length
       ? new Set(body.chapterIds)
       : new Set(project.chapters.map((chapter) => chapter.id));
-    const provider = ['rules', 'codex', 'ollama'].includes(body.provider) ? body.provider : settings.scriptProvider;
+    let defaultProvider = 'rules';
+    try { defaultProvider = scriptJobProvider(settings.scriptProvider, 'rules'); } catch { /* legacy setting */ }
+    const provider = scriptJobProvider(body.provider, defaultProvider);
+    const knownChapterIds = new Set(project.chapters.map((chapter) => chapter.id));
+    if (![...chapterIds].every((chapterId) => typeof chapterId === 'string' && knownChapterIds.has(chapterId))) {
+      throw Object.assign(new Error('chapterIds 包含不属于当前项目的章节。'), {
+        statusCode: 400, code: 'SCRIPT_CHAPTER_INVALID'
+      });
+    }
+    const targetIds = project.chapters.filter((chapter) => chapterIds.has(chapter.id)).map((chapter) => chapter.id);
+    if (!targetIds.length) {
+      throw Object.assign(new Error('没有可处理的章节。'), {
+        statusCode: 400, code: 'SCRIPT_CHAPTER_INVALID'
+      });
+    }
+    const targetIdSet = new Set(targetIds);
+    const overlappingJob = jobs.list().find((job) => (
+      job.type === 'script'
+      && ['queued', 'running'].includes(job.state)
+      && job.payload?.projectId === project.id
+      && Array.isArray(job.payload?.chapterIds)
+      && job.payload.chapterIds.some((chapterId) => targetIdSet.has(chapterId))
+    ));
+    if (overlappingJob) {
+      throw Object.assign(new Error('所选章节已有规则或模型剧本任务正在处理。'), {
+        statusCode: 409, code: 'SCRIPT_JOB_ACTIVE'
+      });
+    }
+    for (const chapterId of chapterIds) {
+      const active = progressManager.latest(project.id, chapterId);
+      if (active && !active.terminal) {
+        throw Object.assign(new Error('所选章节正在进行剧本协作，请完成后再覆盖生成。'), {
+          statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
+        });
+      }
+    }
     const job = jobs.create('script', { projectId: project.id, chapterIds: [...chapterIds], provider }, async (update) => {
-      const targetIds = project.chapters.filter((chapter) => chapterIds.has(chapter.id)).map((chapter) => chapter.id);
+      const versions = [];
       for (let index = 0; index < targetIds.length; index += 1) {
-        const current = await getProject(project.id);
-        const chapter = findChapter(current, targetIds[index]);
-        update((index / targetIds.length) * 100, `正在剧本化：${chapter.title}`);
-        const script = await convertChapter(chapter, { provider, settings, mode: body.mode || 'faithful' });
-        await mutateProject(project.id, (draft) => applyScript(draft, findChapter(draft, chapter.id), script));
+        const chapterId = targetIds[index];
+        await withCodexSessionLock(`${project.id}:${chapterId}`, async () => {
+          const current = await getProject(project.id);
+          const chapter = findChapter(current, chapterId);
+          const chapterVersion = codexChapterVersion(chapter);
+          update((index / targetIds.length) * 100, `正在剧本化：${chapter.title}`);
+          const mode = codexMode(body.mode);
+          let turn;
+          if (provider === 'codex') {
+            const runtimeSettings = await codexSettingsResolver(settings);
+            turn = await codexRunner({
+              chapter, project: current, settings: runtimeSettings, mode,
+              model: normalizeCodexModel(undefined),
+              reasoningEffort: normalizeCodexReasoningEffort(undefined),
+              timeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
+              timeoutMs: codexTimeoutMinutesToMs(DEFAULT_CODEX_TIMEOUT_MINUTES)
+            });
+            if (!turn.threadId) {
+              throw Object.assign(new Error('Codex 没有返回可续接的 Session ID。'), {
+                code: 'CODEX_THREAD_MISSING'
+              });
+            }
+          } else if (provider === 'ollama') {
+            turn = await ollamaRunner({
+              chapter, project: current, settings, mode,
+              model: normalizeOllamaModel(settings.ollamaModel),
+              timeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
+              timeoutMs: codexTimeoutMinutesToMs(DEFAULT_CODEX_TIMEOUT_MINUTES)
+            });
+          } else {
+            turn = { script: await convertChapter(chapter, { provider, settings, mode }) };
+          }
+          const script = turn.script;
+          const version = await mutateProject(project.id, (draft) => {
+            const targetChapter = findChapter(draft, chapterId);
+            assertCodexChapterUnchanged(targetChapter, chapterVersion);
+            const session = applyScriptVersion(draft, targetChapter, script, {
+              provider,
+              title: provider === 'rules' ? '规则生成版本' : `${provider === 'ollama' ? 'Ollama' : 'Codex'} 批量生成版本`,
+              threadId: provider === 'codex' ? turn.threadId : '',
+               model: provider === 'ollama' ? normalizeOllamaModel(settings.ollamaModel) : undefined,
+              reasoningEffort: provider === 'codex' ? 'medium' : null,
+              timeoutMinutes: COLLABORATION_PROVIDERS.includes(provider) ? DEFAULT_CODEX_TIMEOUT_MINUTES : null,
+              mode,
+              prompt: `${provider} 批量剧本生成`,
+              usage: turn.usage
+            });
+            return { chapterId, session: publicCodexSession(session) };
+          });
+          versions.push(version);
+        });
       }
       const summary = await mutateProject(project.id, (draft) => {
         pruneUnusedRoles(draft);
         draft.status = 'scripted';
         return summarizeProject(draft);
       });
-      return { project: summary, chapterCount: targetIds.length, provider };
+      return { project: summary, chapterCount: targetIds.length, provider, versions };
     });
     await mutateProject(project.id, (draft) => { draft.production.lastJobId = job.id; });
     return json(res, 202, job);
+  }
+
+  params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId');
+  if (params && method === 'DELETE') {
+    assertCodexWorkspaceRequest(req);
+    const latest = progressManager.latest(params.projectId, params.chapterId);
+    if (latest && !latest.terminal) {
+      throw Object.assign(new Error('本章正在进行剧本协作，暂不能删除版本。'), {
+        statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
+      });
+    }
+    await mutateProject(params.projectId, (draft) => {
+      const chapter = findChapter(draft, params.chapterId);
+      const session = findCodexSession(chapter, params.sessionId);
+      if (chapter.activeCodexSessionId === session.id) {
+        throw Object.assign(new Error('当前活动版本不能删除，请先激活其他版本。'), {
+          statusCode: 409, code: 'SCRIPT_SESSION_ACTIVE_DELETE'
+        });
+      }
+      chapter.codexSessions = (chapter.codexSessions || []).filter((item) => item.id !== session.id);
+    });
+    res.writeHead(204);
+    return res.end();
   }
 
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/codex-sessions/:sessionId/activate');
@@ -615,9 +861,7 @@ async function handleApi(req, res, url, {
           statusCode: 409, code: 'CODEX_SESSION_VERSION_UNAVAILABLE'
         });
       }
-      const currentSession = (chapter.codexSessions || [])
-        .find((session) => session.id === chapter.activeCodexSessionId);
-      if (currentSession) currentSession.scriptSnapshot = chapterSessionSnapshot(draft, chapter);
+      captureActiveScriptVersion(draft, chapter);
       applyScript(draft, chapter, structuredClone(targetSession.scriptSnapshot));
       chapter.activeCodexSessionId = targetSession.id;
       pruneUnusedRoles(draft);
@@ -636,9 +880,26 @@ async function handleApi(req, res, url, {
     const scopeProject = await getProject(params.projectId);
     const scopeChapter = findChapter(scopeProject, params.chapterId);
     const scopeSession = findCodexSession(scopeChapter, params.sessionId);
-    const model = codexModel(Object.hasOwn(body, 'model') ? body.model : scopeSession.model);
-    const reasoningEffort = normalizeCodexReasoningEffort(
-      Object.hasOwn(body, 'reasoningEffort') ? body.reasoningEffort : scopeSession.reasoningEffort
+    if (scopeChapter.activeCodexSessionId !== scopeSession.id) {
+      throw Object.assign(new Error('请先激活该剧本版本，再基于它继续协作。'), {
+        statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
+      });
+    }
+    const sourceProvider = scriptSessionProvider(scopeSession);
+    const provider = body.provider === undefined
+      ? (COLLABORATION_PROVIDERS.includes(sourceProvider)
+        ? sourceProvider
+        : (() => {
+          throw Object.assign(new Error('规则或导入版本继续协作时必须选择 Codex 或 Ollama。'), {
+            statusCode: 400, code: 'SCRIPT_SESSION_PROVIDER_REQUIRED'
+          });
+        })())
+      : collaborationProvider(body.provider);
+    const optionSettings = await getSettings();
+    const model = collaborationModel(provider, body, optionSettings, scopeSession);
+    const reasoningEffort = collaborationReasoningEffort(provider, body, scopeSession);
+    const canAppendExisting = provider === sourceProvider && (
+      provider === 'ollama' || (provider === 'codex' && Boolean(scopeSession.codexThreadId))
     );
     let inheritedTimeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES;
     try { inheritedTimeoutMinutes = normalizeCodexTimeoutMinutes(scopeSession.timeoutMinutes); } catch { /* legacy */ }
@@ -649,30 +910,37 @@ async function handleApi(req, res, url, {
     );
     const timeoutMs = codexTimeoutMinutesToMs(timeoutMinutes);
     const progress = progressManager.create({
-      ...params, detailLevel, model, reasoningEffort, timeoutMinutes
+      ...params, provider, detailLevel, model, reasoningEffort, timeoutMinutes
     });
     const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
     const operation = () => withCodexSessionLock(lockKey, async () => {
       assertCodexRunActive(signal);
       progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
-      const settings = await codexSettingsResolver(await getSettings());
+      const storedSettings = await getSettings();
+      const settings = provider === 'codex'
+        ? await codexSettingsResolver(storedSettings)
+        : storedSettings;
       const project = await getProject(params.projectId);
       const chapter = findChapter(project, params.chapterId);
       const session = findCodexSession(chapter, params.sessionId);
-      const chapterVersion = codexChapterVersion(chapter);
-      if (!session.codexThreadId) {
-        throw Object.assign(new Error('这个会话缺少可续接的 Codex Session ID，请新建会话。'), {
-          statusCode: 409, code: 'CODEX_THREAD_MISSING'
+      if (chapter.activeCodexSessionId !== session.id) {
+        throw Object.assign(new Error('剧本版本已切换，请先激活目标版本后重试。'), {
+          statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
         });
       }
+      const chapterVersion = codexChapterVersion(chapter);
       const redactionContext = detailLevel === 'summary'
         ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
         : undefined;
       assertCodexRunActive(signal);
-      const turn = await codexRunner({
+      const runner = provider === 'codex' ? codexRunner : ollamaRunner;
+      const resumeThreadId = canAppendExisting && provider === 'codex' ? session.codexThreadId : '';
+      const turn = await runner({
         chapter, project, settings, mode: session.mode, model,
-        sessionId: session.codexThreadId, prompt,
+        provider,
+        sessionId: resumeThreadId, prompt,
+        baselineCurrentScript: !resumeThreadId && Array.isArray(chapter.scenes) && chapter.scenes.length > 0,
         detailLevel, reasoningEffort,
         timeoutMinutes, timeoutMs,
         signal,
@@ -682,20 +950,41 @@ async function handleApi(req, res, url, {
       });
       assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
+      if (provider === 'codex' && !resumeThreadId && !turn.threadId) {
+        throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
+          statusCode: 502, code: 'CODEX_THREAD_MISSING'
+        });
+      }
       progressManager.publish(progress.progressId, { type: 'stage', phase: 'saving' });
       return mutateProject(params.projectId, (draft) => {
         assertCodexRunActive(signal);
         const targetChapter = findChapter(draft, params.chapterId);
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
         const targetSession = findCodexSession(targetChapter, params.sessionId);
+        if (targetChapter.activeCodexSessionId !== targetSession.id) {
+          throw Object.assign(new Error('剧本版本已切换，本轮结果未覆盖当前稿。'), {
+            statusCode: 409, code: 'SCRIPT_SESSION_NOT_ACTIVE'
+          });
+        }
+        captureActiveScriptVersion(draft, targetChapter);
         applyScript(draft, targetChapter, turn.script);
-        appendCodexTurn(targetSession, {
-          prompt, model, reasoningEffort, timeoutMinutes, script: turn.script, usage: turn.usage
-        });
-        saveCodexSession(targetChapter, targetSession);
+        const nextSession = canAppendExisting
+          ? appendCodexTurn(targetSession, {
+            prompt, provider, model, reasoningEffort, timeoutMinutes,
+            script: chapterSessionSnapshot(draft, targetChapter), usage: turn.usage
+          })
+          : createCodexSession({
+            provider,
+            source: provider,
+            title: provider === 'codex' ? 'Codex 协作版本' : 'Ollama 协作版本',
+            threadId: provider === 'codex' ? turn.threadId : '',
+            model, reasoningEffort, timeoutMinutes, mode: targetSession.mode,
+            prompt, script: chapterSessionSnapshot(draft, targetChapter), usage: turn.usage
+          });
+        saveCodexSession(targetChapter, nextSession);
         pruneUnusedRoles(draft);
         draft.status = 'scripted';
-        return { project: draft, session: publicCodexSession(targetSession) };
+        return { project: draft, session: publicCodexSession(nextSession) };
       });
     });
     if (codexAsyncRequested(body)) {
@@ -707,10 +996,10 @@ async function handleApi(req, res, url, {
       progressManager.complete(progress.progressId);
       return json(res, 200, {
         ...result, project: publicProject(result.project), progressId: progress.progressId,
-        detailLevel, model, reasoningEffort, timeoutMinutes
+        provider, detailLevel, model, reasoningEffort, timeoutMinutes
       });
     } catch (error) {
-      const failure = codexFailureStatus(error, timeoutMinutes);
+      const failure = codexFailureStatus(error, timeoutMinutes, provider);
       progressManager.fail(progress.progressId, failure.code);
       failure.progressId = progress.progressId;
       throw failure;
@@ -729,22 +1018,27 @@ async function handleApi(req, res, url, {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
     const detailLevel = normalizeCodexDetailLevel(body.detailLevel);
     const mode = codexMode(body.mode);
-    const model = codexModel(body.model);
-    const reasoningEffort = normalizeCodexReasoningEffort(body.reasoningEffort);
+    const provider = collaborationProvider(body.provider, 'codex');
+    const optionSettings = await getSettings();
+    const model = collaborationModel(provider, body, optionSettings);
+    const reasoningEffort = collaborationReasoningEffort(provider, body);
     const timeoutMinutes = normalizeCodexTimeoutMinutes(body.timeoutMinutes);
     const timeoutMs = codexTimeoutMinutesToMs(timeoutMinutes);
     const prompt = codexPrompt(body.prompt);
     const scopeProject = await getProject(params.projectId);
     findChapter(scopeProject, params.chapterId);
     const progress = progressManager.create({
-      ...params, detailLevel, model, reasoningEffort, timeoutMinutes
+      ...params, provider, detailLevel, model, reasoningEffort, timeoutMinutes
     });
     const signal = progressManager.signal(progress.progressId, params.projectId, params.chapterId);
     const lockKey = `${params.projectId}:${params.chapterId}`;
     const operation = () => withCodexSessionLock(lockKey, async () => {
       assertCodexRunActive(signal);
       progressManager.publish(progress.progressId, { type: 'starting', phase: 'preparing' });
-      const settings = await codexSettingsResolver(await getSettings());
+      const storedSettings = await getSettings();
+      const settings = provider === 'codex'
+        ? await codexSettingsResolver(storedSettings)
+        : storedSettings;
       const project = await getProject(params.projectId);
       const chapter = findChapter(project, params.chapterId);
       const chapterVersion = codexChapterVersion(chapter);
@@ -752,8 +1046,11 @@ async function handleApi(req, res, url, {
         ? createCodexRedactionContext(codexActivitySensitiveTexts(chapter, prompt, project))
         : undefined;
       assertCodexRunActive(signal);
-      const turn = await codexRunner({
+      const runner = provider === 'codex' ? codexRunner : ollamaRunner;
+      const turn = await runner({
         chapter, project, settings, mode, model, prompt,
+        provider,
+        baselineCurrentScript: Array.isArray(chapter.scenes) && chapter.scenes.length > 0,
         detailLevel, reasoningEffort,
         timeoutMinutes, timeoutMs,
         signal,
@@ -763,7 +1060,7 @@ async function handleApi(req, res, url, {
       });
       assertCodexRunActive(signal);
       assertUsableScript(turn.script, chapter, 502);
-      if (!turn.threadId) {
+      if (provider === 'codex' && !turn.threadId) {
         throw Object.assign(new Error('Codex 没有返回可续接的 Session ID，请更新 Codex CLI 后重试。'), {
           statusCode: 502, code: 'CODEX_THREAD_MISSING'
         });
@@ -773,15 +1070,12 @@ async function handleApi(req, res, url, {
         assertCodexRunActive(signal);
         const targetChapter = findChapter(draft, params.chapterId);
         assertCodexChapterUnchanged(targetChapter, chapterVersion);
-        const previousSession = (targetChapter.codexSessions || [])
-          .find((session) => session.id === targetChapter.activeCodexSessionId);
-        if (previousSession) previousSession.scriptSnapshot = chapterSessionSnapshot(draft, targetChapter);
-        applyScript(draft, targetChapter, turn.script);
-        const session = createCodexSession({
-          threadId: turn.threadId, model, reasoningEffort, timeoutMinutes, mode, prompt,
-          script: turn.script, usage: turn.usage
+        const session = applyScriptVersion(draft, targetChapter, turn.script, {
+          provider,
+          title: provider === 'codex' ? 'Codex 协作版本' : 'Ollama 协作版本',
+          threadId: provider === 'codex' ? turn.threadId : '',
+          model, reasoningEffort, timeoutMinutes, mode, prompt, usage: turn.usage
         });
-        saveCodexSession(targetChapter, session);
         pruneUnusedRoles(draft);
         draft.status = 'scripted';
         return { project: draft, session: publicCodexSession(session) };
@@ -796,10 +1090,10 @@ async function handleApi(req, res, url, {
       progressManager.complete(progress.progressId);
       return json(res, 201, {
         ...result, project: publicProject(result.project), progressId: progress.progressId,
-        detailLevel, model, reasoningEffort, timeoutMinutes
+        provider, detailLevel, model, reasoningEffort, timeoutMinutes
       });
     } catch (error) {
-      const failure = codexFailureStatus(error, timeoutMinutes);
+      const failure = codexFailureStatus(error, timeoutMinutes, provider);
       progressManager.fail(progress.progressId, failure.code);
       failure.progressId = progress.progressId;
       throw failure;
@@ -816,14 +1110,31 @@ async function handleApi(req, res, url, {
   params = routeMatch(pathname, '/api/projects/:projectId/chapters/:chapterId/script-import');
   if (params && method === 'POST') {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
-    const project = await mutateProject(params.projectId, (draft) => {
-      const chapter = findChapter(draft, params.chapterId);
-      let raw = body.script ?? body;
-      if (typeof raw === 'string') raw = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/gi, ''));
-      applyScript(draft, chapter, normalizeImportedScript(raw, chapter));
-      pruneUnusedRoles(draft);
-      draft.status = 'scripted';
-    });
+    let imported = body.script ?? body;
+    if (typeof imported === 'string') {
+      try { imported = JSON.parse(imported.replace(/^```(?:json)?\s*|\s*```$/gi, '')); } catch {
+        throw Object.assign(new Error('导入的剧本不是有效 JSON。'), {
+          statusCode: 400, code: 'SCRIPT_IMPORT_INVALID'
+        });
+      }
+    }
+    const active = progressManager.latest(params.projectId, params.chapterId);
+    if (active && !active.terminal) {
+      throw Object.assign(new Error('本章正在进行剧本协作，请完成后再导入覆盖。'), {
+        statusCode: 409, code: 'CODEX_PROGRESS_ACTIVE'
+      });
+    }
+    const project = await withCodexSessionLock(`${params.projectId}:${params.chapterId}`, () => (
+      mutateProject(params.projectId, (draft) => {
+        const chapter = findChapter(draft, params.chapterId);
+        const script = normalizeImportedScript(imported, chapter);
+        applyScriptVersion(draft, chapter, script, {
+          provider: 'import', title: '导入剧本版本', prompt: '手动导入剧本'
+        });
+        pruneUnusedRoles(draft);
+        draft.status = 'scripted';
+      })
+    ));
     return json(res, 200, publicProject(project));
   }
 
@@ -854,15 +1165,99 @@ async function handleApi(req, res, url, {
     return json(res, 200, publicProject(project));
   }
 
+  params = routeMatch(pathname, '/api/projects/:projectId/characters/voices');
+  if (params && method === 'PATCH') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    if (!Array.isArray(body.assignments) || body.assignments.length < 1 || body.assignments.length > 200) {
+      throw Object.assign(new Error('assignments 必须包含 1 到 200 个音色绑定。'), {
+        statusCode: 400, code: 'VOICE_ASSIGNMENTS_INVALID'
+      });
+    }
+    const assignments = body.assignments.map((assignment) => {
+      if (!assignment || typeof assignment !== 'object' || Array.isArray(assignment)) {
+        throw Object.assign(new Error('音色绑定项格式无效。'), {
+          statusCode: 400, code: 'VOICE_ASSIGNMENTS_INVALID'
+        });
+      }
+      const keys = Object.keys(assignment);
+      if (keys.some((key) => !['roleId', 'voiceId'].includes(key))) {
+        throw Object.assign(new Error('音色绑定项包含不支持的字段。'), {
+          statusCode: 400, code: 'VOICE_ASSIGNMENTS_INVALID'
+        });
+      }
+      const roleId = typeof assignment.roleId === 'string' ? assignment.roleId.trim() : '';
+      const voiceId = assignment.voiceId;
+      if (!roleId || roleId.length > 120 || !(voiceId === null || (typeof voiceId === 'string' && voiceId.trim()))) {
+        throw Object.assign(new Error('roleId 或 voiceId 格式无效。'), {
+          statusCode: 400, code: 'VOICE_ASSIGNMENTS_INVALID'
+        });
+      }
+      return { roleId, voiceId: voiceId === null ? null : voiceId.trim() };
+    });
+    const roleIds = new Set(assignments.map((assignment) => assignment.roleId));
+    if (roleIds.size !== assignments.length) {
+      throw Object.assign(new Error('同一角色不能重复绑定。'), {
+        statusCode: 400, code: 'VOICE_ASSIGNMENTS_DUPLICATE_ROLE'
+      });
+    }
+    const result = await withVoiceMutationLock(async () => {
+      await voiceMutationHook({ action: 'batch-bind', projectId: params.projectId });
+      const scopeProject = await getProject(params.projectId);
+      const knownRoleIds = new Set(scopeProject.characters.map((role) => role.id));
+      if (assignments.some((assignment) => !knownRoleIds.has(assignment.roleId))) {
+        throw Object.assign(new Error('音色绑定包含未知角色。'), {
+          statusCode: 404, code: 'VOICE_ASSIGNMENTS_ROLE_NOT_FOUND'
+        });
+      }
+      await Promise.all([...new Set(assignments.map((assignment) => assignment.voiceId).filter(Boolean))]
+        .map((voiceId) => getVoice(voiceId)));
+      const updatedRoleIds = [];
+      const project = await mutateProject(params.projectId, (draft) => {
+        const roles = new Map(draft.characters.map((role) => [role.id, role]));
+        if (assignments.some((assignment) => !roles.has(assignment.roleId))) {
+          throw Object.assign(new Error('音色绑定包含未知角色。'), {
+            statusCode: 404, code: 'VOICE_ASSIGNMENTS_ROLE_NOT_FOUND'
+          });
+        }
+        for (const assignment of assignments) {
+          const role = roles.get(assignment.roleId);
+          if ((role.voiceId || null) === assignment.voiceId) continue;
+          role.voiceId = assignment.voiceId;
+          updatedRoleIds.push(role.id);
+        }
+        if (updatedRoleIds.length) {
+          const changed = new Set(updatedRoleIds);
+          for (const chapter of draft.chapters) for (const scene of chapter.scenes || []) for (const line of scene.lines || []) {
+            if (changed.has(line.speakerId)) line.render = { status: 'stale' };
+          }
+        }
+      });
+      return { project, updatedRoleIds };
+    });
+    return json(res, 200, { project: publicProject(result.project), updatedRoleIds: result.updatedRoleIds });
+  }
+
   params = routeMatch(pathname, '/api/projects/:projectId/characters/:roleId');
   if (params && method === 'PATCH') {
     const body = await parseJsonBody(req, MAX_JSON_BYTES);
-    if (body.voiceId) await getVoice(body.voiceId);
-    const project = await mutateProject(params.projectId, (draft) => {
+    if (
+      Object.hasOwn(body, 'voiceId')
+      && !(body.voiceId === null || (typeof body.voiceId === 'string' && body.voiceId.trim()))
+    ) {
+      throw Object.assign(new Error('voiceId 必须是非空字符串或 null。'), {
+        statusCode: 400, code: 'VOICE_ASSIGNMENT_INVALID'
+      });
+    }
+    const updateRole = async () => {
+      if (Object.hasOwn(body, 'voiceId')) {
+        await voiceMutationHook({ action: 'single-bind', projectId: params.projectId, roleId: params.roleId });
+      }
+      if (body.voiceId) await getVoice(body.voiceId);
+      return mutateProject(params.projectId, (draft) => {
       const role = draft.characters.find((item) => item.id === params.roleId);
       if (!role) throw Object.assign(new Error('角色不存在'), { statusCode: 404 });
       if ('voiceId' in body) {
-        const nextVoiceId = body.voiceId || null;
+        const nextVoiceId = body.voiceId === null ? null : body.voiceId.trim();
         if (role.voiceId !== nextVoiceId) {
           role.voiceId = nextVoiceId;
           for (const chapter of draft.chapters) for (const scene of chapter.scenes || []) for (const line of scene.lines || []) {
@@ -874,11 +1269,18 @@ async function handleApi(req, res, url, {
       if ('name' in body) {
         const oldName = role.name;
         role.name = safeName(body.name, oldName).slice(0, 30);
+        if (oldName && oldName !== role.name) {
+          role.aliases = [...new Set([...(role.aliases || []), oldName])].slice(0, 20);
+        }
         for (const { line } of draft.chapters.flatMap((chapter) => chapter.scenes.flatMap((scene) => scene.lines.map((line) => ({ line }))))) {
           if (line.speakerId === role.id) line.speaker = role.name;
         }
       }
-    });
+      });
+    };
+    const project = Object.hasOwn(body, 'voiceId')
+      ? await withVoiceMutationLock(updateRole)
+      : await updateRole();
     return json(res, 200, publicProject(project));
   }
 
@@ -906,9 +1308,12 @@ async function handleApi(req, res, url, {
 
   params = routeMatch(pathname, '/api/voices/:voiceId');
   if (params && method === 'DELETE') {
-    const references = await findVoiceReferences(params.voiceId);
-    if (references.length) throw Object.assign(new Error(`音色仍绑定 ${references.length} 个角色，请先解除绑定`), { statusCode: 409 });
-    await deleteVoice(params.voiceId);
+    await withVoiceMutationLock(async () => {
+      await voiceMutationHook({ action: 'delete', voiceId: params.voiceId });
+      const references = await findVoiceReferences(params.voiceId);
+      if (references.length) throw Object.assign(new Error(`音色仍绑定 ${references.length} 个角色，请先解除绑定`), { statusCode: 409 });
+      await deleteVoice(params.voiceId);
+    });
     res.writeHead(204);
     return res.end();
   }
@@ -948,7 +1353,8 @@ export function createServer(options = {}) {
   const serverOptions = {
     ...options,
     codexLoginManager: options.codexLoginManager || new CodexLoginManager(),
-    codexProgressManager: options.codexProgressManager || new CodexProgressManager()
+    codexProgressManager: options.codexProgressManager || new CodexProgressManager(),
+    withVoiceMutationLock: options.withVoiceMutationLock || withGlobalVoiceMutationLock
   };
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");

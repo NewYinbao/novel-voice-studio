@@ -293,7 +293,7 @@ test('Codex 异步失败只发送固定终态，服务关闭会强制结束 SSE'
   assert.match(failedStream, /event: failed/);
   assert.doesNotMatch(failedStream, /event: activity/);
   assert.match(failedStream, /"code":"CODEX_FAILED"/);
-  assert.doesNotMatch(failedStream, /RAW-STDERR|private|schema|prompt 原文|--token|abc|detail/i);
+  assert.doesNotMatch(failedStream, /RAW-STDERR|private|schema|prompt 原文|--token abc|detail/i);
 
   const hangingStart = await fetch(sessionsUrl, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: true })

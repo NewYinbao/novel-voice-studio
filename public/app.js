@@ -73,8 +73,10 @@ const state = {
   lineSaveErrors: new Map(),
   codexPackage: null,
   codexSessionId: null,
+  codexVersionId: null,
   codexSessionByChapter: new Map(),
   codexDrafts: new Map(),
+  codexProvider: 'codex',
   codexModel: DEFAULT_CODEX_MODEL,
   codexReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
   codexTimeoutMinutes: DEFAULT_CODEX_TIMEOUT_MINUTES,
@@ -102,6 +104,12 @@ const state = {
   codexLoginPopupNavigated: false,
   codexLoginPopupBlocked: false,
   codexLoginOpenedUrl: '',
+  ruleScriptSubmitting: false,
+  voiceBindingOpen: false,
+  voiceBindingChapterOnly: false,
+  voiceBindingDraft: new Map(),
+  voiceBindingSaving: false,
+  voiceBindingProjectId: '',
   modalTrigger: null
 };
 
@@ -262,7 +270,18 @@ async function refreshBootstrap({ render = false } = {}) {
 }
 
 async function loadProject(projectId) {
-  state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+  const project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (state.voiceBindingProjectId && state.voiceBindingProjectId !== project.id) {
+    state.voiceBindingDraft.clear();
+    state.voiceBindingOpen = false;
+    state.voiceBindingChapterOnly = false;
+  }
+  state.voiceBindingProjectId = project.id;
+  state.project = project;
+  const validRoleIds = new Set(project.characters?.map((role) => role.id) || []);
+  for (const roleId of state.voiceBindingDraft.keys()) {
+    if (!validRoleIds.has(roleId)) state.voiceBindingDraft.delete(roleId);
+  }
   if (!state.selectedChapterId || !state.project.chapters.some((chapter) => chapter.id === state.selectedChapterId)) {
     state.selectedChapterId = state.project.chapters[0]?.id || null;
   }
@@ -334,6 +353,14 @@ function emotionLabel(id) {
 }
 
 const CODEX_MODE_LABELS = { faithful: '忠实朗读', polished: '轻度剧本化', drama: '广播剧化' };
+const COLLABORATION_PROVIDERS = new Set(['codex', 'ollama']);
+const SCRIPT_VERSION_SOURCES = new Set(['codex', 'ollama', 'rules', 'import']);
+const SCRIPT_SOURCE_LABELS = {
+  codex: 'Codex',
+  ollama: '本地 Ollama',
+  rules: '规则生成',
+  import: '导入版本'
+};
 const CODEX_MODEL_OPTIONS = [
   ['gpt-5.6-sol', 'Sol'], ['gpt-5.6-terra', 'Terra'], ['gpt-5.6-luna', 'Luna']
 ];
@@ -379,24 +406,49 @@ function normalizeCodexTimeoutMinutes(value, fallback = DEFAULT_CODEX_TIMEOUT_MI
   return parseCodexTimeoutMinutes(value) ?? fallback;
 }
 
+function normalizeCollaborationProvider(value, fallback = 'codex') {
+  return COLLABORATION_PROVIDERS.has(value) ? value : fallback;
+}
+
+function scriptVersionSource(value, fallback = 'codex') {
+  const source = value?.source || value?.provider || value;
+  return SCRIPT_VERSION_SOURCES.has(source) ? source : fallback;
+}
+
+function scriptSourceLabel(value) {
+  return SCRIPT_SOURCE_LABELS[scriptVersionSource(value)] || SCRIPT_SOURCE_LABELS.codex;
+}
+
+function collaborationModelDefault(provider = state.codexProvider) {
+  return normalizeCollaborationProvider(provider) === 'ollama'
+    ? normalizeCodexModel(state.bootstrap?.settings?.ollamaModel, 'qwen3:8b')
+    : DEFAULT_CODEX_MODEL;
+}
+
 function codexReasoningLabel(value, fallback = '未记录') {
   return CODEX_REASONING_LABELS[value] || fallback;
 }
 
 function codexSessionRuntimeLabel(session) {
+  const provider = normalizeCollaborationProvider(session?.provider);
   const model = typeof session?.model === 'string' && session.model.trim()
     ? session.model.trim()
     : '模型未记录';
-  const effort = codexReasoningLabel(session?.reasoningEffort, '推理强度未记录');
   const timeout = parseCodexTimeoutMinutes(session?.timeoutMinutes);
-  return `${model} · 推理 ${effort} · ${timeout === null ? '超时未记录' : `超时 ${timeout} 分钟`}`;
+  const runtime = provider === 'ollama'
+    ? `${model} · 本地推理`
+    : `${model} · 推理 ${codexReasoningLabel(session?.reasoningEffort, '推理强度未记录')}`;
+  return `${runtime} · ${timeout === null ? '超时未记录' : `超时 ${timeout} 分钟`}`;
 }
 
 function codexProgressRuntimeLabel(progress) {
-  const model = normalizeCodexModel(progress?.model);
-  const effort = codexReasoningLabel(normalizeCodexReasoningEffort(progress?.reasoningEffort));
+  const provider = normalizeCollaborationProvider(progress?.provider);
+  const model = normalizeCodexModel(progress?.model, collaborationModelDefault(provider));
   const timeout = normalizeCodexTimeoutMinutes(progress?.timeoutMinutes);
-  return `${model} · 推理 ${effort} · 超时 ${timeout} 分钟`;
+  const runtime = provider === 'ollama'
+    ? `${model} · 本地 Ollama`
+    : `${model} · 推理 ${codexReasoningLabel(normalizeCodexReasoningEffort(progress?.reasoningEffort))}`;
+  return `${runtime} · 超时 ${timeout} 分钟`;
 }
 
 function codexSessions(chapter = currentChapter()) {
@@ -416,7 +468,9 @@ function allCodexSessions() {
       chapterId: chapter.id,
       chapterTitle: chapter.title,
       chapterIndex: chapter.index,
-      versionNumber: Math.max(1, sessions.length - index)
+      versionNumber: Number.isInteger(session.versionOrdinal) && session.versionOrdinal > 0
+        ? session.versionOrdinal
+        : Math.max(1, sessions.length - index)
     }));
   }
   return rows.sort((left, right) => String(right.updatedAt || right.createdAt || '')
@@ -441,6 +495,19 @@ function codexReadiness() {
     .replace(/\s+/g, ' ').trim().slice(0, 220);
   if (tool.state === 'authRequired') return { ready: false, authRequired: true, label: 'Codex CLI 等待登录', detail };
   return { ready: false, authRequired: false, label: 'Codex CLI 当前不可直接调用', detail };
+}
+
+function collaborationReadiness(provider = state.codexProvider) {
+  if (normalizeCollaborationProvider(provider) === 'codex') return codexReadiness();
+  const settings = state.bootstrap?.settings || {};
+  const model = normalizeCodexModel(settings.ollamaModel, 'qwen3:8b');
+  const endpoint = String(settings.ollamaUrl || '').trim();
+  return {
+    ready: Boolean(model),
+    authRequired: false,
+    label: '本地 Ollama',
+    detail: `${model}${endpoint ? ` · ${endpoint}` : ''}；发送时由本地服务检测连接`
+  };
 }
 
 const CODEX_LOGIN_ACTIVE_STATES = new Set(['starting', 'waiting']);
@@ -921,25 +988,25 @@ const CODEX_PROGRESS_TYPES = new Set(['queued', 'starting', 'thread', 'turn', 's
 const CODEX_PROGRESS_PRESENTATION = {
   queued: { label: '任务已排队', short: '排队中', tone: 'active' },
   starting: { label: '正在准备章节与本轮要求', short: '准备中', tone: 'active' },
-  thread: { label: '正在创建 Codex 会话', short: '创建会话', tone: 'active' },
-  turn: { label: '正在继续当前 Codex 会话', short: '继续会话', tone: 'active' },
+  thread: { label: '正在创建协作 Session', short: '创建会话', tone: 'active' },
+  turn: { label: '正在继续当前协作 Session', short: '继续会话', tone: 'active' },
   stage: { label: '正在生成并校验结构化剧本', short: '处理中', tone: 'active' },
   completed: { label: '本轮处理完成', short: '已完成', tone: 'success' },
   failed: { label: '本轮处理未完成', short: '失败', tone: 'error' }
 };
 const CODEX_PROGRESS_PHASE_MESSAGES = {
   'queued:waiting': '请求已进入本章处理队列。',
-  'starting:preparing': '正在准备 Codex 剧本协作环境。',
-  'thread:started': 'Codex 会话已建立。',
-  'turn:started': 'Codex 已开始处理本轮请求。',
-  'turn:completed': 'Codex 已完成本轮生成，正在校验结果。',
+  'starting:preparing': '正在准备剧本协作环境。',
+  'thread:started': '协作 Session 已建立。',
+  'turn:started': '协作后端已开始处理本轮请求。',
+  'turn:completed': '协作后端已完成本轮生成，正在校验结果。',
   'stage:analyzing': '正在分析章节结构与角色关系。',
   'stage:drafting': '正在整理台词、角色与表演标注。',
   'stage:processing': '正在处理剧本协作任务。',
   'stage:validating': '正在校验剧本结构。',
   'stage:saving': '正在安全保存本轮剧本。',
   'completed:completed': '本轮剧本协作已完成。',
-  'failed:failed': '本轮剧本协作未完成，请检查 Codex 状态后重试。'
+  'failed:failed': '本轮剧本协作未完成，请检查所选后端状态后重试。'
 };
 const CODEX_ACTIVITY_CATEGORIES = new Set(['reasoning_summary', 'command', 'file', 'mcp', 'web', 'collaboration', 'plan', 'tool']);
 const CODEX_ACTIVITY_PRESENTATION = {
@@ -1008,14 +1075,15 @@ function safeCodexTimeoutFailureCode(value) {
 
 function codexProgressFailureMessage(progress) {
   const minutes = normalizeCodexTimeoutMinutes(progress?.timeoutMinutes);
+  const provider = scriptSourceLabel(normalizeCollaborationProvider(progress?.provider));
   if (progress?.failureCode === 'CODEX_TIMEOUT_STARTING') {
-    return `Codex 未能在 ${minutes} 分钟内开始响应，请检查本机状态后重试。`;
+    return `${provider}未能在 ${minutes} 分钟内开始响应，请检查本机状态后重试。`;
   }
   if (progress?.failureCode === 'CODEX_TIMEOUT_ACTIVE') {
-    return `Codex 已开始生成，但未在 ${minutes} 分钟内完成；可缩短章节、降低推理强度或提高超时后重试。`;
+    return `${provider}已开始生成，但未在 ${minutes} 分钟内完成；可缩短章节、调整模型或提高超时后重试。`;
   }
   if (progress?.failureCode === 'CODEX_TIMEOUT') {
-    return `Codex 未能在 ${minutes} 分钟内完成处理，请稍后重试。`;
+    return `${provider}未能在 ${minutes} 分钟内完成处理，请稍后重试。`;
   }
   return fixedCodexProgressMessage('failed', 'failed');
 }
@@ -1143,12 +1211,19 @@ function appendCodexProgressEvent(progress, event, eventId = '') {
 function createCodexProgressSnapshot(raw, context, existing = null) {
   const progressId = safeCodexProgressId(raw?.progressId);
   if (!progressId) return null;
+  const provider = normalizeCollaborationProvider(
+    raw?.provider,
+    normalizeCollaborationProvider(context?.provider, normalizeCollaborationProvider(existing?.provider))
+  );
   const detailLevel = normalizeCodexDetailLevel(
     raw?.detailLevel,
     normalizeCodexDetailLevel(context?.detailLevel, normalizeCodexDetailLevel(existing?.detailLevel))
   );
-  const model = normalizeCodexModel(raw?.model, normalizeCodexModel(context?.model, normalizeCodexModel(existing?.model)));
-  const reasoningEffort = normalizeCodexReasoningEffort(
+  const model = normalizeCodexModel(
+    raw?.model,
+    normalizeCodexModel(context?.model, normalizeCodexModel(existing?.model, collaborationModelDefault(provider)))
+  );
+  const reasoningEffort = provider === 'ollama' ? null : normalizeCodexReasoningEffort(
     raw?.reasoningEffort,
     normalizeCodexReasoningEffort(context?.reasoningEffort, normalizeCodexReasoningEffort(existing?.reasoningEffort))
   );
@@ -1171,6 +1246,7 @@ function createCodexProgressSnapshot(raw, context, existing = null) {
     terminal: false,
     expanded: true,
     detailLevel,
+    provider,
     model,
     reasoningEffort,
     timeoutMinutes,
@@ -1186,6 +1262,7 @@ function createCodexProgressSnapshot(raw, context, existing = null) {
     finalizing: false
   };
   base.detailLevel = detailLevel;
+  base.provider = provider;
   base.model = model;
   base.reasoningEffort = reasoningEffort;
   base.timeoutMinutes = timeoutMinutes;
@@ -1275,7 +1352,7 @@ function codexActivityPanelHtml(progress) {
   const expanded = progress?.activityExpanded !== false;
   const unread = Math.max(0, Number(progress?.activityUnread) || 0);
   const content = summaryRun
-    ? `<div class="codex-activity-log" data-codex-activity-log tabindex="0" aria-label="Codex 安全活动日志"><ol data-codex-activity-list>${codexActivityItemsHtml(progress)}</ol>${activities.length ? '' : '<p class="codex-activity-empty">等待安全摘要或运行记录…</p>'}</div>`
+    ? `<div class="codex-activity-log" data-codex-activity-log tabindex="0" aria-label="协作任务安全活动日志"><ol data-codex-activity-list>${codexActivityItemsHtml(progress)}</ol>${activities.length ? '' : '<p class="codex-activity-empty">等待安全摘要或运行记录…</p>'}</div>`
     : '<p class="codex-activity-empty standalone">当前任务使用基础进度模式。此开关会让下一次发送记录安全摘要。</p>';
   return `<section class="codex-activity-panel ${summaryRun ? 'summary-enabled' : 'basic'}" data-codex-activity-panel aria-labelledby="codex-activity-title">
     <header><div><strong id="codex-activity-title">推理摘要与活动日志</strong><small>${summaryRun ? '本任务已启用摘要模式' : '仅应用于之后发送的任务'}</small></div><div><span data-codex-activity-count>${activities.length} 条</span><button class="button ghost small" type="button" data-action="clear-codex-activity" ${activities.length ? '' : 'disabled'}>清空本地视图</button><button class="icon-button" type="button" data-action="toggle-codex-activity" aria-expanded="${expanded}" aria-controls="${bodyId}" aria-label="${expanded ? '折叠推理摘要与活动日志' : '展开推理摘要与活动日志'}">${expanded ? '⌃' : '⌄'}</button></div></header>
@@ -1429,10 +1506,14 @@ async function finalizeCodexProgress(progress, { recovered = false } = {}) {
         const chapter = refreshed.chapters?.find((item) => item.id === progress.chapterId);
         if (chapter && currentChapter()?.id === progress.chapterId) {
           const sessions = codexSessions(chapter);
-          state.codexSessionId = chapter.activeCodexSessionId || sessions[0]?.id || progress.sessionId || null;
+          state.codexVersionId = chapter.activeCodexSessionId || sessions[0]?.id || progress.sessionId || null;
+          const activeVersion = sessions.find((item) => item.id === state.codexVersionId) || null;
+          const activeSource = scriptVersionSource(activeVersion, progress.provider);
+          state.codexSessionId = COLLABORATION_PROVIDERS.has(activeSource) ? activeVersion?.id || progress.sessionId || null : null;
           if (state.codexSessionId) state.codexSessionByChapter.set(progress.chapterId, state.codexSessionId);
           const activeSession = sessions.find((item) => item.id === state.codexSessionId) || null;
-          state.codexModel = normalizeCodexModel(activeSession?.model, progress.model);
+          state.codexProvider = normalizeCollaborationProvider(activeSession?.provider, progress.provider);
+          state.codexModel = normalizeCodexModel(activeSession?.model, progress.model || collaborationModelDefault(state.codexProvider));
           state.codexReasoningEffort = normalizeCodexReasoningEffort(
             activeSession?.reasoningEffort,
             progress.reasoningEffort
@@ -1462,8 +1543,9 @@ async function finalizeCodexProgress(progress, { recovered = false } = {}) {
   if (roomMatches) renderCodexStudio({ focus: progress.type === 'failed' ? 'composer' : '' });
   else updateCodexProgressPanel();
   if (!recovered || progress.type === 'failed') {
-    if (progress.type === 'completed') toast('Codex 已在后台更新本章剧本', '返回协作页可继续对话和逐句调整。');
-    else toast('Codex 本轮没有完成', failureMessage || fixedCodexProgressMessage('failed', 'failed'), 'error');
+    const providerLabel = scriptSourceLabel(normalizeCollaborationProvider(progress.provider));
+    if (progress.type === 'completed') toast(`${providerLabel}已在后台更新本章剧本`, '返回协作页可继续对话和逐句调整。');
+    else toast(`${providerLabel}本轮没有完成`, failureMessage || fixedCodexProgressMessage('failed', 'failed'), 'error');
   }
 }
 
@@ -1564,6 +1646,7 @@ async function recoverCodexProgress() {
       chapterId,
       sessionId: state.codexSessionId,
       detailLevel: existing?.detailLevel,
+      provider: existing?.provider || state.codexProvider,
       model: existing?.model,
       reasoningEffort: existing?.reasoningEffort,
       timeoutMinutes: existing?.timeoutMinutes,
@@ -1571,6 +1654,7 @@ async function recoverCodexProgress() {
     }, existing);
     if (!progress) return;
     state.codexProgressByChapter.set(key, progress);
+    state.codexProvider = progress.provider;
     state.codexModel = progress.model;
     state.codexReasoningEffort = progress.reasoningEffort;
     state.codexTimeoutMinutes = progress.timeoutMinutes;
@@ -1589,7 +1673,7 @@ async function recoverCodexProgress() {
 }
 
 function codexDraftKey(sessionId = state.codexSessionId) {
-  return `${currentChapter()?.id || 'chapter'}:${sessionId || 'new'}`;
+  return `${currentChapter()?.id || 'chapter'}:${sessionId || `new:${normalizeCollaborationProvider(state.codexProvider)}`}`;
 }
 
 function codexStarterPrompt(mode = state.codexMode) {
@@ -1619,22 +1703,27 @@ function rememberCodexComposer() {
   if (parsedTimeoutMinutes !== null) state.codexTimeoutMinutes = parsedTimeoutMinutes;
   const mode = $('#codex-room-mode');
   if (mode && !mode.disabled) state.codexMode = mode.value;
+  const provider = $('#codex-provider');
+  if (provider && !provider.disabled) state.codexProvider = normalizeCollaborationProvider(provider.value);
 }
 
 function codexSessionTitle(session, index) {
   const firstPrompt = session.messages?.find((message) => message.role === 'user')?.content || '';
   const title = String(session.title || firstPrompt).replace(/\s+/g, ' ').trim();
-  return title ? title.slice(0, 34) : `协作会话 ${index + 1}`;
+  return title ? title.slice(0, 34) : `${scriptSourceLabel(session)}版本 ${index + 1}`;
 }
 
-function codexSessionItemHtml(item, index, activeSessionId, disabled = false) {
+function codexSessionItemHtml(item, index, disabled = false) {
   const progress = state.codexProgressByChapter.get(codexProgressKey(state.project?.id, item.chapterId));
   const running = codexProgressIsActive(progress) && progress?.sessionId === item.id;
-  const selected = item.id === activeSessionId && item.chapterId === currentChapter()?.id;
+  const selected = item.id === state.codexVersionId && item.chapterId === currentChapter()?.id;
   const version = `V${item.versionNumber || 1}`;
+  const source = scriptVersionSource(item);
+  const sourceLabel = scriptSourceLabel(source);
   return `<button class="codex-session-item ${selected ? 'active' : ''} ${running ? 'running' : ''}" data-action="select-codex-session" data-session-id="${escapeHtml(item.id)}" data-chapter-id="${escapeHtml(item.chapterId)}" ${disabled ? 'disabled' : ''}>
-    <span class="codex-session-primary"><span class="codex-session-version">${escapeHtml(version)}</span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong></span>
+    <span class="codex-session-primary"><span class="codex-session-version">${escapeHtml(version)}</span><span class="codex-session-source source-${source}">${escapeHtml(sourceLabel)}</span><strong>${escapeHtml(codexSessionTitle(item, index))}</strong></span>
     <small class="codex-session-chapter">${escapeHtml(item.chapterTitle || '未命名章节')}</small>
+    <small class="codex-session-runtime">${escapeHtml(COLLABORATION_PROVIDERS.has(source) ? codexSessionRuntimeLabel(item) : `${sourceLabel} · 可恢复剧本快照`)}</small>
     <span class="codex-session-meta"><em>${running ? '处理中' : `${Number(item.turnCount || Math.ceil((item.messages?.length || 0) / 2))} 轮`}</em><time>${escapeHtml(formatDate(item.updatedAt || item.messages?.at(-1)?.createdAt || item.createdAt))}</time></span>
   </button>`;
 }
@@ -1700,6 +1789,81 @@ function projectCardHtml(project) {
   </article>`;
 }
 
+function voiceIsReady(voice) {
+  return Boolean(voice?.status === 'ready' && voice.reference);
+}
+
+function activeScriptJobForChapter(chapterId = currentChapter()?.id) {
+  const projectId = state.project?.id;
+  return (state.bootstrap?.jobs || []).find((job) => job.type === 'script'
+    && ['queued', 'running'].includes(job.state)
+    && job.payload?.projectId === projectId
+    && Array.isArray(job.payload?.chapterIds)
+    && job.payload.chapterIds.includes(chapterId)) || null;
+}
+
+function characterOccurrenceCounts() {
+  const projectCounts = new Map((state.project?.characters || []).map((role) => [role.id, 0]));
+  const chapterCounts = new Map((state.project?.characters || []).map((role) => [role.id, 0]));
+  for (const chapter of state.project?.chapters || []) {
+    for (const line of chapter.scenes?.flatMap((scene) => scene.lines || []) || []) {
+      const role = state.project.characters.find((item) => item.id === line.speakerId)
+        || state.project.characters.find((item) => item.name === line.speaker);
+      if (!role) continue;
+      projectCounts.set(role.id, (projectCounts.get(role.id) || 0) + 1);
+      if (chapter.id === currentChapter()?.id) chapterCounts.set(role.id, (chapterCounts.get(role.id) || 0) + 1);
+    }
+  }
+  return { projectCounts, chapterCounts };
+}
+
+function voiceBindingDraftEntries() {
+  const roles = new Map((state.project?.characters || []).map((role) => [role.id, role]));
+  const voices = new Set((state.bootstrap?.voices || []).map((voice) => voice.id));
+  const assignments = [];
+  for (const [roleId, value] of state.voiceBindingDraft) {
+    const role = roles.get(roleId);
+    if (!role) continue;
+    const voiceId = value || null;
+    if (voiceId && !voices.has(voiceId)) continue;
+    if ((role.voiceId || null) === voiceId) continue;
+    assignments.push({ roleId, voiceId });
+  }
+  return assignments;
+}
+
+function effectiveRoleVoiceId(role) {
+  return state.voiceBindingDraft.has(role.id) ? state.voiceBindingDraft.get(role.id) || null : role.voiceId || null;
+}
+
+function voiceBindingDrawerHtml() {
+  if (!state.voiceBindingOpen) return '';
+  const counts = characterOccurrenceCounts();
+  const voices = state.bootstrap?.voices || [];
+  const roles = (state.project?.characters || []).filter((role) => !state.voiceBindingChapterOnly || (counts.chapterCounts.get(role.id) || 0) > 0);
+  const dirtyCount = voiceBindingDraftEntries().length;
+  const readyCount = (state.project?.characters || []).filter((role) => voiceIsReady(voices.find((voice) => voice.id === effectiveRoleVoiceId(role)))).length;
+  const rows = roles.map((role) => {
+    const selectedVoiceId = effectiveRoleVoiceId(role);
+    const selectedVoice = voices.find((voice) => voice.id === selectedVoiceId) || null;
+    const chapterCount = counts.chapterCounts.get(role.id) || 0;
+    const projectCount = counts.projectCounts.get(role.id) || 0;
+    const ready = voiceIsReady(selectedVoice);
+    return `<div class="voice-binding-row ${ready ? 'ready' : 'unbound'}">
+      <span class="voice-binding-avatar" style="--speaker:${escapeHtml(role.color || '#78dfc9')}">${escapeHtml([...(role.name || '角')][0])}</span>
+      <div class="voice-binding-role"><strong>${escapeHtml(role.name)}</strong><small>本章 ${chapterCount} 行 · 全书 ${projectCount} 行</small></div>
+      <span class="voice-binding-state">${ready ? '就绪' : selectedVoiceId ? '音色未就绪' : '未绑定'}</span>
+      <label><span class="sr-only">为 ${escapeHtml(role.name)} 选择音色</span><select class="select-field" data-character-voice="${escapeHtml(role.id)}" ${state.voiceBindingSaving ? 'disabled' : ''}><option value="">不绑定</option>${voices.map((voice) => `<option value="${escapeHtml(voice.id)}" ${voice.id === selectedVoiceId ? 'selected' : ''}>${escapeHtml(voice.name)}${voiceIsReady(voice) ? '' : ' · 未就绪'}</option>`).join('')}</select></label>
+    </div>`;
+  }).join('');
+  return `<div class="voice-binding-scrim" data-action="close-voice-binding" aria-hidden="true"></div><aside class="voice-binding-drawer" role="dialog" aria-modal="false" aria-labelledby="voice-binding-title">
+    <header><div><span class="eyebrow">CAST VOICES</span><h2 id="voice-binding-title">角色音色绑定</h2><p>${readyCount}/${state.project?.characters?.length || 0} 个角色已可用于真人语音</p></div><button class="icon-button" data-action="close-voice-binding" aria-label="关闭角色音色绑定">×</button></header>
+    <div class="voice-binding-tools"><label class="checkbox-row"><input type="checkbox" id="voice-binding-chapter-only" ${state.voiceBindingChapterOnly ? 'checked' : ''}><span>仅显示本章出现角色</span></label><button class="button ghost small" data-nav="voices">管理音色库</button></div>
+    <div class="voice-binding-list">${rows || '<div class="voice-binding-empty">本章没有识别到已建档角色。</div>'}</div>
+    <footer><div><strong>${dirtyCount ? `${dirtyCount} 项未保存` : '所有绑定已保存'}</strong><small>关闭侧栏会保留本地草稿；只有“保存全部绑定”才会写入项目。</small></div><div><button class="button ghost" data-action="discard-voice-bindings" ${!dirtyCount || state.voiceBindingSaving ? 'disabled' : ''}>取消更改</button><button class="button primary" data-action="save-voice-bindings" ${!dirtyCount || state.voiceBindingSaving ? 'disabled' : ''}>${state.voiceBindingSaving ? '保存中…' : '保存全部绑定'}</button></div></footer>
+  </aside>`;
+}
+
 function studioHtml() {
   if (!state.project) {
     return `<section class="error-state"><h2>还没有打开作品</h2><p>请从项目页选择一本小说，或先创建新作品。</p><button class="button primary" data-nav="projects">返回项目</button></section>`;
@@ -1712,16 +1876,20 @@ function studioHtml() {
   const total = allProjectLines().length;
   const missingNames = missingVoices.slice(0, 4).map((item) => item.name).join('、');
   const missingMore = missingVoices.length > 4 ? `等 ${missingVoices.length} 个角色` : '';
+  const collaborationActive = codexProgressIsActive(currentCodexProgress());
+  const scriptJobActive = Boolean(activeScriptJobForChapter(chapter?.id));
   return `<section class="studio-page ${missingVoices.length ? 'has-voice-warning' : ''}">
     <header class="studio-header">
       <div class="studio-title"><button class="back-button" data-nav="projects" aria-label="返回">‹</button><div><h1>${escapeHtml(project.title)}</h1><small>${project.chapters.length} 章 · ${formatNumber(project.source?.charCount)} 字 · ${project.characters.length} 个角色</small></div></div>
       <div class="studio-actions">
-        <button class="button ghost" data-action="open-script-modal">✦ 剧本润色</button>
+        <button class="button ghost" data-action="run-rule-script" ${collaborationActive || scriptJobActive || state.ruleScriptSubmitting ? 'disabled' : ''} title="${collaborationActive ? '本章协作任务完成后才能运行规则生成' : scriptJobActive ? '本章已有剧本任务正在运行' : '按忠实朗读档位立即生成'}">⚡ ${scriptJobActive ? '剧本任务进行中…' : state.ruleScriptSubmitting ? '正在提交…' : '规则一键生成'}</button>
+        <button class="button ghost" data-action="open-collaboration-room">✦ 剧本协作室 / 版本</button>
+        <button class="button ghost" data-action="toggle-voice-binding">♬ 角色音色绑定</button>
         <button class="button" data-action="render-scope" data-scope="chapter">◉ 生成本章</button>
         <button class="button primary" data-action="export-project">⇩ 导出 WAV</button>
       </div>
     </header>
-    ${missingVoices.length ? `<div class="voice-readiness-banner" role="status"><span class="voice-warning-icon">!</span><div><strong>本章还有 ${missingVoices.length} 个角色无法生成真人语音</strong><small>${escapeHtml(missingNames)}${escapeHtml(missingMore)} 尚未绑定带参考录音的可用音色；选中台词后可在右侧绑定。</small></div><button class="button small" data-nav="voices">管理音色</button></div>` : ''}
+    ${missingVoices.length ? `<div class="voice-readiness-banner" role="status"><span class="voice-warning-icon">!</span><div><strong>本章还有 ${missingVoices.length} 个角色无法生成真人语音</strong><small>${escapeHtml(missingNames)}${escapeHtml(missingMore)} 尚未绑定带参考录音的可用音色。</small></div><button class="button small" data-action="toggle-voice-binding">批量绑定</button><button class="button ghost small" data-nav="voices">管理音色</button></div>` : ''}
     <div class="studio-grid">
       <aside class="chapter-rail">
         <div class="rail-head"><span>章节</span><small class="rail-count">${project.chapters.length}</small></div>
@@ -1739,6 +1907,7 @@ function studioHtml() {
       </section>
       <aside class="inspector">${inspectorHtml()}</aside>
     </div>
+    ${voiceBindingDrawerHtml()}
   </section>`;
 }
 
@@ -1753,7 +1922,7 @@ function scriptContentHtml(chapter) {
   if (!chapter) return '<div class="source-only"><h3>作品还没有章节</h3><p>重新导入包含正文的文件后即可开始。</p></div>';
   const all = chapter.scenes?.flatMap((scene) => scene.lines || []) || [];
   if (!all.length) {
-    return `<div class="source-only"><div class="doc-glyph">▤</div><h3>正文已经拆好，等待剧本化</h3><p>用规则引擎可立即识别引号对白；也可以导出结构化任务交给 Codex，获得更准确的角色与情绪标注。</p><button class="button primary" data-action="open-script-modal">✦ 开始剧本润色</button></div>`;
+    return `<div class="source-only"><div class="doc-glyph">▤</div><h3>正文已经拆好，等待剧本化</h3><p>规则一键生成可立即识别引号对白；剧本协作室支持 Codex 或本地 Ollama 多轮调整，并保留可恢复版本。</p><div class="source-actions"><button class="button" data-action="run-rule-script" ${codexProgressIsActive(currentCodexProgress()) || activeScriptJobForChapter(chapter.id) || state.ruleScriptSubmitting ? 'disabled' : ''}>⚡ ${activeScriptJobForChapter(chapter.id) ? '剧本任务进行中…' : state.ruleScriptSubmitting ? '正在提交…' : '规则一键生成'}</button><button class="button primary" data-action="open-collaboration-room">✦ 打开剧本协作室</button></div></div>`;
   }
   const filtered = (line) => state.lineFilter === 'all' || line.kind === state.lineFilter || (state.lineFilter === 'review' && line.needsReview);
   return chapter.scenes.map((scene) => {
@@ -1885,7 +2054,7 @@ function autoSizeTextareas() {
 async function navigate(view, projectId = null, chapterId = null) {
   if (state.view === 'codex' && view !== 'codex') {
     if (state.codexBusy) {
-      toast('正在提交 Codex 任务', '收到后台任务编号后再离开本页。', 'warn');
+      toast('正在提交协作任务', '收到后台任务编号后再离开本页。', 'warn');
       return;
     }
     pauseCodexStudio();
@@ -1953,21 +2122,6 @@ function voiceModalHtml() {
     </div><footer class="modal-foot"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary" id="voice-submit-button">保存到音色库</button></footer></form>`;
 }
 
-function scriptModalHtml() {
-  const chapter = currentChapter();
-  const codex = codexReadiness();
-  return `<header class="modal-head"><div><span class="eyebrow">SCRIPT POLISH</span><h2>把小说转成配音剧本</h2></div><button class="icon-button" data-action="close-modal">×</button></header>
-    <div class="modal-body"><div class="modal-note">当前处理：${escapeHtml(chapter?.title || '')}。原文始终保留；剧本会生成独立的朗读文本、角色、情绪和停顿。</div>
-      <div class="form-group"><label>润色档位</label><div class="mode-cards">
-        <label class="mode-card"><input type="radio" name="script-mode" value="faithful" ${state.codexMode === 'faithful' ? 'checked' : ''}><strong>忠实朗读</strong><small>不增写剧情，只做归属与情绪标注</small></label>
-        <label class="mode-card"><input type="radio" name="script-mode" value="polished" ${state.codexMode === 'polished' ? 'checked' : ''}><strong>轻度剧本化</strong><small>优化书面结构和朗读节奏</small></label>
-        <label class="mode-card"><input type="radio" name="script-mode" value="drama" ${state.codexMode === 'drama' ? 'checked' : ''}><strong>广播剧化</strong><small>适度压缩叙述，增强表演提示</small></label>
-      </div></div>
-      <div class="form-group" style="margin-top:16px"><label>处理方式</label><select class="select-field" id="script-provider"><option value="rules">本地规则引擎 · 立即完成</option><option value="codex">Codex 剧本协作室 · ${codex.ready ? '可直接对话' : '任务包可用'}</option><option value="ollama">本地 Ollama · 结构化输出</option></select></div>
-      <div class="script-readiness ${codex.ready ? 'ready' : 'warn'}" role="status"><i></i><div><strong>${escapeHtml(codex.label)}</strong><small>${escapeHtml(codex.detail)}${codex.ready ? '。选择 Codex 后可在同一会话里多轮调整。' : '。仍可打开协作室生成任务包，并手工导入 JSON。'}</small></div></div>
-    </div><footer class="modal-foot" style="justify-content:space-between"><div><button class="button ghost" data-action="open-codex-package">⇧ Codex 任务包</button><button class="button ghost" data-action="open-codex-import">⇩ 导入 JSON</button></div><div style="display:flex;gap:8px"><button class="button ghost" data-action="close-modal">取消</button><button class="button primary" data-action="run-script">开始转换</button></div></footer>`;
-}
-
 function codexImportModalHtml(prompt = '') {
   return `<header class="modal-head"><div><span class="eyebrow">CODEX HANDOFF</span><h2>Codex 剧本任务</h2></div><button class="icon-button" data-action="close-modal">×</button></header>
     <div class="modal-body"><div class="modal-note">已按官方结构化输出方式准备任务。复制下方内容交给 Codex，取得 JSON 后粘贴到“返回结果”中导入。</div>
@@ -1977,9 +2131,9 @@ function codexImportModalHtml(prompt = '') {
     </div><footer class="modal-foot"><button class="button ghost" data-action="close-modal">稍后处理</button><button class="button primary" data-action="import-codex-result">校验并导入</button></footer>`;
 }
 
-function codexMessageHtml(message) {
+function codexMessageHtml(message, provider = state.codexProvider) {
   const role = message.role === 'assistant' ? 'assistant' : message.role === 'user' ? 'user' : 'system';
-  const label = role === 'assistant' ? 'Codex' : role === 'user' ? '你' : '系统';
+  const label = role === 'assistant' ? scriptSourceLabel(normalizeCollaborationProvider(provider)) : role === 'user' ? '你' : '系统';
   const createdAt = message.createdAt ? new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '';
   return `<article class="codex-message ${role}"><div class="codex-message-meta"><strong>${label}</strong><time>${escapeHtml(createdAt)}</time></div><div class="codex-message-content">${escapeHtml(message.content || '')}</div></article>`;
 }
@@ -1991,7 +2145,7 @@ function codexLineEditorHtml(line, index) {
   const roleOptions = state.project.characters.map((item) => `<option value="${item.id}" ${item.id === role?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('');
   const emotionOptions = state.bootstrap.emotions.map((emotion) => `<option value="${emotion.id}" ${emotion.id === line.emotion ? 'selected' : ''}>${escapeHtml(emotion.label)}</option>`).join('');
   return `<article class="codex-script-line" data-codex-line-id="${line.id}">
-    <header><span class="codex-line-number">${String(index + 1).padStart(2, '0')}</span><span class="codex-line-kind">${line.kind === 'dialogue' ? '对白' : '旁白'}</span>${line.needsReview ? '<span class="review-flag">待确认</span>' : ''}<small>${busy ? 'Codex 处理中暂锁定' : '修改自动保存'}</small></header>
+    <header><span class="codex-line-number">${String(index + 1).padStart(2, '0')}</span><span class="codex-line-kind">${line.kind === 'dialogue' ? '对白' : '旁白'}</span>${line.needsReview ? '<span class="review-flag">待确认</span>' : ''}<small>${busy ? '协作任务处理中暂锁定' : '修改自动保存'}</small></header>
     <textarea class="codex-line-text" rows="2" aria-label="第 ${index + 1} 句朗读文本" data-line-input="spokenText" data-line-id="${line.id}" ${locked}>${escapeHtml(line.spokenText || '')}</textarea>
     <div class="codex-line-selects"><label><span>角色</span><select class="select-field" data-line-field="speakerId" data-line-id="${line.id}" ${locked}>${roleOptions}</select></label><label><span>情绪</span><select class="select-field" data-line-field="emotion" data-line-id="${line.id}" ${locked}>${emotionOptions}</select></label></div>
     <div class="codex-line-ranges">
@@ -2007,13 +2161,16 @@ function codexStudioHtml() {
   const sessions = codexSessions(chapter);
   const projectSessions = allCodexSessions();
   const session = currentCodexSession();
-  const readiness = codexReadiness();
+  const selectedVersion = sessions.find((item) => item.id === state.codexVersionId) || session || null;
   const messages = session?.messages || [];
   const lines = chapter?.scenes?.flatMap((scene) => scene.lines || []) || [];
   const progress = currentCodexProgress();
   const busy = codexRoomBusy();
   const activeProgress = codexProgressIsActive(progress) ? progress : null;
-  const model = normalizeCodexModel(activeProgress?.model ?? state.codexModel ?? session?.model);
+  const provider = normalizeCollaborationProvider(activeProgress?.provider ?? session?.provider ?? state.codexProvider);
+  const readiness = collaborationReadiness(provider);
+  const providerLabel = scriptSourceLabel(provider);
+  const model = normalizeCodexModel(activeProgress?.model ?? state.codexModel ?? session?.model, collaborationModelDefault(provider));
   const reasoningEffort = normalizeCodexReasoningEffort(
     activeProgress?.reasoningEffort ?? state.codexReasoningEffort ?? session?.reasoningEffort
   );
@@ -2022,39 +2179,40 @@ function codexStudioHtml() {
   );
   const legacyTimeout = Boolean(session) && !activeProgress && parseCodexTimeoutMinutes(session.timeoutMinutes) === null;
   const mode = session?.mode || state.codexMode || 'faithful';
-  const sessionStatus = busy ? (CODEX_PROGRESS_PRESENTATION[progress?.type]?.short || '提交中') : session ? codexStatusLabel(session.status) : '新会话';
+  const sessionStatus = busy ? (CODEX_PROGRESS_PRESENTATION[progress?.type]?.short || '提交中') : session ? codexStatusLabel(session.status) : selectedVersion ? `${scriptSourceLabel(selectedVersion)}版本已激活` : '新会话';
   const canSend = readiness.ready && !busy;
   const loginActive = CODEX_LOGIN_ACTIVE_STATES.has(currentCodexLogin().state);
-  const loginButton = readiness.authRequired
+  const loginButton = provider === 'codex' && readiness.authRequired
     ? `<button class="button primary small" data-action="start-codex-login" ${busy ? 'disabled' : ''}>${loginActive ? '查看登录' : '登录 Codex'}</button>`
     : '';
-  return `<header class="codex-room-head"><div class="codex-room-title"><button class="button ghost codex-room-back" data-action="leave-codex-room" ${state.codexBusy ? 'disabled' : ''}>‹ 返回制作台</button><div><span class="eyebrow">CODEX SCRIPT ROOM</span><h1>Codex 剧本协作室</h1><p>${escapeHtml(chapter?.title || '当前章节')} · 多轮调整与逐句校对</p></div></div><div class="codex-room-head-actions"><span class="codex-room-status ${readiness.ready ? 'ready' : 'warn'}"><i></i>${escapeHtml(readiness.label)}</span></div></header>
+  return `<header class="codex-room-head"><div class="codex-room-title"><button class="button ghost codex-room-back" data-action="leave-codex-room" ${state.codexBusy ? 'disabled' : ''}>‹ 返回制作台</button><div><span class="eyebrow">SCRIPT COLLABORATION</span><h1>剧本协作室</h1><p>${escapeHtml(chapter?.title || '当前章节')} · Codex / 本地 Ollama 多轮调整与版本恢复</p></div></div><div class="codex-room-head-actions"><span class="codex-room-status ${readiness.ready ? 'ready' : 'warn'}"><i></i>${escapeHtml(readiness.label)}</span></div></header>
     <div class="codex-room-grid" style="--codex-session-width:${Math.round(state.codexSessionPaneWidth)}px;--codex-script-width:${Math.round(state.codexScriptPaneWidth)}px">
-      <aside class="codex-session-panel" aria-label="Codex 会话历史">
-        <div class="codex-panel-title"><div><span class="eyebrow">SESSIONS</span><strong>版本会话</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新版本</button></div>
-        <p class="codex-session-hint">每个 Session 是一条独立版本线；章节名仅用于标识归属。</p>
-        <div class="codex-session-list">${projectSessions.length ? projectSessions.map((item, index) => codexSessionItemHtml(item, index, session?.id, state.codexBusy)).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有版本会话</strong><small>新建 Session 后，可以在同一章节保留多条独立调整路线。</small></div>'}</div>
-        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? '。直接对话会把当前章节发送给你已登录的 Codex 服务。' : ''}</p><div>${loginButton}<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${busy ? 'disabled' : ''}>⇧ 任务包</button><button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
+      <aside class="codex-session-panel" aria-label="剧本版本与会话历史">
+        <div class="codex-panel-title"><div><span class="eyebrow">VERSIONS</span><strong>版本与 Session</strong></div><button class="button small" data-action="new-codex-session" ${busy ? 'disabled' : ''}>＋ 新 Session</button></div>
+        <p class="codex-session-hint">规则、导入、Codex、Ollama 版本都可激活恢复；切换协作后端会新建 Session。</p>
+        <div class="codex-session-list">${projectSessions.length ? projectSessions.map((item, index) => codexSessionItemHtml(item, index, busy)).join('') : '<div class="codex-empty-session"><span>✦</span><strong>还没有剧本版本</strong><small>规则生成或发送第一条协作消息后，会在这里保留可恢复版本。</small></div>'}</div>
+        <div class="codex-readiness-card ${readiness.ready ? 'ready' : 'warn'}"><strong>${escapeHtml(readiness.label)}</strong><p>${escapeHtml(readiness.detail)}${readiness.ready ? `。本轮会由${escapeHtml(providerLabel)}处理当前章节。` : ''}</p><div>${loginButton}${provider === 'codex' ? `<button class="button ghost small" data-action="open-codex-package" data-mode="${escapeHtml(mode)}" ${busy ? 'disabled' : ''}>⇧ Codex 任务包</button>` : ''}<button class="button ghost small" data-action="refresh-codex-room" ${state.codexBusy ? 'disabled' : ''}>↻ 重新检测</button></div></div>
       </aside>
       <div class="codex-splitter codex-splitter-left" data-codex-splitter="left" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整 Session 列表宽度"></div>
-      <section class="codex-chat-panel" aria-label="Codex 对话与任务进度" aria-busy="${busy}">
+      <section class="codex-chat-panel" aria-label="剧本协作对话与任务进度" aria-busy="${busy}">
         <div class="codex-chat-toolbar">
-          <label class="codex-model-control"><span>模型（默认 Terra，可输入 CLI ID）</span><div class="codex-model-input"><input class="field" id="codex-model" list="codex-model-options" maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}" value="${escapeHtml(model)}" placeholder="gpt-5.6-terra" title="以字母或数字开头，最多 100 个字符" autocomplete="off" spellcheck="false" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" title="使用推荐模型 gpt-5.6-terra" ${busy ? 'disabled' : ''}>Terra</button></div></label>
+          <label class="codex-provider-control"><span>协作后端（切换会新建 Session）</span><select class="select-field" id="codex-provider" ${busy ? 'disabled' : ''}><option value="codex" ${provider === 'codex' ? 'selected' : ''}>Codex</option><option value="ollama" ${provider === 'ollama' ? 'selected' : ''}>本地 Ollama</option></select></label>
+          <label class="codex-model-control"><span>${provider === 'ollama' ? 'Ollama 模型（本地模型 ID）' : '模型（默认 Terra，可输入 CLI ID）'}</span><div class="codex-model-input"><input class="field" id="codex-model" ${provider === 'codex' ? 'list="codex-model-options"' : ''} maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}" value="${escapeHtml(model)}" placeholder="${provider === 'ollama' ? 'qwen3:8b' : 'gpt-5.6-terra'}" title="以字母或数字开头，最多 100 个字符" autocomplete="off" spellcheck="false" ${busy ? 'disabled' : ''}><button class="button ghost small" type="button" data-action="use-codex-default-model" title="使用${provider === 'ollama' ? '设置中的 Ollama 模型' : '推荐模型 gpt-5.6-terra'}" ${busy ? 'disabled' : ''}>${provider === 'ollama' ? '本地默认' : 'Terra'}</button></div></label>
           <datalist id="codex-model-options">${CODEX_MODEL_OPTIONS.map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</datalist>
-          <label class="codex-reasoning-control"><span>推理强度（影响质量 / 耗时）</span><select class="select-field" id="codex-reasoning-effort" ${busy ? 'disabled' : ''}>${CODEX_REASONING_OPTIONS.map(([value, label]) => `<option value="${value}" ${value === reasoningEffort ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+          <label class="codex-reasoning-control"><span>${provider === 'ollama' ? '推理强度（由本地模型配置）' : '推理强度（影响质量 / 耗时）'}</span><select class="select-field" id="codex-reasoning-effort" ${busy || provider === 'ollama' ? 'disabled' : ''}>${provider === 'ollama' ? '<option>不适用</option>' : CODEX_REASONING_OPTIONS.map(([value, label]) => `<option value="${value}" ${value === reasoningEffort ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
           <label class="codex-timeout-control"><span>任务超时（分钟）${legacyTimeout ? ' · 旧会话下轮默认 10' : ''}</span><input class="field" id="codex-timeout-minutes" type="number" min="5" max="120" step="1" inputmode="numeric" value="${timeoutMinutes}" title="请输入 5–120 的整数；建议按 5 分钟调整" ${busy ? 'disabled' : ''}></label>
           <label class="codex-mode-control"><span>润色档位</span><select class="select-field" id="codex-room-mode" ${session || busy ? 'disabled' : ''}>${Object.entries(CODEX_MODE_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
-          <div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : '发送后创建会话'}</small><fieldset class="codex-observability-controls"><legend class="sr-only">Codex 进度显示设置</legend><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label><label class="codex-progress-visibility codex-activity-visibility"><input type="checkbox" id="codex-activity-visible" ${state.codexActivityVisible ? 'checked' : ''} aria-describedby="codex-activity-setting-help"><span>显示推理摘要与活动日志 <em>非隐藏思维链</em></span></label><small id="codex-activity-setting-help">摘要采集模式在发送新任务时确定；关闭显示不会停止后台处理</small></fieldset></div>
+          <div class="codex-active-status"><span>${sessionStatus}</span><small>${session ? `${scriptSourceLabel(session)} · ${Number(session.turnCount || Math.ceil(messages.length / 2))} 轮对话` : selectedVersion ? `从 ${scriptSourceLabel(selectedVersion)}版本继续会创建 ${providerLabel} Session` : `发送后创建 ${providerLabel} Session`}</small><fieldset class="codex-observability-controls"><legend class="sr-only">协作进度显示设置</legend><label class="codex-progress-visibility"><input type="checkbox" id="codex-progress-visible" ${state.codexProgressVisible ? 'checked' : ''}><span>显示处理进度</span></label><label class="codex-progress-visibility codex-activity-visibility"><input type="checkbox" id="codex-activity-visible" ${state.codexActivityVisible ? 'checked' : ''} aria-describedby="codex-activity-setting-help"><span>显示推理摘要与活动日志 <em>非隐藏思维链</em></span></label><small id="codex-activity-setting-help">摘要采集模式在发送新任务时确定；关闭显示不会停止后台处理</small></fieldset></div>
         </div>
         <div class="sr-only" id="codex-progress-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
-        <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map(codexMessageHtml).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 Codex 一起打磨这一版</h3><p>新建 Session 会创建独立版本线；继续发送则沿当前 Session 迭代。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}<div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>${state.codexBusy ? '<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 Codex 后台任务</strong><small>收到任务编号后会转为流式运行记录。</small></div></div>' : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
-        <form class="codex-composer" id="codex-chat-form" novalidate><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以返回制作台，稍后再进入本页查看。' : readiness.ready ? '发送后会直接更新当前章节，可继续多轮调整。' : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : '直接对话暂不可用；请使用左侧任务包交接。'}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : '创建会话并生成'}</button></div></form>
+        <div class="codex-conversation" id="codex-conversation">${messages.length ? messages.map((message) => codexMessageHtml(message, provider)).join('') : `<div class="codex-conversation-empty"><span>✦</span><h3>和 ${escapeHtml(providerLabel)} 一起打磨这一版</h3><p>新建 Session 会创建独立版本线；规则或导入版本继续协作时也会建立新 Session。</p><div><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请重点检查所有对白的说话人归属，不确定的角色保留待确认标记。" ${busy ? 'disabled' : ''}>检查角色归属</button><button class="codex-suggestion" type="button" data-action="use-codex-suggestion" data-prompt="请优化朗读节奏和停顿，但不要改变剧情事实和人物关系。" ${busy ? 'disabled' : ''}>优化朗读节奏</button></div></div>`}<div id="codex-progress-slot">${state.codexProgressVisible && progress ? codexProgressPanelHtml(progress) : ''}</div>${state.codexBusy ? `<div class="codex-processing" role="status"><span><i></i><i></i><i></i></span><div><strong>正在提交 ${escapeHtml(providerLabel)} 后台任务</strong><small>收到任务编号后会转为流式运行记录。</small></div></div>` : ''}${state.codexError ? `<div class="codex-chat-error" role="alert"><strong>本轮没有完成</strong><span>${escapeHtml(state.codexError)}</span></div>` : ''}</div>
+        <form class="codex-composer" id="codex-chat-form" novalidate><textarea id="codex-chat-prompt" rows="3" maxlength="4000" placeholder="例如：第二场中苏晚的语气太激烈，请改得克制一些，并延长关键句后的停顿。" ${busy ? 'disabled' : ''}>${escapeHtml(codexDraft())}</textarea><div><small>${busy && progress ? '任务已在后台运行；可以返回制作台，稍后再进入本页查看。' : readiness.ready ? `发送后会由${escapeHtml(providerLabel)}更新当前章节，可继续多轮调整。` : readiness.authRequired ? '请先点击左侧“登录 Codex”，在 OpenAI 官方页面完成登录；任务包仍可使用。' : `${escapeHtml(providerLabel)}当前不可用，请检查本地配置。`}</small><button class="button primary" type="submit" ${canSend ? '' : 'disabled'}>${busy ? (progress ? '后台处理中…' : '正在提交…') : session ? '发送并更新剧本' : `创建 ${escapeHtml(providerLabel)} Session`}</button></div></form>
       </section>
       <div class="codex-splitter codex-splitter-right" data-codex-splitter="right" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整对话与剧本宽度比例"></div>
       <aside class="codex-script-panel" aria-label="当前剧本逐句编辑">
         <div class="codex-panel-title"><div><span class="eyebrow">LIVE SCRIPT</span><strong>当前剧本</strong></div><span class="codex-line-count">${lines.length} 句</span></div>
         <p class="codex-script-hint">可直接修改台词、角色、情绪与节奏；每项改动都会自动保存。</p>
-        <div class="codex-script-list">${lines.length ? lines.map(codexLineEditorHtml).join('') : '<div class="codex-empty-script"><span>▤</span><strong>本章还没有剧本</strong><small>向 Codex 发送第一条要求后，生成结果会显示在这里。</small></div>'}</div>
+        <div class="codex-script-list">${lines.length ? lines.map(codexLineEditorHtml).join('') : `<div class="codex-empty-script"><span>▤</span><strong>本章还没有剧本</strong><small>向${escapeHtml(providerLabel)}发送第一条要求后，生成结果会显示在这里。</small></div>`}</div>
       </aside>
     </div>`;
 }
@@ -2158,7 +2316,7 @@ function pauseCodexStudio({ invalidateRequest = false } = {}) {
 
 async function leaveCodexStudio() {
   if (state.codexBusy) {
-    toast('正在提交 Codex 任务', '收到后台任务编号后即可返回制作台。', 'warn');
+    toast('正在提交协作任务', '收到后台任务编号后即可返回制作台。', 'warn');
     return;
   }
   const projectId = state.project?.id;
@@ -2170,13 +2328,19 @@ function prepareCodexStudioState(mode = state.codexMode) {
   state.codexError = '';
   const chapter = currentChapter();
   const sessions = codexSessions(chapter);
-  const remembered = state.codexSessionByChapter.get(chapter?.id) || chapter?.activeCodexSessionId;
-  state.codexSessionId = sessions.some((session) => session.id === remembered) ? remembered : sessions[0]?.id || null;
+  const remembered = state.codexSessionByChapter.get(chapter?.id);
+  const preferred = chapter?.activeCodexSessionId || remembered || sessions[0]?.id || null;
+  state.codexVersionId = sessions.some((version) => version.id === preferred) ? preferred : sessions[0]?.id || null;
+  const selectedVersion = sessions.find((version) => version.id === state.codexVersionId) || null;
+  const source = scriptVersionSource(selectedVersion);
+  state.codexSessionId = selectedVersion && COLLABORATION_PROVIDERS.has(source) ? selectedVersion.id : null;
   const session = currentCodexSession();
-  state.codexModel = normalizeCodexModel(session?.model);
+  if (session) state.codexProvider = normalizeCollaborationProvider(session.provider, source);
+  else state.codexProvider = normalizeCollaborationProvider(state.codexProvider);
+  state.codexModel = normalizeCodexModel(session?.model, collaborationModelDefault(state.codexProvider));
   state.codexReasoningEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
   state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(session?.timeoutMinutes);
-  if (session?.mode) state.codexMode = session.mode;
+  if (selectedVersion?.mode) state.codexMode = selectedVersion.mode;
 }
 
 function openCodexStudio(mode = state.codexMode) {
@@ -2187,17 +2351,19 @@ function openCodexStudio(mode = state.codexMode) {
   const hash = state.project && chapter ? `#/codex/${state.project.id}/${chapter.id}` : '#/codex';
   if (location.hash !== hash) history.pushState(null, '', hash);
   renderCodexStudio({ focus: state.codexSessionId ? '' : 'composer' });
-  recoverCodexLogin();
+  if (state.codexProvider === 'codex') recoverCodexLogin();
   void recoverCodexProgress();
 }
 
-function startNewCodexSession() {
+function startNewCodexSession(provider = state.codexProvider) {
   if (codexRoomBusy()) return;
   rememberCodexComposer();
   const chapterId = currentChapter()?.id;
   if (chapterId) state.codexSessionByChapter.delete(chapterId);
+  state.codexProvider = normalizeCollaborationProvider(provider);
   state.codexSessionId = null;
-  state.codexModel = DEFAULT_CODEX_MODEL;
+  state.codexVersionId = null;
+  state.codexModel = collaborationModelDefault(state.codexProvider);
   state.codexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
   state.codexTimeoutMinutes = DEFAULT_CODEX_TIMEOUT_MINUTES;
   state.codexError = '';
@@ -2205,16 +2371,23 @@ function startNewCodexSession() {
   renderCodexStudio({ focus: 'composer' });
 }
 
+function switchCollaborationProvider(provider) {
+  const nextProvider = normalizeCollaborationProvider(provider);
+  if (nextProvider === state.codexProvider && (!currentCodexSession() || normalizeCollaborationProvider(currentCodexSession()?.provider) === nextProvider)) return;
+  startNewCodexSession(nextProvider);
+  toast(`已切换到${scriptSourceLabel(nextProvider)}`, '将创建新的 Session；原版本仍保留在左侧，可随时恢复。', 'warn');
+}
+
 async function selectCodexSession(sessionId, chapterId = '') {
   if (state.codexBusy || !sessionId) return;
   let target = findCodexSessionAcrossProject(sessionId, chapterId);
   if (!target) return;
-  if (sessionId === state.codexSessionId && target.chapterId === currentChapter()?.id) return;
+  if (sessionId === state.codexVersionId && target.chapterId === currentChapter()?.id) return;
   rememberCodexComposer();
   const targetChapter = state.project?.chapters.find((chapter) => chapter.id === target.chapterId);
   if (targetChapter?.activeCodexSessionId !== target.id) {
     if (!target.versionAvailable) {
-      toast('这个旧 Session 无法恢复版本', '它创建于版本快照功能之前；可以查看当前版本，或新建 Session 继续制作。', 'warn');
+      toast('这个旧版本无法恢复', '它创建于版本快照功能之前；可以查看当前版本，或新建 Session 继续制作。', 'warn');
       return;
     }
     try {
@@ -2223,19 +2396,22 @@ async function selectCodexSession(sessionId, chapterId = '') {
       if (result?.project) state.project = result.project;
       target = findCodexSessionAcrossProject(sessionId, chapterId) || target;
     } catch (error) {
-      toast('无法切换 Session 版本', error.message, 'warn');
+      toast('无法切换剧本版本', error.message, 'warn');
       return;
     }
   }
   closeCodexProgressConnection(codexProgressKey(), { paused: true });
   state.selectedChapterId = target.chapterId;
-  state.codexSessionId = sessionId;
+  state.codexVersionId = sessionId;
+  const source = scriptVersionSource(target);
+  state.codexSessionId = COLLABORATION_PROVIDERS.has(source) ? sessionId : null;
   if (target.chapterId) state.codexSessionByChapter.set(target.chapterId, sessionId);
   const session = currentCodexSession();
-  state.codexModel = normalizeCodexModel(session?.model);
+  if (session) state.codexProvider = normalizeCollaborationProvider(session.provider, source);
+  state.codexModel = normalizeCodexModel(session?.model, collaborationModelDefault(state.codexProvider));
   state.codexReasoningEffort = normalizeCodexReasoningEffort(session?.reasoningEffort);
   state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(session?.timeoutMinutes);
-  if (session?.mode) state.codexMode = session.mode;
+  if (target?.mode) state.codexMode = target.mode;
   state.codexError = '';
   const hash = `#/codex/${state.project.id}/${target.chapterId}`;
   if (location.hash !== hash) history.pushState(null, '', hash);
@@ -2250,28 +2426,37 @@ async function waitForPendingLineSaves(projectId, requestId, timeoutMs = 8000) {
     if (requestId !== state.codexRequestId) return false;
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
-  if (hasPending()) throw new Error('仍有台词正在自动保存，请稍后再发送给 Codex。');
+  if (hasPending()) throw new Error('仍有台词正在自动保存，请稍后再发送给协作后端。');
   const failed = [...state.lineSaveErrors.entries()].filter(([key]) => key.startsWith(`${projectId}:`));
-  if (failed.length) throw new Error(`有 ${failed.length} 句台词自动保存失败，请重新修改并保存后再发送给 Codex。`);
+  if (failed.length) throw new Error(`有 ${failed.length} 句台词自动保存失败，请重新修改并保存后再发送给协作后端。`);
   return requestId === state.codexRequestId;
 }
 
 async function submitCodexMessage() {
   if (codexRoomBusy()) return;
-  const readiness = codexReadiness();
-  if (!readiness.ready) return toast(readiness.label, readiness.authRequired ? '请点击左侧“登录 Codex”完成官方网页登录，或使用任务包交接。' : '请使用任务包完成手工交接。', 'warn');
   rememberCodexComposer();
+  const provider = normalizeCollaborationProvider($('#codex-provider')?.value ?? state.codexProvider);
+  const readiness = collaborationReadiness(provider);
+  if (!readiness.ready) {
+    const advice = provider === 'codex'
+      ? (readiness.authRequired ? '请点击左侧“登录 Codex”完成官方网页登录，或使用任务包交接。' : '请使用任务包完成手工交接。')
+      : '请确认 Ollama 已启动，并在模型中心检查本地服务地址和模型。';
+    return toast(readiness.label, advice, 'warn');
+  }
   const prompt = String($('#codex-chat-prompt')?.value || codexDraft()).trim();
-  if (!prompt) return toast('先写下本轮目标', '说明希望 Codex 生成或调整什么内容。', 'warn');
+  if (!prompt) return toast('先写下本轮目标', `说明希望${scriptSourceLabel(provider)}生成或调整什么内容。`, 'warn');
   const projectId = state.project?.id;
   const chapterId = currentChapter()?.id;
   if (!projectId || !chapterId) return;
-  const sessionId = state.codexSessionId;
+  const selectedSession = currentCodexSession();
+  const sessionId = selectedSession && normalizeCollaborationProvider(selectedSession.provider) === provider
+    ? selectedSession.id
+    : null;
   const rawModel = String($('#codex-model')?.value ?? state.codexModel ?? '').trim();
   if (rawModel && !CODEX_MODEL_PATTERN.test(rawModel)) {
     return toast('模型 ID 格式不正确', '请使用字母或数字开头，最多 100 个字符。', 'warn');
   }
-  const model = normalizeCodexModel(rawModel);
+  const model = normalizeCodexModel(rawModel, collaborationModelDefault(provider));
   const reasoningEffort = normalizeCodexReasoningEffort(
     $('#codex-reasoning-effort')?.value ?? state.codexReasoningEffort ?? currentCodexSession()?.reasoningEffort
   );
@@ -2283,57 +2468,70 @@ async function submitCodexMessage() {
   const detailLevel = state.codexActivityVisible ? 'summary' : 'basic';
   state.codexProgressRecoveryId += 1;
   const requestId = ++state.codexRequestId;
+  state.codexProvider = provider;
   state.codexModel = model;
   state.codexReasoningEffort = reasoningEffort;
   state.codexTimeoutMinutes = timeoutMinutes;
   state.codexMode = mode;
   state.codexBusy = true;
   state.codexError = '';
-  state.codexDrafts.set(codexDraftKey(sessionId), prompt);
+  const promptDraftKey = codexDraftKey(sessionId);
+  state.codexDrafts.set(promptDraftKey, prompt);
   renderCodexStudio();
   try {
     if (!(await waitForPendingLineSaves(projectId, requestId))) return;
     const endpoint = sessionId
       ? `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions/${encodeURIComponent(sessionId)}/messages`
       : `/api/projects/${encodeURIComponent(projectId)}/chapters/${encodeURIComponent(chapterId)}/codex-sessions`;
-    const body = sessionId
-      ? { model, reasoningEffort, timeoutMinutes, prompt, stream: true, detailLevel }
-      : { mode, model, reasoningEffort, timeoutMinutes, prompt, stream: true, detailLevel };
+    const runtimeOptions = {
+      provider,
+      model,
+      ...(provider === 'codex' ? { reasoningEffort } : {}),
+      timeoutMinutes,
+      prompt,
+      stream: true,
+      detailLevel
+    };
+    const body = sessionId ? runtimeOptions : { mode, ...runtimeOptions };
     const result = await api(endpoint, { method: 'POST', body });
     if (requestId !== state.codexRequestId) return;
     if (result?.progressId && result?.eventsUrl) {
       const key = codexProgressKey(projectId, chapterId);
+      const progressSessionId = result.sessionId || result.session?.id || sessionId;
       const progress = createCodexProgressSnapshot(result, {
         projectId,
         chapterId,
-        sessionId,
+        sessionId: progressSessionId,
         detailLevel,
+        provider,
         model,
         reasoningEffort,
         timeoutMinutes,
-        promptDraftKey: `${chapterId}:${sessionId || 'new'}`
+        promptDraftKey
       });
-      if (!progress) throw new Error('Codex 已接收任务，但返回的进度地址无效。');
+      if (!progress) throw new Error(`${scriptSourceLabel(provider)}已接收任务，但返回的进度地址无效。`);
       state.codexProgressByChapter.set(key, progress);
       state.codexBusy = false;
       state.codexError = '';
       renderCodexStudio();
       connectCodexProgress(progress);
-      toast('Codex 已开始后台处理', '现在可以返回制作台，稍后再进入协作页查看进度。');
+      toast(`${scriptSourceLabel(provider)}已开始后台处理`, '现在可以返回制作台，稍后再进入协作页查看进度。');
       return;
     }
     if (result.project && state.project?.id === projectId) state.project = result.project;
     state.codexSessionId = result.session?.id || sessionId;
+    state.codexVersionId = state.codexSessionId;
+    state.codexProvider = normalizeCollaborationProvider(result.session?.provider, provider);
     state.codexModel = normalizeCodexModel(result.session?.model, model);
     state.codexReasoningEffort = normalizeCodexReasoningEffort(result.session?.reasoningEffort, reasoningEffort);
     state.codexTimeoutMinutes = normalizeCodexTimeoutMinutes(result.session?.timeoutMinutes, timeoutMinutes);
     if (state.codexSessionId) state.codexSessionByChapter.set(chapterId, state.codexSessionId);
-    state.codexDrafts.delete(`${chapterId}:${sessionId || 'new'}`);
+    state.codexDrafts.delete(promptDraftKey);
     state.codexDrafts.set(`${chapterId}:${state.codexSessionId || 'new'}`, '');
     state.codexBusy = false;
     state.codexError = '';
     renderCodexStudio({ focus: 'composer' });
-    toast('Codex 已更新本章剧本', '可以继续对话，或在右侧逐句微调。');
+    toast(`${scriptSourceLabel(state.codexProvider)}已更新本章剧本`, '可以继续对话，或在右侧逐句微调。');
   } catch (error) {
     if (requestId !== state.codexRequestId) return;
     state.codexBusy = false;
@@ -2450,19 +2648,89 @@ function closeJobs() {
   $('#drawer-scrim').classList.remove('open');
 }
 
-async function runScript() {
-  const provider = $('#script-provider')?.value || 'rules';
-  const mode = $('input[name="script-mode"]:checked')?.value || 'faithful';
-  state.codexMode = CODEX_MODE_LABELS[mode] ? mode : 'faithful';
-  if (provider === 'codex') {
-    openCodexStudio(mode);
+async function runRulesScript() {
+  if (state.ruleScriptSubmitting) return;
+  const chapter = currentChapter();
+  if (!chapter || !state.project) return;
+  if (activeScriptJobForChapter(chapter.id)) {
+    toast('本章已有剧本任务', '请等待当前规则或模型剧本任务完成后再提交。', 'warn');
     return;
   }
-  const chapter = currentChapter();
-  closeModal();
-  const job = await api(`/api/projects/${state.project.id}/script`, { method: 'POST', body: { chapterIds: [chapter.id], provider, mode } });
-  toast('剧本任务已提交', `${chapter.title} · ${provider === 'rules' ? '本地规则' : provider}`, 'success');
-  trackJob(job);
+  if (codexProgressIsActive(currentCodexProgress())) {
+    toast('本章协作任务仍在运行', '请等待后台任务完成，再使用规则一键生成，避免版本冲突。', 'warn');
+    return;
+  }
+  try {
+    const [jobs, payload] = await Promise.all([
+      api('/api/jobs'),
+      api(`/api/projects/${encodeURIComponent(state.project.id)}/chapters/${encodeURIComponent(chapter.id)}/codex-progress`)
+    ]);
+    state.bootstrap.jobs = jobs;
+    if (activeScriptJobForChapter(chapter.id)) {
+      toast('本章已有剧本任务', '请等待当前规则或模型剧本任务完成后再提交。', 'warn');
+      renderView();
+      return;
+    }
+    const progress = payload?.progress;
+    if (progress && progress.terminal !== true && !['completed', 'failed'].includes(progress.type || progress.state)) {
+      toast('本章协作任务仍在运行', '请等待后台任务完成，再使用规则一键生成，避免版本冲突。', 'warn');
+      return;
+    }
+  } catch (error) {
+    toast('暂时无法确认本章任务状态', '为避免覆盖后台协作结果，本次没有启动规则生成；请稍后重试。', 'warn');
+    return;
+  }
+  state.ruleScriptSubmitting = true;
+  renderView();
+  try {
+    const job = await api(`/api/projects/${encodeURIComponent(state.project.id)}/script`, {
+      method: 'POST',
+      body: { chapterIds: [chapter.id], provider: 'rules', mode: 'faithful' }
+    });
+    toast('规则剧本任务已提交', `${chapter.title} · 忠实朗读`, 'success');
+    trackJob(job);
+  } finally {
+    state.ruleScriptSubmitting = false;
+    if (state.view === 'studio') renderView();
+  }
+}
+
+function closeVoiceBindingDrawer() {
+  const dirtyCount = voiceBindingDraftEntries().length;
+  state.voiceBindingOpen = false;
+  renderView();
+  requestAnimationFrame(() => $('[data-action="toggle-voice-binding"]')?.focus());
+  if (dirtyCount) toast('音色绑定草稿已保留', `${dirtyCount} 项更改尚未写入项目；重新打开侧栏可继续。`, 'warn');
+}
+
+function discardVoiceBindings() {
+  if (state.voiceBindingSaving) return;
+  state.voiceBindingDraft.clear();
+  renderView();
+  requestAnimationFrame(() => $('[data-action="discard-voice-bindings"]')?.focus());
+}
+
+async function saveVoiceBindings() {
+  if (state.voiceBindingSaving || !state.project) return;
+  const assignments = voiceBindingDraftEntries();
+  if (!assignments.length) return;
+  state.voiceBindingSaving = true;
+  renderView();
+  try {
+    const result = await api(`/api/projects/${encodeURIComponent(state.project.id)}/characters/voices`, {
+      method: 'PATCH', body: { assignments }
+    });
+    const updatedProject = result?.project || result;
+    if (!updatedProject?.id) throw new Error('服务未返回更新后的项目，请重新检测后再试。');
+    state.project = updatedProject;
+    state.voiceBindingDraft.clear();
+    toast('角色音色已批量保存', `已原子更新 ${assignments.length} 个角色；现在可以继续生成语音。`);
+  } catch (error) {
+    toast('批量绑定没有保存', `${error.message}；全部本地草稿仍保留，可修正后重试。`, 'error');
+  } finally {
+    state.voiceBindingSaving = false;
+    if (state.view === 'studio') renderView();
+  }
 }
 
 async function openCodexPackage(modeOverride = '') {
@@ -2925,8 +3193,17 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'filter-lines') { state.lineFilter = target.dataset.filter; renderView(); return; }
-    if (action === 'open-script-modal') { showModal(scriptModalHtml(), 'wide'); return; }
-    if (action === 'run-script') { await runScript(); return; }
+    if (action === 'run-rule-script') { await runRulesScript(); return; }
+    if (action === 'open-collaboration-room') { openCodexStudio('faithful'); return; }
+    if (action === 'toggle-voice-binding') {
+      state.voiceBindingOpen = !state.voiceBindingOpen;
+      renderView();
+      if (state.voiceBindingOpen) requestAnimationFrame(() => $('.voice-binding-drawer select, .voice-binding-drawer button')?.focus());
+      return;
+    }
+    if (action === 'close-voice-binding') { closeVoiceBindingDrawer(); return; }
+    if (action === 'discard-voice-bindings') { discardVoiceBindings(); return; }
+    if (action === 'save-voice-bindings') { await saveVoiceBindings(); return; }
     if (action === 'new-codex-session') { startNewCodexSession(); return; }
     if (action === 'select-codex-session') { await selectCodexSession(target.dataset.sessionId, target.dataset.chapterId); return; }
     if (action === 'toggle-codex-progress') {
@@ -2961,9 +3238,9 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'use-codex-default-model') {
-      state.codexModel = DEFAULT_CODEX_MODEL;
+      state.codexModel = collaborationModelDefault(state.codexProvider);
       const model = $('#codex-model');
-      if (model) { model.value = DEFAULT_CODEX_MODEL; model.focus(); }
+      if (model) { model.value = state.codexModel; model.focus(); }
       return;
     }
     if (action === 'refresh-codex-room') {
@@ -2972,7 +3249,7 @@ document.addEventListener('click', async (event) => {
       await refreshBootstrap();
       renderCodexStudio({ focus: 'composer' });
       await recoverCodexProgress();
-      toast('Codex 状态已重新检测', codexReadiness().label);
+      toast('协作后端状态已重新检测', collaborationReadiness(state.codexProvider).label);
       return;
     }
     if (action === 'use-codex-suggestion') {
@@ -3082,11 +3359,7 @@ document.addEventListener('change', async (event) => {
     state.codexMode = CODEX_MODE_LABELS[input.value] ? input.value : 'faithful';
     return;
   }
-  if (input.id === 'script-provider' && input.value === 'codex') {
-    const mode = $('input[name="script-mode"]:checked')?.value || state.codexMode;
-    openCodexStudio(mode);
-    return;
-  }
+  if (input.id === 'codex-provider') { switchCollaborationProvider(input.value); return; }
   if (input.id === 'codex-model') { state.codexModel = input.value.trim(); return; }
   if (input.id === 'codex-reasoning-effort') {
     state.codexReasoningEffort = normalizeCodexReasoningEffort(input.value);
@@ -3119,6 +3392,22 @@ document.addEventListener('change', async (event) => {
     }
     return;
   }
+  if (input.id === 'voice-binding-chapter-only') {
+    state.voiceBindingChapterOnly = input.checked;
+    renderView();
+    requestAnimationFrame(() => $('#voice-binding-chapter-only')?.focus());
+    return;
+  }
+  if (input.matches?.('[data-character-voice]')) {
+    const role = state.project?.characters.find((item) => item.id === input.dataset.characterVoice);
+    if (!role) return;
+    const voiceId = input.value || null;
+    if ((role.voiceId || null) === voiceId) state.voiceBindingDraft.delete(role.id);
+    else state.voiceBindingDraft.set(role.id, voiceId);
+    renderView();
+    requestAnimationFrame(() => $(`[data-character-voice="${CSS.escape(role.id)}"]`)?.focus());
+    return;
+  }
   if (input.id === 'modal-book-file') {
     state.bookFile = input.files[0] || null;
     if (state.bookFile) {
@@ -3148,6 +3437,7 @@ document.addEventListener('change', async (event) => {
     const previous = roleForLine(findLine(state.selectedLineId))?.voiceId || '';
     try {
       state.project = await api(`/api/projects/${state.project.id}/characters/${input.dataset.roleVoice}`, { method: 'PATCH', body: { voiceId: input.value || null } });
+      state.voiceBindingDraft.delete(input.dataset.roleVoice);
       renderView(); toast('角色音色已绑定');
     } catch (error) {
       input.value = previous;
@@ -3202,6 +3492,7 @@ document.addEventListener('keydown', (event) => {
     if ($('#modal-root .codex-login-modal')) dismissCodexLogin();
     else if ($('#modal-root .modal')) closeModal();
     else if ($('#job-drawer').classList.contains('open')) closeJobs();
+    else if (state.voiceBindingOpen) closeVoiceBindingDrawer();
     return;
   }
   if (event.key === 'Tab') {
@@ -3280,7 +3571,7 @@ window.addEventListener('hashchange', async () => {
   if (state.view === 'codex') prepareCodexStudioState();
   renderView();
   if (state.view === 'codex') {
-    recoverCodexLogin();
+    if (state.codexProvider === 'codex') recoverCodexLogin();
     void recoverCodexProgress();
   }
 });
@@ -3311,7 +3602,7 @@ async function boot() {
     if (state.view === 'codex') prepareCodexStudioState();
     renderView();
     if (state.view === 'codex') {
-      recoverCodexLogin();
+      if (state.codexProvider === 'codex') recoverCodexLogin();
       void recoverCodexProgress();
     }
     const activeJobs = state.bootstrap.jobs.filter((job) => ['queued', 'running'].includes(job.state));

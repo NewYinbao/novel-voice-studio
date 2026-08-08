@@ -3,8 +3,13 @@ import { normalizeCodexDetailLevel, sanitizeCodexActivitySummary } from './codex
 import {
   normalizeCodexModel,
   normalizeCodexReasoningEffort,
-  normalizeCodexTimeoutMinutes
+  normalizeCodexTimeoutMinutes,
+  normalizeOllamaModel
 } from './codex-options.js';
+import {
+  COLLABORATION_PROVIDERS,
+  normalizeScriptSessionProvider
+} from './codex-sessions.js';
 
 const PROGRESS_ID_PATTERN = /^codexprog_[0-9a-f]{32}$/;
 const LAST_EVENT_ID_PATTERN = /^(?:0|[1-9][0-9]{0,9})$/;
@@ -41,7 +46,8 @@ const SAFE_FAILURE_CODES = new Set([
   'CODEX_RESPONSE_MISSING', 'CODEX_SESSION_MISSING', 'CODEX_STDIN_FAILED',
   'CODEX_THREAD_MISSING', 'CODEX_TIMEOUT', 'CODEX_TIMEOUT_ACTIVE', 'CODEX_TIMEOUT_STARTING',
   'CODEX_TURN_FAILED', 'CODEX_UNAVAILABLE',
-  'SCRIPT_SCHEMA_INVALID'
+  'OLLAMA_FAILED', 'OLLAMA_TIMEOUT', 'OLLAMA_UNAVAILABLE',
+  'SCRIPT_SCHEMA_INVALID', 'SCRIPT_SESSION_NOT_ACTIVE', 'SCRIPT_SESSION_VERSION_LIMIT'
 ]);
 
 function httpError(message, statusCode, code) {
@@ -64,6 +70,11 @@ function safeEventMessage(definition, type, code, timeoutMinutes) {
   if (code === 'CODEX_TIMEOUT') {
     return `Codex 未能在 ${timeoutMinutes} 分钟内完成处理。`;
   }
+  if (code === 'OLLAMA_TIMEOUT') {
+    return `Ollama 未能在 ${timeoutMinutes} 分钟内完成处理。`;
+  }
+  if (code === 'OLLAMA_UNAVAILABLE') return '无法连接本机 Ollama 服务。';
+  if (code === 'OLLAMA_FAILED') return 'Ollama 本地模型未能完成本轮剧本处理。';
   return definition.message;
 }
 
@@ -86,6 +97,7 @@ function safeSnapshot(record, now) {
   const elapsedUntil = record.terminal ? record.updatedAt : now;
   const snapshot = {
     progressId: record.id,
+    provider: record.provider,
     detailLevel: record.detailLevel,
     model: record.model,
     reasoningEffort: record.reasoningEffort,
@@ -175,13 +187,20 @@ export class CodexProgressManager {
     }
   }
 
-  create({ projectId, chapterId, detailLevel, model, reasoningEffort, timeoutMinutes } = {}) {
+  create({ projectId, chapterId, provider, detailLevel, model, reasoningEffort, timeoutMinutes } = {}) {
     if (this.closed) throw httpError('Codex 进度服务正在关闭。', 503, 'CODEX_PROGRESS_UNAVAILABLE');
     const ownerProjectId = String(projectId || '');
     const ownerChapterId = String(chapterId || '');
     const normalizedDetailLevel = normalizeCodexDetailLevel(detailLevel);
-    const normalizedModel = normalizeCodexModel(model);
-    const normalizedReasoningEffort = normalizeCodexReasoningEffort(reasoningEffort);
+    const normalizedProvider = normalizeScriptSessionProvider(provider, {
+      fallback: 'codex', allowed: COLLABORATION_PROVIDERS
+    });
+    const normalizedModel = normalizedProvider === 'ollama'
+      ? normalizeOllamaModel(model)
+      : normalizeCodexModel(model);
+    const normalizedReasoningEffort = normalizedProvider === 'codex'
+      ? normalizeCodexReasoningEffort(reasoningEffort)
+      : null;
     const normalizedTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
     if (!ownerProjectId || !ownerChapterId) {
       throw httpError('Codex 进度缺少项目或章节边界。', 400, 'CODEX_PROGRESS_SCOPE_INVALID');
@@ -212,6 +231,7 @@ export class CodexProgressManager {
       id: `codexprog_${crypto.randomBytes(16).toString('hex')}`,
       projectId: ownerProjectId,
       chapterId: ownerChapterId,
+      provider: normalizedProvider,
       detailLevel: normalizedDetailLevel,
       model: normalizedModel,
       reasoningEffort: normalizedReasoningEffort,
@@ -285,6 +305,7 @@ export class CodexProgressManager {
     );
     const data = {
       progressId: record.id,
+      provider: record.provider,
       type: normalizedType,
       phase: normalizedPhase,
       message: publicMessage,

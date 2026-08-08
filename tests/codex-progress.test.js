@@ -84,6 +84,19 @@ test('Codex progress 只保存固定事件、限制同章并发并在 TTL 后清
   );
   assert.doesNotMatch(JSON.stringify(record.events), /小说原文|hidden chain|thread-secret|SECRET_ERROR/i);
 
+  const ollama = manager.create({
+    projectId: 'project_ollama', chapterId: 'chapter_ollama', provider: 'ollama', model: ''
+  });
+  assert.equal(ollama.provider, 'ollama');
+  assert.equal(ollama.model, 'qwen3:8b');
+  assert.equal(ollama.reasoningEffort, null);
+  assert.equal(manager.owned(ollama.progressId, 'project_ollama', 'chapter_ollama').events[0].data.provider, 'ollama');
+  manager.complete(ollama.progressId);
+  assert.throws(
+    () => manager.create({ projectId: 'bad', chapterId: 'bad', provider: 'ollama', model: '--remote' }),
+    (error) => error.code === 'OLLAMA_MODEL_INVALID'
+  );
+
   const next = manager.create({
     projectId: 'project_a', chapterId: 'chapter_a', timeoutMinutes: 120
   });

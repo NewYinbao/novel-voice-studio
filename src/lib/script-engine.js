@@ -18,8 +18,10 @@ import {
   codexTimeoutMinutesToMs,
   normalizeCodexModel,
   normalizeCodexReasoningEffort,
-  normalizeCodexTimeoutMinutes
+  normalizeCodexTimeoutMinutes,
+  normalizeOllamaModel
 } from './codex-options.js';
+import { assertScriptStructureLimits } from './script-limits.js';
 import { clamp, id, stripCodeFence } from './utils.js';
 
 const MODE_GUIDANCE = {
@@ -109,7 +111,8 @@ function sentenceLines(text) {
   const paragraphs = clean.split(/\n{2,}/).filter(Boolean);
   const lines = [];
   for (const paragraph of paragraphs) {
-    const sentences = paragraph.split(/(?<=[。！？!?…])\s*/u).filter(Boolean);
+    const sentences = paragraph.split(/(?<=[。！？!?…])\s*/u).filter(Boolean)
+      .flatMap((sentence) => sentence.length > 2_000 ? sentence.match(/[\s\S]{1,2000}/g) : [sentence]);
     let carry = '';
     for (const sentence of sentences) {
       const value = `${carry}${sentence}`.trim();
@@ -223,9 +226,33 @@ function scriptLineSnapshot(line = {}, roleById = new Map()) {
  * drops internal IDs/render state while preserving every user-editable field.
  */
 export function chapterToScriptSnapshot(chapter = {}, project = null) {
-  const sourceRoles = Array.isArray(chapter.roles)
+  const persistedScenes = Array.isArray(chapter.scenes) ? chapter.scenes : [];
+  const usedRoleIds = new Set(persistedScenes.flatMap((scene) => (
+    Array.isArray(scene?.lines) ? scene.lines.map((line) => String(line?.speakerId || '')).filter(Boolean) : []
+  )));
+  const usedRoleNames = new Set(persistedScenes.flatMap((scene) => (
+    Array.isArray(scene?.lines)
+      ? scene.lines.map((line) => String(line?.speaker || '').trim().toLowerCase()).filter(Boolean)
+      : []
+  )));
+  const availableRoles = Array.isArray(chapter.roles)
     ? chapter.roles
     : Array.isArray(project?.characters) ? project.characters : [];
+  const sourceRoles = availableRoles.filter((role) => (
+    role?.isNarrator
+    || usedRoleIds.has(String(role?.id || ''))
+    || [role?.name, ...(Array.isArray(role?.aliases) ? role.aliases : [])]
+      .some((name) => usedRoleNames.has(String(name || '').trim().toLowerCase()))
+  ));
+  const sourceWarnings = Array.isArray(chapter.warnings)
+    ? chapter.warnings
+    : Array.isArray(chapter.scriptWarnings) ? chapter.scriptWarnings : [];
+  assertScriptStructureLimits({
+    chapterTitle: chapter.chapterTitle || chapter.title,
+    roles: sourceRoles,
+    scenes: persistedScenes,
+    warnings: sourceWarnings
+  }, { maxSerializedBytes: null });
   const roleById = new Map(sourceRoles.map((role) => [String(role.id || ''), role]));
   const roles = sourceRoles.map((role) => ({
     name: scriptString(role.name, '待确认角色'),
@@ -233,7 +260,7 @@ export function chapterToScriptSnapshot(chapter = {}, project = null) {
     description: scriptString(role.description),
     isNarrator: Boolean(role.isNarrator || role.name === '旁白')
   }));
-  const scenes = (Array.isArray(chapter.scenes) ? chapter.scenes : []).map((scene, sceneIndex) => ({
+  const scenes = persistedScenes.map((scene, sceneIndex) => ({
     title: scriptString(scene.title, `场景 ${sceneIndex + 1}`),
     context: scriptString(scene.context),
     lines: (Array.isArray(scene.lines) ? scene.lines : []).map((line) => scriptLineSnapshot(line, roleById))
@@ -255,13 +282,14 @@ export function chapterToScriptSnapshot(chapter = {}, project = null) {
     roles.unshift({ name: '旁白', aliases: [], description: '全书叙述者', isNarrator: true });
   }
 
-  return {
+  const snapshot = {
     chapterTitle: scriptString(chapter.chapterTitle || chapter.title, '未命名章节'),
     roles,
     scenes,
-    warnings: (Array.isArray(chapter.warnings) ? chapter.warnings : Array.isArray(chapter.scriptWarnings) ? chapter.scriptWarnings : [])
-      .map((warning) => scriptString(warning))
+    warnings: sourceWarnings.map((warning) => scriptString(warning))
   };
+  assertScriptStructureLimits(snapshot);
+  return snapshot;
 }
 
 export function buildCodexFollowUpPrompt({ chapter, project = null, prompt = '' } = {}) {
@@ -534,7 +562,8 @@ export function parseCodexJsonl(value) {
 
 function normalizeAiScript(value, chapter) {
   const script = value && typeof value === 'object' ? value : {};
-  const roles = Array.isArray(script.roles) ? script.roles : [];
+  assertScriptStructureLimits(script);
+  const roles = Array.isArray(script.roles) ? [...script.roles] : [];
   if (!roles.some((role) => role.name === '旁白')) {
     roles.unshift({ name: '旁白', aliases: [], description: '全书叙述者', isNarrator: true });
   }
@@ -569,6 +598,7 @@ function normalizeAiScript(value, chapter) {
       code: 'SCRIPT_SCHEMA_INVALID'
     });
   }
+  assertScriptStructureLimits(normalized);
   return normalized;
 }
 
@@ -746,6 +776,7 @@ export async function runCodexSession({
   model,
   sessionId = '',
   prompt = '',
+  baselineCurrentScript = false,
   timeoutMinutes,
   timeoutMs,
   reasoningEffort,
@@ -775,7 +806,7 @@ export async function runCodexSession({
     reasoningEffort: normalizedReasoningEffort,
     sessionId: resumeId
   });
-  const stdin = resumeId
+  const stdin = resumeId || baselineCurrentScript
     ? buildCodexFollowUpPrompt({ chapter, project, prompt })
     : buildInitialSessionPrompt(chapter, mode, prompt);
   const redactionContext = normalizedDetailLevel === 'summary'
@@ -814,23 +845,159 @@ async function runCodex(chapter, settings, mode) {
   return result.script;
 }
 
+async function readBoundedResponseText(response, maxBytes) {
+  const declared = Number(response?.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw Object.assign(new Error('Ollama 返回内容超过安全上限。'), { code: 'CODEX_OUTPUT_TOO_LARGE' });
+  }
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw Object.assign(new Error('Ollama 返回内容超过安全上限。'), { code: 'CODEX_OUTPUT_TOO_LARGE' });
+    }
+    return text;
+  }
+  const chunks = [];
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    bytes += chunk.length;
+    if (bytes > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw Object.assign(new Error('Ollama 返回内容超过安全上限。'), { code: 'CODEX_OUTPUT_TOO_LARGE' });
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+export async function runOllamaSession({
+  chapter,
+  project = null,
+  settings = {},
+  mode = 'faithful',
+  model,
+  prompt = '',
+  baselineCurrentScript,
+  timeoutMinutes,
+  timeoutMs,
+  onProgress,
+  signal,
+  fetchImpl = fetch
+} = {}) {
+  if (!chapter || typeof chapter !== 'object') {
+    throw Object.assign(new Error('缺少待处理的章节。'), { code: 'CODEX_INPUT_INVALID' });
+  }
+  const selectedModel = normalizeOllamaModel(model ?? settings.ollamaModel);
+  const normalizedTimeoutMinutes = normalizeCodexTimeoutMinutes(timeoutMinutes);
+  const processTimeoutMs = timeoutMs === undefined
+    ? codexTimeoutMinutesToMs(normalizedTimeoutMinutes)
+    : normalizeCodexProcessTimeoutMs(timeoutMs);
+  const baseUrl = String(settings.ollamaUrl || '').trim().replace(/\/$/, '');
+  let serviceUrl;
+  try { serviceUrl = new URL(baseUrl); } catch { /* handled below */ }
+  if (
+    !serviceUrl
+    || !['http:', 'https:'].includes(serviceUrl.protocol)
+    || !['localhost', '127.0.0.1', '[::1]'].includes(serviceUrl.hostname)
+    || serviceUrl.username
+    || serviceUrl.password
+    || serviceUrl.hash
+    || serviceUrl.search
+    || !['', '/'].includes(serviceUrl.pathname)
+  ) {
+    throw Object.assign(new Error('Ollama 服务地址无效。'), { code: 'OLLAMA_UNAVAILABLE' });
+  }
+  const generateUrl = new URL('/api/generate', serviceUrl.origin);
+  if (signal?.aborted) {
+    throw Object.assign(new Error('本地模型请求已取消。'), { code: 'CODEX_CANCELLED' });
+  }
+
+  const currentScriptAvailable = baselineCurrentScript === undefined
+    ? Array.isArray(chapter.scenes) && chapter.scenes.length > 0
+    : Boolean(baselineCurrentScript);
+  const requestPrompt = currentScriptAvailable
+    ? buildCodexFollowUpPrompt({ chapter, project, prompt })
+    : buildInitialSessionPrompt(chapter, mode, prompt);
+  const schema = JSON.parse(await fsp.readFile(SCRIPT_SCHEMA_PATH, 'utf8'));
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortHandler = () => controller.abort();
+  signal?.addEventListener('abort', abortHandler, { once: true });
+  if (signal?.aborted) controller.abort();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, processTimeoutMs);
+  timer.unref?.();
+  const progress = (event) => {
+    if (typeof onProgress !== 'function') return;
+    try { onProgress(event); } catch { /* progress is best effort */ }
+  };
+
+  try {
+    progress({ type: 'stage', phase: 'analyzing' });
+    const response = await fetchImpl(generateUrl.href, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: selectedModel,
+        prompt: requestPrompt,
+        stream: false,
+        format: schema,
+        options: { temperature: 0.2, num_ctx: 16384 }
+      }),
+      signal: controller.signal,
+      redirect: 'error'
+    });
+    if (!response?.ok) {
+      throw Object.assign(new Error('Ollama 本地模型请求失败。'), { code: 'OLLAMA_FAILED' });
+    }
+    progress({ type: 'stage', phase: 'drafting' });
+    const raw = typeof response.text === 'function'
+      ? await readBoundedResponseText(response, CODEX_PROCESS_LIMITS.stdoutBytes)
+      : JSON.stringify(await response.json());
+    let result;
+    try { result = JSON.parse(raw); } catch {
+      throw Object.assign(new Error('Ollama 返回格式无效。'), { code: 'OLLAMA_FAILED' });
+    }
+    if (typeof result?.response !== 'string' || !result.response.trim()) {
+      throw Object.assign(new Error('Ollama 没有返回剧本内容。'), { code: 'OLLAMA_FAILED' });
+    }
+    progress({ type: 'stage', phase: 'validating' });
+    let parsedScript;
+    try { parsedScript = JSON.parse(stripCodeFence(result.response)); } catch {
+      throw Object.assign(new Error('Ollama 返回的剧本 JSON 无效。'), { code: 'SCRIPT_SCHEMA_INVALID' });
+    }
+    return {
+      script: normalizeAiScript(parsedScript, chapter),
+      threadId: null,
+      usage: null,
+      assistantText: result.response
+    };
+  } catch (error) {
+    if (signal?.aborted) {
+      throw Object.assign(new Error('本地模型请求已取消。'), { code: 'CODEX_CANCELLED' });
+    }
+    if (timedOut) {
+      throw Object.assign(new Error(`Ollama 未在 ${formatCodexTimeoutDuration(processTimeoutMs)}内完成。`), {
+        code: 'OLLAMA_TIMEOUT', timeoutMs: processTimeoutMs
+      });
+    }
+    if (error?.code) throw error;
+    throw Object.assign(new Error('无法连接本机 Ollama 服务。'), { code: 'OLLAMA_UNAVAILABLE' });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abortHandler);
+  }
+}
+
 async function runOllama(chapter, settings, mode) {
-  const schema = (await import('node:fs/promises')).readFile(SCRIPT_SCHEMA_PATH, 'utf8').then(JSON.parse);
-  const response = await fetch(`${settings.ollamaUrl.replace(/\/$/, '')}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: settings.ollamaModel,
-      prompt: buildCodexPrompt(chapter, mode),
-      stream: false,
-      format: await schema,
-      options: { temperature: 0.2, num_ctx: 16384 }
-    }),
-    signal: AbortSignal.timeout(10 * 60_000)
-  });
-  if (!response.ok) throw Object.assign(new Error(`Ollama 请求失败：HTTP ${response.status}`), { code: 'OLLAMA_FAILED' });
-  const result = await response.json();
-  return normalizeAiScript(JSON.parse(stripCodeFence(result.response)), chapter);
+  const result = await runOllamaSession({ chapter, settings, mode });
+  return result.script;
 }
 
 export async function convertChapter(chapter, { provider = 'rules', settings, mode = 'faithful' }) {
@@ -852,7 +1019,7 @@ export function normalizeImportedScript(value, chapter) {
   try {
     return normalizeAiScript(value, chapter);
   } catch (error) {
-    if (error.code === 'SCRIPT_SCHEMA_INVALID' && !error.statusCode) error.statusCode = 400;
+    if (error.code === 'SCRIPT_SCHEMA_INVALID') error.statusCode = 400;
     throw error;
   }
 }

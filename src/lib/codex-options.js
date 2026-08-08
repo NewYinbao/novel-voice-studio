@@ -1,4 +1,5 @@
 export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
+export const DEFAULT_OLLAMA_MODEL = 'qwen3:8b';
 export const DEFAULT_CODEX_REASONING_EFFORT = 'medium';
 export const CODEX_REASONING_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 export const DEFAULT_CODEX_TIMEOUT_MINUTES = 10;
@@ -20,6 +21,16 @@ export function normalizeCodexModel(value, { fallback = DEFAULT_CODEX_MODEL } = 
   const candidate = selected.trim();
   if (!MODEL_PATTERN.test(candidate)) {
     throw httpError('Codex 模型名称格式无效。', 'CODEX_MODEL_INVALID');
+  }
+  return candidate;
+}
+
+export function normalizeOllamaModel(value, { fallback = DEFAULT_OLLAMA_MODEL } = {}) {
+  const selected = value === undefined || value === null || value === '' ? fallback : value;
+  if (typeof selected !== 'string') throw httpError('Ollama 模型名称格式无效。', 'OLLAMA_MODEL_INVALID');
+  const candidate = selected.trim();
+  if (!MODEL_PATTERN.test(candidate)) {
+    throw httpError('Ollama 模型名称格式无效。', 'OLLAMA_MODEL_INVALID');
   }
   return candidate;
 }

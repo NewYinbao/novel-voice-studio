@@ -154,11 +154,13 @@ CosyVoice 3 是默认的硬件/质量推荐，但官方安装目标是 Linux，`
 
 RTX 5060 Ti 是 `sm_120`。很多旧 TTS 仓库锁定的 PyTorch、FlashAttention、xFormers 二进制包不包含该架构。安装脚本优先使用 CUDA 13.0 PyTorch，并在 Qwen3-TTS 中使用原生 SDPA，避免强装旧 `flash-attn` wheel。
 
-## Codex 剧本润色
+## 剧本生成与协作
 
-剧本处理有四条路径：本地规则引擎、Codex 剧本协作室、Codex 任务包手工交接，以及本地 Ollama。润色档位与处理路径彼此独立，均可选择忠实朗读、轻度剧本化或广播剧化。
+制作台把剧本处理分成两类入口：**规则一键生成**适合立即完成说话人、情绪和停顿的基础标注；**剧本协作室**则统一承载 Codex 与本地 Ollama，可在同一界面切换后端并进行多轮调整。Codex 任务包与 JSON 导入继续作为手工交接路径。润色档位与后端彼此独立，均可选择忠实朗读、轻度剧本化或广播剧化。
 
-Codex 剧本协作室使用带项目与章节 ID 的独立页面路由，刷新、浏览器前进后退或从制作台重新进入时都能恢复当前章节。首次运行 `codex exec --sandbox read-only --json --output-schema ... -`，从 JSONL 中记录 `thread_id`；后续通过 `codex exec resume <SESSION_ID>` 在同一个 session 中继续调整。左侧按 Session 展示整个项目的版本线，章节名仅作为归属标签；同一章节可保留多个 Session 版本，切换时会恢复对应剧本快照。中间对话与右侧逐句剧本之间的分隔线可拖拽或用方向键调整，比例保存在当前浏览器。页面支持每轮选择模型、推理强度和超时时间，并在右侧手工修改台词、角色、情绪、强度、语速和停顿。下一轮会把制作台中的最新完整剧本带回同一 session，因此人工改动会成为新的编辑基线。
+剧本协作室使用带项目与章节 ID 的独立页面路由，刷新、浏览器前进后退或从制作台重新进入时都能恢复当前章节。Codex 首次运行 `codex exec --sandbox read-only --json --output-schema ... -` 并记录 `thread_id`，后续通过 `codex exec resume <SESSION_ID>` 继续调整；本地 Ollama 不依赖远程 thread，每轮都以制作台中的最新完整剧本为基线。左侧按 Session 展示整个项目的版本线，章节名仅作为归属标签；每次规则生成、JSON 导入以及每个新建的 Codex/Ollama Session 都会保存独立剧本快照，同一 Session 内的多轮对话则持续推进这条版本线。恢复版本只切换剧本内容，不会回滚项目级角色音色绑定。中间对话与右侧逐句剧本之间的分隔线可拖拽或用方向键调整，比例保存在当前浏览器。
+
+制作台右侧提供可显示或隐藏的“角色音色绑定”侧栏。它可以查看整个项目出现过的角色，也可以筛选为仅当前章节出现的角色；多项选择先保存在本地草稿中，点击保存后一次性原子写入，任一角色或音色无效时不会产生部分绑定。
 
 新会话默认显式使用 `gpt-5.6-terra` 与 `medium`，不会受用户级 `config.toml` 中的模型或推理强度影响。界面可选择 `low`、`medium`、`high`、`xhigh` 或 `max`；其中 `medium` 是质量与速度的推荐平衡点，`max` 最慢，只适合质量优先的困难章节。模型、推理强度和超时时间会随会话保存，并在任务进度卡中显示本轮实际快照。
 
@@ -168,7 +170,7 @@ Codex 剧本协作室使用带项目与章节 ID 的独立页面路由，刷新�
 
 Windows 下会先探测设置中的命令；默认 `codex` 若命中不可启动的 WindowsApps 副本，还会自动搜索 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`。未登录时，可在 Codex 剧本协作室或模型中心点击“登录 Codex”：本地服务会启动官方 `codex login` 浏览器认证，并在界面中等待结果。若 CLI 没有自动唤起系统浏览器，工作台会从 CLI 输出中提取、严格校验本次临时的 OpenAI 官方授权地址，再打开独立标签页；弹窗内也会保留手动打开入口。授权地址只存在于当前登录进程的内存中，完成、取消或超时后立即清除。账号、密码、验证码和令牌始终由 OpenAI 登录页与 Codex CLI 处理，不会进入本项目的页面、日志或项目数据。缓存目录名可能随 Codex App 更新变化，不要手工硬编码哈希目录。认证方式见 [OpenAI Authentication](https://learn.chatgpt.com/docs/auth)。
 
-直接使用 Codex 会把当前章节原文以及后续轮次的当前剧本发送给已登录的 Codex 服务；本地规则和 Ollama 路径不会。任务包只有在你主动复制给 Codex 时才会离开本机。
+直接使用 Codex 会把当前章节原文以及后续轮次的当前剧本发送给已登录的 Codex 服务；规则和 Ollama 后端仅在本机处理。任务包只有在你主动复制给 Codex 时才会离开本机。
 
 直接协作进程会在独立的空临时工作目录运行，只继承登录、网络和系统运行所需的环境变量，并忽略用户配置/规则，关闭 shell、Apps、浏览器、计算机控制、图像生成和 hooks；它只通过标准输入接收当前章节，并读取复制后的剧本 Schema。这样不会把项目目录或其他应用环境变量暴露给本轮剧本任务。
 
@@ -186,7 +188,7 @@ novel-voice-studio/
 │     ├─ novel.js          # 文本解码、章节拆分
 │     ├─ epub.js           # 安全的最小 EPUB 解析器
 │     ├─ script-engine.js  # 规则、Codex、Ollama 剧本 Provider
-│     ├─ codex-sessions.js # Codex 会话记录、轮次摘要与持久化边界
+│     ├─ codex-sessions.js # 通用剧本 Session、版本快照与持久化边界
 │     ├─ store.js          # 原子 JSON 持久化与音色版本
 │     ├─ tts.js            # 逐句缓存、工作器调用与队列
 │     ├─ video-voice.js    # 长媒体流式上传、裁剪任务与临时素材
@@ -215,12 +217,14 @@ POST   /api/projects/:id/script
 GET    /api/projects/:id/chapters/:chapterId/codex-sessions
 POST   /api/projects/:id/chapters/:chapterId/codex-sessions
 POST   /api/projects/:id/chapters/:chapterId/codex-sessions/:sessionId/messages
+POST   /api/projects/:id/chapters/:chapterId/codex-sessions/:sessionId/activate
 GET    /api/projects/:id/chapters/:chapterId/codex-progress
 GET    /api/projects/:id/chapters/:chapterId/codex-progress/:progressId
 GET    /api/projects/:id/chapters/:chapterId/codex-package
 POST   /api/projects/:id/chapters/:chapterId/script-import
 PATCH  /api/projects/:id/lines/:lineId
 PATCH  /api/projects/:id/characters/:roleId
+PATCH  /api/projects/:id/characters/voices
 POST   /api/voices
 POST   /api/voice-sources?fileName=...
 POST   /api/voice-sources/:sourceId/extract
