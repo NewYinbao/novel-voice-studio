@@ -111,7 +111,9 @@ export function mediaType(filePath) {
     '.webp': 'image/webp',
     '.wav': 'audio/wav',
     '.mp3': 'audio/mpeg',
+    '.m4a': 'audio/mp4',
     '.m4b': 'audio/mp4',
+    '.flac': 'audio/flac',
     '.webm': 'audio/webm',
     '.ogg': 'audio/ogg'
   }[ext] || 'application/octet-stream';

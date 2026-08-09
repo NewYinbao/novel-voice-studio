@@ -19,6 +19,12 @@ const {
   claimVoiceSource, cleanupExpiredVoiceSources, deleteVoiceSource, saveVoiceSource, validateVoiceExtraction
 } = await import('../src/lib/video-voice.js');
 const { createServer } = await import('../src/server.js');
+const { mediaType } = await import('../src/lib/utils.js');
+
+test('音色参考音频为 M4A 或 FLAC 时返回浏览器可播放的 MIME', () => {
+  assert.equal(mediaType('reference.m4a'), 'audio/mp4');
+  assert.equal(mediaType('reference.flac'), 'audio/flac');
+});
 
 function makeStoredZip(entries) {
   const locals = [];

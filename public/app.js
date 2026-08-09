@@ -126,6 +126,9 @@ const state = {
   voiceBindingDraft: new Map(),
   voiceBindingSaving: false,
   voiceBindingProjectId: '',
+  voiceBindingPickerRoleId: '',
+  voiceBindingPreview: null,
+  voiceBindingPreviewRequestId: 0,
   modalTrigger: null
 };
 
@@ -275,7 +278,10 @@ function resetPlayback() {
   audio.removeAttribute('src');
   audio.load();
   state.loadedAudio = null;
+  state.voiceBindingPreview = null;
+  state.voiceBindingPreviewRequestId += 1;
   $('.play-main').textContent = '▶';
+  syncVoiceBindingPreviewButtons();
 }
 
 async function refreshBootstrap({ render = false } = {}) {
@@ -2165,6 +2171,115 @@ function effectiveRoleVoiceId(role) {
   return state.voiceBindingDraft.has(role.id) ? state.voiceBindingDraft.get(role.id) || null : role.voiceId || null;
 }
 
+function voiceBindingOptionsId(roleId) {
+  return `voice-binding-options-${String(roleId || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+}
+
+function voiceBindingPreviewIsActive(roleId, voiceId) {
+  const audio = $('#audio-player');
+  return Boolean(audio && !audio.paused && state.voiceBindingPreview?.roleId === roleId && state.voiceBindingPreview?.voiceId === voiceId);
+}
+
+function syncVoiceBindingPreviewButtons() {
+  const audio = $('#audio-player');
+  $$('[data-action="preview-binding-voice"]').forEach((button) => {
+    const voice = state.bootstrap?.voices?.find((item) => item.id === button.dataset.voiceId);
+    const hasSample = Boolean(voice?.reference?.mediaUrl);
+    if (!hasSample) {
+      button.classList.remove('playing');
+      button.setAttribute('aria-pressed', 'false');
+      button.setAttribute('aria-label', `音色 ${voice?.name || ''} 没有可试听样音`.trim());
+      button.innerHTML = '<span aria-hidden="true">—</span><span>无样音</span>';
+      return;
+    }
+    const active = Boolean(audio && !audio.paused && state.voiceBindingPreview?.roleId === button.dataset.roleId
+      && state.voiceBindingPreview?.voiceId === button.dataset.voiceId);
+    button.classList.toggle('playing', active);
+    button.setAttribute('aria-pressed', String(active));
+    button.innerHTML = `<span aria-hidden="true">${active ? 'Ⅱ' : '▶'}</span><span>${active ? '暂停' : '试听'}</span>`;
+    if (voice) button.setAttribute('aria-label', `${active ? '暂停' : '试听'}音色：${voice.name}`);
+  });
+}
+
+function restoreTransportAfterVoicePreview() {
+  if (state.selectedLineId && findLine(state.selectedLineId)) {
+    updateTransportForSelection();
+    return;
+  }
+  const title = $('#transport-title');
+  const subtitle = $('#transport-subtitle');
+  if (title) title.textContent = '尚未选择片段';
+  if (subtitle) subtitle.textContent = '选择一句台词开始试听';
+}
+
+function stopVoiceBindingPreview({ clear = true } = {}) {
+  const audio = $('#audio-player');
+  state.voiceBindingPreviewRequestId += 1;
+  if (state.loadedAudio?.kind !== 'voice-binding') {
+    state.voiceBindingPreview = null;
+    syncVoiceBindingPreviewButtons();
+    return;
+  }
+  audio.pause();
+  state.voiceBindingPreview = null;
+  if (clear) {
+    state.loadedAudio = null;
+    audio.removeAttribute('src');
+    audio.load();
+    restoreTransportAfterVoicePreview();
+  }
+  syncVoiceBindingPreviewButtons();
+}
+
+function closeVoiceBindingPicker({ focus = false } = {}) {
+  const roleId = state.voiceBindingPickerRoleId;
+  if (!roleId) return;
+  state.voiceBindingPickerRoleId = '';
+  const trigger = $(`[data-action="toggle-binding-voice-picker"][data-role-id="${CSS.escape(roleId)}"]`);
+  const menu = $(`#${CSS.escape(voiceBindingOptionsId(roleId))}`);
+  trigger?.setAttribute('aria-expanded', 'false');
+  if (menu) menu.hidden = true;
+  if (focus) trigger?.focus();
+}
+
+async function playVoiceBindingPreview(roleId, voiceId) {
+  const voice = state.bootstrap?.voices?.find((item) => item.id === voiceId);
+  const mediaUrl = voice?.reference?.mediaUrl;
+  if (!voice || !mediaUrl) {
+    toast('没有可试听样音', '这个音色尚未包含参考录音。', 'warn');
+    return;
+  }
+  const audio = $('#audio-player');
+  if (voiceBindingPreviewIsActive(roleId, voiceId)) {
+    state.voiceBindingPreviewRequestId += 1;
+    state.voiceBindingPreview = null;
+    audio.pause();
+    syncVoiceBindingPreviewButtons();
+    return;
+  }
+  stopVoiceBindingPreview({ clear: true });
+  const requestId = ++state.voiceBindingPreviewRequestId;
+  audio.src = mediaUrl;
+  state.loadedAudio = { kind: 'voice-binding', id: roleId, voiceId, url: mediaUrl };
+  state.voiceBindingPreview = { roleId, voiceId, requestId };
+  $('#transport').hidden = false;
+  $('#transport-title').textContent = voice.name;
+  $('#transport-subtitle').textContent = '角色绑定 · 音色参考原声';
+  syncVoiceBindingPreviewButtons();
+  try {
+    await audio.play();
+    if (requestId !== state.voiceBindingPreviewRequestId) return;
+    syncVoiceBindingPreviewButtons();
+  } catch (error) {
+    if (requestId !== state.voiceBindingPreviewRequestId
+      || state.voiceBindingPreview?.roleId !== roleId
+      || state.voiceBindingPreview?.voiceId !== voiceId) return;
+    stopVoiceBindingPreview({ clear: true });
+    if (error?.name === 'AbortError') return;
+    toast('无法试听音色', error.message || '浏览器未能播放这个参考音频。', 'error');
+  }
+}
+
 function voiceBindingDrawerHtml() {
   if (!state.voiceBindingOpen) return '';
   const counts = characterOccurrenceCounts();
@@ -2178,11 +2293,28 @@ function voiceBindingDrawerHtml() {
     const chapterCount = counts.chapterCounts.get(role.id) || 0;
     const projectCount = counts.projectCounts.get(role.id) || 0;
     const ready = voiceIsReady(selectedVoice);
+    const pickerOpen = state.voiceBindingPickerRoleId === role.id;
+    const pickerId = voiceBindingOptionsId(role.id);
+    const voiceOptions = voices.map((voice) => {
+      const selected = voice.id === selectedVoiceId;
+      const hasSample = Boolean(voice.reference?.mediaUrl);
+      const active = voiceBindingPreviewIsActive(role.id, voice.id);
+      return `<div class="voice-binding-option ${selected ? 'selected' : ''}">
+        <button type="button" class="voice-binding-choice" data-action="choose-binding-voice" data-role-id="${escapeHtml(role.id)}" data-voice-id="${escapeHtml(voice.id)}" aria-pressed="${selected}"><span><strong>${escapeHtml(voice.name)}</strong><small>${voiceIsReady(voice) ? '可用于生成' : '音色未就绪'}</small></span>${selected ? '<i aria-hidden="true">✓</i>' : ''}</button>
+        <button type="button" class="voice-binding-preview ${active ? 'playing' : ''}" data-action="preview-binding-voice" data-role-id="${escapeHtml(role.id)}" data-voice-id="${escapeHtml(voice.id)}" aria-label="${hasSample ? `${active ? '暂停' : '试听'}音色：${escapeHtml(voice.name)}` : `音色 ${escapeHtml(voice.name)} 没有可试听样音`}" aria-pressed="${active}" ${hasSample ? '' : 'disabled title="无参考音频"'}><span aria-hidden="true">${hasSample ? active ? 'Ⅱ' : '▶' : '—'}</span><span>${hasSample ? active ? '暂停' : '试听' : '无样音'}</span></button>
+      </div>`;
+    }).join('');
     return `<div class="voice-binding-row ${ready ? 'ready' : 'unbound'}">
       <span class="voice-binding-avatar" style="--speaker:${escapeHtml(role.color || '#78dfc9')}">${escapeHtml([...(role.name || '角')][0])}</span>
       <div class="voice-binding-role"><strong>${escapeHtml(role.name)}</strong><small>本章 ${chapterCount} 行 · 全书 ${projectCount} 行</small></div>
       <span class="voice-binding-state">${ready ? '就绪' : selectedVoiceId ? '音色未就绪' : '未绑定'}</span>
-      <label><span class="sr-only">为 ${escapeHtml(role.name)} 选择音色</span><select class="select-field" data-character-voice="${escapeHtml(role.id)}" ${state.voiceBindingSaving ? 'disabled' : ''}><option value="">不绑定</option>${voices.map((voice) => `<option value="${escapeHtml(voice.id)}" ${voice.id === selectedVoiceId ? 'selected' : ''}>${escapeHtml(voice.name)}${voiceIsReady(voice) ? '' : ' · 未就绪'}</option>`).join('')}</select></label>
+      <div class="voice-binding-picker">
+        <button type="button" class="voice-binding-picker-button" data-action="toggle-binding-voice-picker" data-role-id="${escapeHtml(role.id)}" aria-label="为 ${escapeHtml(role.name)} 选择音色，当前${selectedVoice ? `为 ${escapeHtml(selectedVoice.name)}` : '未绑定'}" aria-expanded="${pickerOpen}" aria-controls="${escapeHtml(pickerId)}" ${state.voiceBindingSaving ? 'disabled' : ''}><span><small>角色音色</small><strong>${escapeHtml(selectedVoice?.name || '不绑定')}</strong></span><i aria-hidden="true">${pickerOpen ? '⌃' : '⌄'}</i></button>
+        <div class="voice-binding-options" id="${escapeHtml(pickerId)}" role="group" aria-label="为 ${escapeHtml(role.name)} 选择并试听音色" ${pickerOpen ? '' : 'hidden'}>
+          <div class="voice-binding-option ${selectedVoiceId ? '' : 'selected'}"><button type="button" class="voice-binding-choice" data-action="choose-binding-voice" data-role-id="${escapeHtml(role.id)}" data-voice-id="" aria-pressed="${!selectedVoiceId}"><span><strong>不绑定</strong><small>清除这个角色的音色</small></span>${selectedVoiceId ? '' : '<i aria-hidden="true">✓</i>'}</button><button type="button" class="voice-binding-preview" aria-label="不绑定选项没有试听音频" disabled><span aria-hidden="true">—</span><span>无样音</span></button></div>
+          ${voiceOptions || '<p class="voice-binding-no-options">音色库为空，请先制作音色。</p>'}
+        </div>
+      </div>
     </div>`;
   }).join('');
   return `<div class="voice-binding-scrim" data-action="close-voice-binding" aria-hidden="true"></div><aside class="voice-binding-drawer" role="dialog" aria-modal="false" aria-labelledby="voice-binding-title">
@@ -3235,6 +3367,8 @@ async function runRulesScript() {
 
 function closeVoiceBindingDrawer() {
   const dirtyCount = voiceBindingDraftEntries().length;
+  stopVoiceBindingPreview({ clear: true });
+  state.voiceBindingPickerRoleId = '';
   state.voiceBindingOpen = false;
   renderView();
   requestAnimationFrame(() => $('[data-action="toggle-voice-binding"]')?.focus());
@@ -3243,6 +3377,8 @@ function closeVoiceBindingDrawer() {
 
 function discardVoiceBindings() {
   if (state.voiceBindingSaving) return;
+  stopVoiceBindingPreview({ clear: true });
+  state.voiceBindingPickerRoleId = '';
   state.voiceBindingDraft.clear();
   renderView();
   requestAnimationFrame(() => $('[data-action="discard-voice-bindings"]')?.focus());
@@ -3252,6 +3388,8 @@ async function saveVoiceBindings() {
   if (state.voiceBindingSaving || !state.project) return;
   const assignments = voiceBindingDraftEntries();
   if (!assignments.length) return;
+  stopVoiceBindingPreview({ clear: true });
+  state.voiceBindingPickerRoleId = '';
   state.voiceBindingSaving = true;
   renderView();
   try {
@@ -3361,6 +3499,12 @@ function scheduleLineSave(lineId, patch) {
 }
 
 function updateTransportForSelection() {
+  if (state.loadedAudio?.kind === 'voice-binding') {
+    const voice = state.bootstrap?.voices?.find((item) => item.id === state.loadedAudio.voiceId);
+    $('#transport-title').textContent = voice?.name || '音色参考原声';
+    $('#transport-subtitle').textContent = '角色绑定 · 音色参考原声';
+    return;
+  }
   const line = findLine(state.selectedLineId);
   if (!line) return;
   $('#transport-title').textContent = line.spokenText || '空白片段';
@@ -3752,9 +3896,41 @@ document.addEventListener('click', async (event) => {
     }
     if (action === 'open-collaboration-room') { openCodexStudio('faithful'); return; }
     if (action === 'toggle-voice-binding') {
-      state.voiceBindingOpen = !state.voiceBindingOpen;
+      if (state.voiceBindingOpen) { closeVoiceBindingDrawer(); return; }
+      state.voiceBindingOpen = true;
+      state.voiceBindingPickerRoleId = '';
       renderView();
       if (state.voiceBindingOpen) requestAnimationFrame(() => $('.voice-binding-drawer select, .voice-binding-drawer button')?.focus());
+      return;
+    }
+    if (action === 'toggle-binding-voice-picker') {
+      stopVoiceBindingPreview({ clear: true });
+      state.voiceBindingPickerRoleId = state.voiceBindingPickerRoleId === target.dataset.roleId ? '' : target.dataset.roleId;
+      renderView();
+      requestAnimationFrame(() => {
+        const roleId = target.dataset.roleId;
+        const picker = $(`[data-action="toggle-binding-voice-picker"][data-role-id="${CSS.escape(roleId)}"]`);
+        if (state.voiceBindingPickerRoleId === roleId) $(`#${CSS.escape(voiceBindingOptionsId(roleId))} .voice-binding-choice`)?.focus();
+        else picker?.focus();
+      });
+      return;
+    }
+    if (action === 'choose-binding-voice') {
+      const role = state.project?.characters.find((item) => item.id === target.dataset.roleId);
+      if (!role || state.voiceBindingSaving) return;
+      const voiceId = target.dataset.voiceId || null;
+      if (voiceId && !state.bootstrap?.voices?.some((voice) => voice.id === voiceId)) return;
+      stopVoiceBindingPreview({ clear: true });
+      if ((role.voiceId || null) === voiceId) state.voiceBindingDraft.delete(role.id);
+      else state.voiceBindingDraft.set(role.id, voiceId);
+      state.voiceBindingPickerRoleId = '';
+      renderView();
+      requestAnimationFrame(() => $(`[data-action="toggle-binding-voice-picker"][data-role-id="${CSS.escape(role.id)}"]`)?.focus());
+      return;
+    }
+    if (action === 'preview-binding-voice') {
+      event.stopPropagation();
+      await playVoiceBindingPreview(target.dataset.roleId, target.dataset.voiceId);
       return;
     }
     if (action === 'close-voice-binding') { closeVoiceBindingDrawer(); return; }
@@ -4003,6 +4179,8 @@ document.addEventListener('change', async (event) => {
     return;
   }
   if (input.id === 'voice-binding-chapter-only') {
+    stopVoiceBindingPreview({ clear: true });
+    state.voiceBindingPickerRoleId = '';
     state.voiceBindingChapterOnly = input.checked;
     renderView();
     requestAnimationFrame(() => $('#voice-binding-chapter-only')?.focus());
@@ -4091,6 +4269,8 @@ document.addEventListener('click', async (event) => {
 });
 
 document.addEventListener('click', (event) => {
+  const clickedInsideVoiceBindingPicker = event.composedPath().some((node) => node instanceof Element && node.classList?.contains('voice-binding-picker'));
+  if (state.voiceBindingPickerRoleId && !clickedInsideVoiceBindingPicker) closeVoiceBindingPicker();
   const zone = event.target.closest('#book-drop-zone, #voice-drop-zone, #voice-source-drop-zone');
   if (!zone || event.target.matches('input')) return;
   if (zone.id === 'book-drop-zone') $('#modal-book-file')?.click();
@@ -4100,7 +4280,8 @@ document.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
-    if ($('#modal-root .codex-login-modal')) dismissCodexLogin();
+    if (state.voiceBindingPickerRoleId) closeVoiceBindingPicker({ focus: true });
+    else if ($('#modal-root .codex-login-modal')) dismissCodexLogin();
     else if ($('#modal-root .modal')) closeModal();
     else if ($('#job-drawer').classList.contains('open')) closeJobs();
     else if (state.voiceBindingOpen) closeVoiceBindingDrawer();
@@ -4165,8 +4346,26 @@ audio.addEventListener('timeupdate', () => {
   $('#transport-progress').style.width = `${ratio * 100}%`;
   $('#transport-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
 });
-audio.addEventListener('ended', () => { $('.play-main').textContent = '▶'; });
-audio.addEventListener('pause', () => { if (!audio.ended) $('.play-main').textContent = '▶'; });
+audio.addEventListener('ended', () => {
+  $('.play-main').textContent = '▶';
+  const expectedUrl = state.loadedAudio?.kind === 'voice-binding'
+    ? new URL(state.loadedAudio.url, location.href).href : '';
+  if (expectedUrl && audio.ended && (!audio.currentSrc || audio.currentSrc === expectedUrl)) {
+    state.voiceBindingPreviewRequestId += 1;
+    state.voiceBindingPreview = null;
+    syncVoiceBindingPreviewButtons();
+  }
+});
+audio.addEventListener('pause', () => {
+  if (!audio.ended) $('.play-main').textContent = '▶';
+});
+audio.addEventListener('error', () => {
+  if (state.loadedAudio?.kind !== 'voice-binding' || !state.voiceBindingPreview) return;
+  const expectedUrl = new URL(state.loadedAudio.url, location.href).href;
+  if (audio.currentSrc !== expectedUrl) return;
+  stopVoiceBindingPreview({ clear: true });
+  toast('样音播放失败', '参考音频无法由当前浏览器解码，请检查音频格式。', 'error');
+});
 
 window.addEventListener('hashchange', async () => {
   if ($('#modal-root .codex-login-modal')) closeModal();
