@@ -82,6 +82,7 @@ const state = {
   codexSessionScriptRequests: new Map(),
   codexProjectRefreshSequence: 0,
   codexProjectRefreshApplied: new Map(),
+  codexSessionSelectionRequestId: 0,
   codexDrafts: new Map(),
   codexErrorsBySession: new Map(),
   codexProvider: 'codex',
@@ -2436,7 +2437,7 @@ function inspectorHtml() {
 
 function syncStudioLineSelection() {
   if (state.view !== 'studio') return;
-  $('.script-line.selected').forEach((item) => {
+  $$('.script-line.selected').forEach((item) => {
     item.classList.remove('selected');
     item.setAttribute('aria-current', 'false');
   });
@@ -2824,11 +2825,19 @@ function renderCodexStudio({ focus = '' } = {}) {
   if (state.view !== 'codex') return;
   updateTopbar();
   const main = $('#app-main');
-  main.innerHTML = `<section class="codex-room-page codex-room-surface">${codexStudioHtml()}</section>`;
+  const existingRoom = $('.codex-room-surface', main);
+  const sessionListScrollTop = existingRoom ? $('.codex-session-list', existingRoom)?.scrollTop ?? 0 : null;
+  const html = codexStudioHtml();
+  if (existingRoom) existingRoom.innerHTML = html;
+  else main.innerHTML = `<section class="codex-room-page codex-room-surface">${html}</section>`;
   $('#transport').hidden = true;
   startCodexProgressElapsedTimer();
   requestAnimationFrame(() => {
     setupCodexSplitters();
+    if (sessionListScrollTop !== null) {
+      const sessionList = $('.codex-session-list');
+      if (sessionList) sessionList.scrollTop = sessionListScrollTop;
+    }
     const conversation = $('#codex-conversation');
     if (conversation) conversation.scrollTop = conversation.scrollHeight;
     if (focus === 'composer') $('#codex-chat-prompt')?.focus();
@@ -2934,6 +2943,20 @@ async function selectCodexSession(sessionId, chapterId = '') {
   if (!target) return;
   if (sessionId === state.codexVersionId && target.chapterId === currentChapter()?.id) return;
   rememberCodexComposer();
+  const selectionRequestId = ++state.codexSessionSelectionRequestId;
+  const targetButton = $(`.codex-session-item[data-session-id="${CSS.escape(sessionId)}"][data-chapter-id="${CSS.escape(target.chapterId)}"]`);
+  targetButton?.setAttribute('aria-busy', 'true');
+  try {
+    await loadCodexSessionScript(sessionId, target.chapterId);
+  } catch {
+    if (selectionRequestId === state.codexSessionSelectionRequestId) {
+      toast('版本快照暂时无法读取', '当前页面保持不变；可稍后重新选择此 Session。', 'warn');
+    }
+    return;
+  } finally {
+    targetButton?.removeAttribute('aria-busy');
+  }
+  if (selectionRequestId !== state.codexSessionSelectionRequestId || state.view !== 'codex') return;
   state.selectedChapterId = target.chapterId;
   state.codexCollapsedChapters.delete(target.chapterId);
   state.codexVersionId = sessionId;
@@ -2949,15 +2972,11 @@ async function selectCodexSession(sessionId, chapterId = '') {
   state.codexError = state.codexErrorsBySession.get(codexProgressKey(state.project?.id, target.chapterId, sessionId)) || '';
   const hash = `#/codex/${state.project.id}/${target.chapterId}`;
   if (location.hash !== hash) history.pushState(null, '', hash);
-  renderCodexStudio();
-  try {
-    await loadCodexSessionScript(sessionId, target.chapterId);
-  } catch {
-    toast('版本快照暂时无法读取', '没有切换活动版本；可稍后重新选择此 Session。', 'warn');
-  }
-  if (state.codexVersionId !== sessionId || currentChapter()?.id !== target.chapterId) return;
   renderCodexStudio({ focus: 'composer' });
-  if (state.codexSessionId) void recoverCodexProgress();
+  const selectedProgress = currentCodexProgress();
+  if (state.codexSessionId && (sessionHasActiveRun(session) || codexProgressIsActive(selectedProgress))) {
+    void recoverCodexProgress();
+  }
 }
 
 async function activateCodexSession(sessionId, chapterId) {
