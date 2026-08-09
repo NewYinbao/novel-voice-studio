@@ -2367,7 +2367,7 @@ function studioHtml() {
         </div>
         <div class="script-scroll">${scriptContentHtml(chapter)}</div>
       </section>
-      <aside class="inspector">${inspectorHtml()}</aside>
+      <aside class="inspector" data-inspected-line-id="${escapeHtml(state.selectedLineId || '')}">${inspectorHtml()}</aside>
     </div>
     ${voiceBindingDrawerHtml()}
   </section>`;
@@ -2399,7 +2399,7 @@ function scriptLineHtml(line) {
   const selected = line.id === state.selectedLineId;
   const initial = [...(role.name || '旁')][0];
   const pause = line.pauseAfterMs >= 1000 ? `${(line.pauseAfterMs / 1000).toFixed(1)}秒停顿` : `${line.pauseAfterMs || 0}ms 停顿`;
-  return `<article class="script-line ${selected ? 'selected' : ''}" style="--speaker:${role.color || '#78dfc9'}" data-action="select-line" data-line-id="${line.id}">
+  return `<article class="script-line ${selected ? 'selected' : ''}" style="--speaker:${role.color || '#78dfc9'}" data-action="select-line" data-line-id="${line.id}" aria-current="${selected}">
     <span class="render-dot ${line.render?.status || 'idle'}"></span>
     <span class="speaker-avatar">${escapeHtml(initial)}</span>
     <div class="line-main"><div class="line-meta"><span class="speaker-name">${escapeHtml(role.name)}</span><span class="line-kind">${line.kind === 'dialogue' ? '对白' : '旁白'}</span>${line.needsReview ? '<span class="review-flag">待确认角色</span>' : ''}${line.render?.demo ? '<span class="review-flag">演示音轨</span>' : ''}</div>
@@ -2432,6 +2432,45 @@ function inspectorHtml() {
       <div class="form-label" style="margin-top:16px"><span>句后停顿</span></div><div class="range-row"><input type="range" min="0" max="2500" step="50" value="${line.pauseAfterMs || 0}" data-line-field="pauseAfterMs" data-line-id="${line.id}"><span class="range-value">${line.pauseAfterMs || 0}ms</span></div>
     </div>
     <div class="form-section"><button class="button primary" style="width:100%" data-action="render-line" data-line-id="${line.id}">◉ 生成并试听这一句</button></div>`;
+}
+
+function syncStudioLineSelection() {
+  if (state.view !== 'studio') return;
+  $('.script-line.selected').forEach((item) => {
+    item.classList.remove('selected');
+    item.setAttribute('aria-current', 'false');
+  });
+  const selected = state.selectedLineId
+    ? $(`.script-line[data-line-id="${CSS.escape(state.selectedLineId)}"]`)
+    : null;
+  selected?.classList.add('selected');
+  selected?.setAttribute('aria-current', 'true');
+  const audio = $('#audio-player');
+  if (state.loadedAudio?.kind === 'line' && state.loadedAudio.id !== state.selectedLineId) {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    state.loadedAudio = null;
+    $('.play-main').textContent = '▶';
+  }
+  const inspector = $('.inspector');
+  if (inspector) {
+    inspector.innerHTML = inspectorHtml();
+    inspector.dataset.inspectedLineId = state.selectedLineId || '';
+    inspector.scrollTop = 0;
+  }
+  updateTransportForSelection();
+}
+
+function selectStudioLine(lineId) {
+  if (!lineId || !findLine(lineId)) return false;
+  const selected = $('.script-line.selected');
+  const inspector = $('.inspector');
+  const domIsAligned = selected?.dataset.lineId === lineId && inspector?.dataset.inspectedLineId === lineId;
+  if (state.selectedLineId === lineId && domIsAligned) return false;
+  state.selectedLineId = lineId;
+  syncStudioLineSelection();
+  return true;
 }
 
 function voicesHtml() {
@@ -3522,14 +3561,14 @@ async function playLine(lineId) {
   if (!line?.render?.mediaUrl) {
     toast('还没有音频', '先点击生成按钮为这一句创建音频。', 'warn'); return;
   }
-  const selectionChanged = state.selectedLineId !== lineId;
-  state.selectedLineId = lineId;
-  if (selectionChanged && state.view === 'studio') renderView();
+  selectStudioLine(lineId);
   updateTransportForSelection();
   const audio = $('#audio-player');
   if (audio.src !== new URL(line.render.mediaUrl, location.href).href) audio.src = line.render.mediaUrl;
   state.loadedAudio = { kind: 'line', id: lineId, url: line.render.mediaUrl };
-  try { await audio.play(); $('.play-main').textContent = 'Ⅱ'; } catch (error) { toast('无法播放', error.message, 'error'); }
+  try { await audio.play(); $('.play-main').textContent = 'Ⅱ'; } catch (error) {
+    if (error?.name !== 'AbortError') toast('无法播放', error.message, 'error');
+  }
 }
 
 function stepLine(direction) {
@@ -3537,8 +3576,7 @@ function stepLine(direction) {
   if (!lines.length) return;
   const index = Math.max(0, lines.findIndex((line) => line.id === state.selectedLineId));
   const next = lines[(index + direction + lines.length) % lines.length];
-  state.selectedLineId = next.id;
-  renderView();
+  selectStudioLine(next.id);
   if (next.render?.mediaUrl) playLine(next.id);
 }
 
@@ -3835,6 +3873,8 @@ async function submitVoice(form) {
 }
 
 document.addEventListener('click', async (event) => {
+  const scriptLine = event.target.closest('.script-line[data-line-id]');
+  if (scriptLine) selectStudioLine(scriptLine.dataset.lineId);
   const target = event.target.closest('[data-nav], [data-action]');
   if (!target) return;
   if (target.dataset.nav) {
@@ -3868,13 +3908,7 @@ document.addEventListener('click', async (event) => {
     if (action === 'close-jobs') { closeJobs(); return; }
     if (action === 'select-chapter') { resetPlayback(); state.selectedChapterId = target.dataset.chapterId; state.selectedLineId = null; renderView(); return; }
     if (action === 'select-line') {
-      if (state.selectedLineId !== target.dataset.lineId) {
-        state.selectedLineId = target.dataset.lineId;
-        if (event.target.closest('textarea, select, input, button')) {
-          $$('.script-line').forEach((item) => item.classList.toggle('selected', item.dataset.lineId === state.selectedLineId));
-          updateTransportForSelection();
-        } else renderView();
-      }
+      selectStudioLine(target.dataset.lineId);
       return;
     }
     if (action === 'filter-lines') { state.lineFilter = target.dataset.filter; renderView(); return; }
@@ -4257,6 +4291,11 @@ document.addEventListener('input', (event) => {
     if (input.dataset.lineField === 'pace') valueNode.textContent = `${Number(input.value).toFixed(2)}×`;
     if (input.dataset.lineField === 'pauseAfterMs') valueNode.textContent = `${input.value}ms`;
   }
+});
+
+document.addEventListener('focusin', (event) => {
+  const line = event.target.closest('.script-line[data-line-id]');
+  if (line) selectStudioLine(line.dataset.lineId);
 });
 
 document.addEventListener('click', async (event) => {
