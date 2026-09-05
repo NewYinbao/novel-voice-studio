@@ -1,3 +1,5 @@
+import './analysis-waveform.js?v=2';
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
@@ -5,6 +7,7 @@ const CODEX_PROGRESS_PREFERENCE_KEY = 'novelVoiceStudio.codexProgressVisible.v1'
 const CODEX_ACTIVITY_PREFERENCE_KEY = 'novelVoiceStudio.codexActivityVisible.v1';
 const CODEX_SESSION_PANE_WIDTH_KEY = 'novelVoiceStudio.codexSessionPaneWidth.v1';
 const CODEX_SCRIPT_PANE_WIDTH_KEY = 'novelVoiceStudio.codexScriptPaneWidth.v1';
+const ANALYSIS_WAVEFORMS_PREFERENCE_KEY = 'novelVoiceStudio.analysisWaveformsVisible.v1';
 const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
 const DEFAULT_CODEX_REASONING_EFFORT = 'medium';
 const DEFAULT_CODEX_TIMEOUT_MINUTES = 10;
@@ -41,6 +44,7 @@ function writeLocalNumber(key, value) {
 
 const state = {
   bootstrap: null,
+  analysisWaveformsVisible: readLocalBoolean(ANALYSIS_WAVEFORMS_PREFERENCE_KEY, true),
   view: 'projects',
   project: null,
   selectedChapterId: null,
@@ -162,7 +166,7 @@ const statusLabels = {
 const jobLabels = {
   script: '剧本润色', render: '语音生成', export: '音频导出',
   extract: '音色裁剪', voice_extract: '音色裁剪', 'voice-extract': '音色裁剪',
-  voice_design: '文字设计音色', voice_analyze: '多人语音分析', voice_export: '说话人音色导出'
+  voice_design: '文字设计音色', voice_analyze: '多人语音分析', voice_export: '说话人音色导出', voice_clean: '片段自动去静音'
 };
 const coverColors = ['#78dfc9', '#ffb86b', '#aea4ff', '#f07d9e', '#78aef8'];
 
@@ -373,6 +377,7 @@ async function loadVoiceAnalysis(analysisId) {
 }
 
 function rememberVoiceAnalysis(analysis) {
+  if (!analysis?.id) return;
   const cached = state.voiceAnalysisCache.get(analysis.id);
   if (cached && cached.revision > analysis.revision) return;
   state.voiceAnalysisCache.set(analysis.id, analysis);
@@ -388,7 +393,7 @@ function analysisSessionKey() { return state.voiceAnalysisId || state.voiceAnaly
 
 function analysisDraft(analysisId = analysisSessionKey()) {
   if (!state.voiceAnalysisDrafts.has(analysisId)) {
-    state.voiceAnalysisDrafts.set(analysisId, { segments: new Map(), speakers: new Map(), addLabel: '', scrollTop: 0, query: '', speakerFilter: 'all', pages: new Map() });
+    state.voiceAnalysisDrafts.set(analysisId, { segments: new Map(), speakers: new Map(), waveforms: new Map(), addLabel: '', scrollTop: 0, query: '', speakerFilter: 'all', pages: new Map() });
   }
   return state.voiceAnalysisDrafts.get(analysisId);
 }
@@ -2736,6 +2741,41 @@ function analysisPagerHtml(groupId, pagination) {
   return `<div class="analysis-pagination"><span>${pagination.matches.length} 段 · 每页 ${ANALYSIS_PAGE_SIZE} 段</span><button class="button small" data-action="analysis-page" data-group-id="${escapeHtml(groupId)}" data-page="${pagination.page - 1}" ${pagination.page === 0 ? 'disabled' : ''}>上一页</button><b>${pagination.page + 1} / ${pagination.pageCount}</b><button class="button small" data-action="analysis-page" data-group-id="${escapeHtml(groupId)}" data-page="${pagination.page + 1}" ${pagination.page + 1 === pagination.pageCount ? 'disabled' : ''}>下一页</button></div>`;
 }
 
+function analysisWaveformVisible(segmentId) {
+  return analysisDraft().waveforms.get(segmentId) ?? state.analysisWaveformsVisible;
+}
+
+function setAnalysisWaveformVisibility(visible, segmentId = null) {
+  if (segmentId !== null) {
+    const overrides = analysisDraft().waveforms;
+    if (visible === state.analysisWaveformsVisible) overrides.delete(segmentId);
+    else overrides.set(segmentId, visible);
+    return;
+  }
+  state.analysisWaveformsVisible = visible;
+  writeLocalBoolean(ANALYSIS_WAVEFORMS_PREFERENCE_KEY, visible);
+  for (const draft of state.voiceAnalysisDrafts.values()) draft.waveforms.clear();
+}
+
+function syncAnalysisWaveformUi() {
+  // Update visibility in place; text drafts and in-progress crop selections survive.
+  for (const track of $$('analysis-waveform')) {
+    const visible = analysisWaveformVisible(track.getAttribute('segment-id'));
+    if (!visible) $('audio', track)?.pause();
+    track.hidden = !visible;
+    const button = $('[data-action="toggle-analysis-segment-waveform"]', track.closest('.analysis-segment'));
+    if (button) {
+      button.textContent = visible ? '隐藏本段音轨' : '显示本段音轨';
+      button.setAttribute('aria-expanded', String(visible));
+    }
+  }
+  const allButton = $('[data-action="toggle-analysis-waveforms"]');
+  if (allButton) {
+    allButton.textContent = state.analysisWaveformsVisible ? '隐藏全部音轨' : '显示全部音轨';
+    allButton.setAttribute('aria-expanded', String(state.analysisWaveformsVisible));
+  }
+}
+
 function syncAnalysisDirtyUi() {
   const count = analysisDraft().segments.size;
   const saving = [...state.voiceAnalysisMutations].some((key) => key.startsWith(`${state.voiceAnalysisId}:`));
@@ -2743,6 +2783,9 @@ function syncAnalysisDirtyUi() {
   if (label) { label.textContent = saving ? '正在保存…' : count ? `${count} 段尚未保存（含其他页）` : '所有片段修改已保存'; label.classList.toggle('dirty', count > 0); }
   const save = $('[data-action="save-all-analysis"]');
   if (save) save.disabled = !count || saving;
+  const cleaning = (state.bootstrap.jobs || []).find((job) => job.type === 'voice_clean' && job.payload.analysisId === state.voiceAnalysisId && ['queued', 'running'].includes(job.state));
+  const clean = $('[data-action="clean-analysis-silence"]');
+  if (clean) { clean.disabled = Boolean(cleaning) || saving || count > 0; clean.textContent = cleaning ? `去静音中 ${cleaning.progress}%` : '全 Session 一键去静音'; }
 }
 
 function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
@@ -2751,6 +2794,8 @@ function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
   const start = analysisStartMs(segment);
   const end = analysisEndMs(segment);
   const mediaUrl = analysisMediaUrl(segment);
+  const waveformVisible = analysisWaveformVisible(id);
+  const waveformId = `analysis-track-${state.voiceAnalysisId}-${id}`;
   const keep = segment.keep === true;
   const emotion = segment.emotion || 'neutral';
   const emotionOptions = state.bootstrap.emotions.map((item) => `<option value="${item.id}" ${item.id === emotion ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('');
@@ -2760,12 +2805,15 @@ function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
     return `<option value="${escapeHtml(speakerId)}" ${speakerId === currentSpeakerId ? 'selected' : ''}>${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}</option>`;
   }).join('');
   return `<article class="analysis-segment ${overlap ? 'overlap' : ''}" data-segment-id="${escapeHtml(id)}">
-    <div class="segment-time"><strong>${formatTime(start / 1000)} – ${formatTime(end / 1000)}</strong><small>${((end - start) / 1000).toFixed(1)} 秒${overlap ? ' · 多人重叠' : ''}</small>${mediaUrl ? `<button type="button" class="segment-play" data-action="play-analysis-segment" data-url="${escapeHtml(mediaUrl)}" data-name="${overlap ? '重叠语音' : '说话人片段'} ${formatTime(start / 1000)}">▶ 试听</button>` : ''}</div>
+    <div class="segment-time"><strong>${formatTime(start / 1000)} – ${formatTime(end / 1000)}</strong><small>原录音范围${overlap ? ' · 多人重叠' : ''}</small><small>当前片段 ${(Number(segment.durationMs ?? end - start) / 1000).toFixed(2)} 秒</small>${mediaUrl ? `<button type="button" class="button small segment-wave-toggle" data-action="toggle-analysis-segment-waveform" data-segment-id="${escapeHtml(id)}" aria-controls="${escapeHtml(waveformId)}" aria-expanded="${waveformVisible}" title="仅显示或隐藏当前片段的音轨">${waveformVisible ? '隐藏本段音轨' : '显示本段音轨'}</button>` : ''}</div>
     <label class="segment-transcript"><span>台词${segment.containsOverlap ? ' · 可能含重叠，需复核' : ''}</span><textarea class="field" rows="2" data-analysis-text>${escapeHtml(analysisSegmentText(segment))}</textarea></label>
     <label class="segment-emotion"><span>语气</span><select class="select-field" data-analysis-emotion>${emotionOptions}</select><small>${segment.emotionConfidence != null ? `识别信心 ${Math.round(Number(segment.emotionConfidence) * 100)}%` : '可手动修改'}</small></label>
     <label class="segment-speaker"><span>归属</span><select class="select-field" data-analysis-speaker>${overlap ? `<option value="overlap" ${!currentSpeakerId || currentSpeakerId === 'overlap' ? 'selected' : ''}>多人重叠 · 待复核</option>` : ''}${speakerOptions}</select></label>
-    <label class="segment-keep"><input type="checkbox" data-analysis-keep ${keep ? 'checked' : ''}><span>${overlap ? '保留待复核' : '用于该人音色'}</span></label>
+    <label class="segment-keep"><input type="checkbox" data-analysis-keep ${keep ? 'checked' : ''} ${segment.silence?.silent ? 'disabled' : ''}><span>${segment.silence?.silent ? '未检测到有效声音' : overlap ? '保留待复核' : '用于该人音色'}</span></label>
     <button type="button" class="button small" data-action="save-analysis-segment" data-segment-id="${escapeHtml(id)}" ${state.voiceAnalysisMutations.has(`${state.voiceAnalysisId}:${id}`) ? 'disabled' : ''}>${analysisDraft().segments.has(id) ? '保存修改 *' : '保存修改'}</button>
+    ${mediaUrl ? `<analysis-waveform id="${escapeHtml(waveformId)}" analysis-id="${escapeHtml(state.voiceAnalysisId)}" segment-id="${escapeHtml(id)}" audio-revision="${segment.audioRevision || 0}" can-restore="${segment.canRestoreAudio === true}" ${waveformVisible ? '' : 'hidden'}></analysis-waveform>` : ''}
+    <div class="segment-audio-note">${segment.silence?.silent ? '此段接近全静音，已排除出克隆样本；原音频仍保留。' : segment.silence ? `已自动去除 ${(segment.silence.removedMs / 1000).toFixed(2)} 秒静音；裁剪不会覆盖原片段。` : '此历史片段尚未去静音，可点击音轨按钮或全 Session 一键清理。'}</div>
+    ${segment.needsTranscriptReview ? `<label class="segment-transcript-review"><input type="checkbox" data-analysis-transcript-reviewed ${segment.transcriptReviewed ? 'checked' : ''}><span>音频已裁剪或恢复，请试听并修改上方台词；我已核对音频与台词一致（保存后可用于克隆）</span></label>` : ''}
   </article>`;
 }
 
@@ -2862,10 +2910,12 @@ function captureAnalysisInput(input) {
       speakerId: row.querySelector('[data-analysis-speaker]').value,
       keep: row.querySelector('[data-analysis-keep]').checked
     };
+    const reviewed = row.querySelector('[data-analysis-transcript-reviewed]');
+    if (reviewed) patch.transcriptReviewed = reviewed.checked;
     const original = [...(state.voiceAnalysis?.speakers || []).flatMap((speaker) => speaker.segments), ...(state.voiceAnalysis?.overlaps || [])]
       .find((segment) => analysisSegmentId(segment) === row.dataset.segmentId);
     const unchanged = original && patch.text === original.text && patch.emotion === original.emotion
-      && patch.speakerId === (original.isOverlap ? 'overlap' : original.speakerId) && patch.keep === original.keep;
+      && patch.speakerId === (original.isOverlap ? 'overlap' : original.speakerId) && patch.keep === original.keep && !patch.transcriptReviewed;
     if (unchanged) analysisDraft().segments.delete(row.dataset.segmentId);
     else analysisDraft().segments.set(row.dataset.segmentId, patch);
     const save = row.querySelector('[data-action="save-analysis-segment"]');
@@ -2911,7 +2961,8 @@ function voiceAnalysisHtml() {
     <form id="analysis-add-speaker-form" class="analysis-add-speaker"><label for="analysis-speaker-label">添加对话人</label><input id="analysis-speaker-label" class="field" name="label" maxlength="80" placeholder="例如：主持人、小林" value="${escapeHtml(analysisDraft().addLabel)}" required><button class="button" type="submit" ${state.voiceAnalysisMutations.has(`${analysis.id}:speaker`) ? 'disabled' : ''}>＋ 添加对话人</button><small>添加后，在片段“归属”中分配台词。</small></form>
     <div class="analysis-capabilities" role="status"><span class="${capabilities.asr === false ? 'off' : ''}">转写 ${capabilities.asr === false ? '不可用' : '已完成'}</span><span class="${capabilities.diarization === false ? 'off' : ''}">说话人 ${capabilities.diarization === false ? '不可用' : '已分离'}</span><span class="${capabilities.emotion === false ? 'off' : ''}">语气 ${capabilities.emotion === false ? '仅可手动' : '已识别'}</span><span class="${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? 'off' : ''}">重叠检测 ${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '未启用' : '已启用'}</span></div>
     ${(analysis.warnings || []).length ? `<div class="analysis-warning" role="status"><strong>分析提示</strong><ul>${analysis.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>` : ''}
-    <div class="analysis-review-tools"><label>搜索台词<input id="analysis-search" class="field" type="search" placeholder="在本 Session 全部片段中查找" value="${escapeHtml(draft.query)}"></label><label>对话人筛选<select id="analysis-speaker-filter" class="select-field"><option value="all">全部对话人</option>${speakers.map((speaker) => `<option value="${escapeHtml(speaker.id)}" ${draft.speakerFilter === speaker.id ? 'selected' : ''}>${escapeHtml(speaker.label)} · ${speaker.segments.length} 段</option>`).join('')}<option value="overlap" ${draft.speakerFilter === 'overlap' ? 'selected' : ''}>多人重叠 · ${overlaps.length} 段</option></select></label><div><span data-analysis-dirty role="status"></span><button class="button primary small" data-action="save-all-analysis">保存全部修改</button></div></div>
+    <div class="analysis-audio-tools"><div><strong>干净语音 · 用于克隆</strong><p>新拆分和导出会自动去除首尾静音与 ≥0.5 秒的句内空白，保留 80ms 边缘余量。波形支持拖动两端或输入秒数裁剪；原录音与原片段可恢复。去静音不等于降噪或分离重叠人声。</p></div><button class="button" data-action="clean-analysis-silence">全 Session 一键去静音</button></div>
+    <div class="analysis-review-tools"><label>搜索台词<input id="analysis-search" class="field" type="search" placeholder="在本 Session 全部片段中查找" value="${escapeHtml(draft.query)}"></label><label>对话人筛选<select id="analysis-speaker-filter" class="select-field"><option value="all">全部对话人</option>${speakers.map((speaker) => `<option value="${escapeHtml(speaker.id)}" ${draft.speakerFilter === speaker.id ? 'selected' : ''}>${escapeHtml(speaker.label)} · ${speaker.segments.length} 段</option>`).join('')}<option value="overlap" ${draft.speakerFilter === 'overlap' ? 'selected' : ''}>多人重叠 · ${overlaps.length} 段</option></select></label><div><span data-analysis-dirty role="status"></span><span class="analysis-review-actions"><button class="button small" data-action="toggle-analysis-waveforms" aria-expanded="${state.analysisWaveformsVisible}" title="统一显示或隐藏所有片段音轨，并重置单段选择">${state.analysisWaveformsVisible ? '隐藏全部音轨' : '显示全部音轨'}</button><button class="button primary small" data-action="save-all-analysis">保存全部修改</button></span></div></div>
     <div class="speaker-groups">${speakerGroups}</div>
     ${!speakerGroups && !showOverlap ? '<div class="empty-inline">没有匹配的台词，可清空搜索或切换对话人。</div>' : ''}
     ${showOverlap ? `<section class="overlap-group panel"><header class="speaker-group-head overlap-head"><span class="speaker-index">!</span><div><span class="eyebrow">OVERLAPPED SPEECH</span><h2>多人重叠 / 需人工复核</h2><p>这些片段默认不进入任何人的克隆样本。“保留”只表示存档供复核，不代表已完成语音分离。</p></div></header>${analysisPagerHtml('overlap', overlapPage)}<div class="analysis-segments">${overlaps.length ? overlapPage.items.map((segment) => analysisSegmentHtml(segment, { overlap: true, speakers })).join('') : `<div class="empty-inline">${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '当前未启用可靠的重叠语音检测模型；系统没有伪造检测结果。' : '未检测到重叠语音。'}</div>`}</div>${analysisPagerHtml('overlap', overlapPage)}</section>` : ''}
@@ -3648,6 +3699,7 @@ function jobCompletionNotice(job) {
   }
   if (job.state === 'failed') return { title: `${label}失败`, message: job.error?.message || job.message, type: 'error' };
   if (job.type === 'voice_design') return { title: '试听候选已生成', message: '请先试听；满意后再点击“加入音色库”。', type: 'success' };
+  if (job.type === 'voice_clean') return { title: '静音清理完成', message: `处理 ${job.result?.processed || 0} 段，去除 ${((job.result?.removedMs || 0) / 1000).toFixed(1)} 秒空白。原始媒体未改动。`, type: 'success' };
   const failure = renderFailureOutcome(job);
   if (failure) return { title: `${label}${failure.partial ? '部分失败' : '失败'}`, message: failure.summary, type: failure.type };
   if (job.result?.demo) return { title: `${label}完成`, message: '已生成演示音轨，真实 TTS 启动并绑定音色后可重新生成。', type: 'warn' };
@@ -3677,16 +3729,19 @@ async function pollJobs() {
     renderJobs();
     let changed = false;
     let completedDesignId = '';
+    const cleanedAnalyses = new Set();
     for (const job of jobs) {
       if (!state.watchedJobs.has(job.id) || !['completed', 'failed'].includes(job.state) || state.notifiedJobs.has(job.id)) continue;
       state.notifiedJobs.add(job.id);
       changed = true;
       if (job.type === 'voice_design' && job.state === 'completed') completedDesignId = job.result?.designId || job.result?.design?.id || '';
+      if (job.type === 'voice_clean' && job.state === 'completed') cleanedAnalyses.add(job.result.analysisId);
       const notice = jobCompletionNotice(job);
       toast(notice.title, notice.message, notice.type, 6000);
     }
     if (changed) {
       await refreshBootstrap();
+      for (const analysisId of cleanedAnalyses) rememberVoiceAnalysis(await api(`/api/voice-analyses/${analysisId}`));
       if (state.project) await loadProject(state.project.id);
       if (completedDesignId && state.view === 'voice-design') {
         await loadVoiceDesignDrafts({ selectId: completedDesignId });
@@ -4512,6 +4567,42 @@ function analysisSegmentElement(segmentId) {
   return $(`.analysis-segment[data-segment-id="${CSS.escape(segmentId)}"]`);
 }
 
+function analysisAudioEditingBlocked(analysisId) {
+  return analysisDraft(analysisId).segments.size || [...state.voiceAnalysisMutations].some((key) => key.startsWith(`${analysisId}:`))
+    || (state.bootstrap.jobs || []).some((job) => job.type === 'voice_clean' && job.payload.analysisId === analysisId && ['queued', 'running'].includes(job.state));
+}
+
+async function cleanCurrentAnalysisSilence() {
+  const analysisId = state.voiceAnalysisId;
+  if (!analysisId) return;
+  if (analysisAudioEditingBlocked(analysisId)) return toast('请先保存片段修改', '当前有未保存内容或音频处理尚未完成。', 'warn');
+  const key = `${analysisId}:clean`;
+  state.voiceAnalysisMutations.add(key); syncAnalysisDirtyUi();
+  try { await trackJob(await api(`/api/voice-analyses/${analysisId}/clean-silence`, { method: 'POST', body: {} })); }
+  finally { state.voiceAnalysisMutations.delete(key); syncAnalysisDirtyUi(); }
+}
+
+document.addEventListener('analysis-audio-edit', async (event) => {
+  const { analysisId, segmentId, ...input } = event.detail;
+  const track = event.target;
+  if (state.view !== 'voice-analysis' || state.voiceAnalysisId !== analysisId) return;
+  if (analysisAudioEditingBlocked(analysisId)) return toast('请先保存片段修改', '保存全部台词修改，并等待当前音频处理结束后再裁剪。', 'warn');
+  const key = `${analysisId}:audio`;
+  state.voiceAnalysisMutations.add(key); track.setBusy(true); syncAnalysisDirtyUi();
+  try {
+    const result = await api(`/api/voice-analyses/${analysisId}/segments/${segmentId}/audio`, { method: 'POST', body: input });
+    rememberVoiceAnalysis(result.analysis);
+    toast(input.action === 'trim' ? '裁剪已保存' : input.action === 'restore' ? '已恢复原片段' : '静音已清理', input.action === 'silence' ? `本次去除 ${(result.removedMs / 1000).toFixed(2)} 秒空白。` : '请试听并核对台词，保存确认后再导出音色。');
+  } catch (error) {
+    toast('音频处理未完成', error.message, 'error');
+    if (error.status === 409 || error.code === 'VOICE_AUDIO_CONFLICT') rememberVoiceAnalysis(await api(`/api/voice-analyses/${analysisId}`).catch(() => null));
+  } finally {
+    state.voiceAnalysisMutations.delete(key);
+    if (track.isConnected) track.setBusy(false);
+    if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
+  }
+});
+
 async function saveAnalysisSegment(segmentId) {
   if (!state.voiceAnalysisId || !segmentId) return;
   const row = analysisSegmentElement(segmentId);
@@ -4717,6 +4808,17 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'save-all-analysis') { await saveAllAnalysisEdits(); return; }
+    if (action === 'toggle-analysis-waveforms') {
+      setAnalysisWaveformVisibility(!state.analysisWaveformsVisible);
+      syncAnalysisWaveformUi();
+      return;
+    }
+    if (action === 'toggle-analysis-segment-waveform') {
+      setAnalysisWaveformVisibility(!analysisWaveformVisible(target.dataset.segmentId), target.dataset.segmentId);
+      syncAnalysisWaveformUi();
+      return;
+    }
+    if (action === 'clean-analysis-silence') { await cleanCurrentAnalysisSilence(); return; }
     if (action === 'save-analysis-segment') { await saveAnalysisSegment(target.dataset.segmentId); return; }
     if (action === 'export-analysis-speaker') { await exportAnalysisSpeaker(target.dataset.speakerId); return; }
     if (action === 'export-selected-speakers') { await exportSelectedAnalysisSpeakers(); return; }
@@ -5261,7 +5363,7 @@ for (const type of ['dragleave', 'drop']) document.addEventListener(type, (event
 
 const audio = $('#audio-player');
 document.addEventListener('play', (event) => {
-  if (event.target.matches?.('.analysis-source-player')) audio.pause();
+  for (const player of $$('audio, video')) if (player !== event.target) player.pause();
 }, true);
 audio.addEventListener('timeupdate', () => {
   const ratio = audio.duration ? audio.currentTime / audio.duration : 0;

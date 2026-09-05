@@ -136,6 +136,36 @@ test('长音频分页有界，跨页搜索全部台词且 Session 筛选与页�
   assert.equal(context.analysisSegmentPage('speaker_a', segments).items.length, 30);
 });
 
+test('音轨全局与单段开关互不混淆，跨页和跨 Session 隔离且不影响校对草稿', () => {
+  const context = sessionHarness(async () => null);
+  context.ANALYSIS_WAVEFORMS_PREFERENCE_KEY = 'waveforms';
+  const preferences = [];
+  context.writeLocalBoolean = (key, value) => preferences.push([key, value]);
+  vm.runInContext(appSource.slice(appSource.indexOf('function analysisSegmentId('), appSource.indexOf('function syncAnalysisDirtyUi(')), context);
+  context.state.voiceAnalysisId = 'first';
+  context.state.analysisWaveformsVisible = true;
+  context.analysisDraft().segments.set('segment_a', { text: '未保存的校对' });
+  context.setAnalysisWaveformVisibility(false, 'segment_a');
+  assert.equal(context.analysisWaveformVisible('segment_a'), false);
+  assert.equal(context.analysisWaveformVisible('segment_b'), true);
+  context.analysisDraft().pages.set('speaker_a', 2);
+  assert.equal(context.analysisWaveformVisible('segment_a'), false);
+  context.state.voiceAnalysisId = 'second';
+  assert.equal(context.analysisWaveformVisible('segment_a'), true, '同名片段不能跨 Session 共用状态');
+  context.state.voiceAnalysisId = 'first';
+  assert.equal(context.analysisWaveformVisible('segment_a'), false, '返回会话保留本段选择');
+  context.setAnalysisWaveformVisibility(false);
+  assert.equal(context.analysisWaveformVisible('off_page'), false);
+  context.setAnalysisWaveformVisibility(true, 'segment_b');
+  assert.equal(context.analysisWaveformVisible('segment_a'), false);
+  assert.equal(context.analysisWaveformVisible('segment_b'), true, '全部隐藏后可以只展开一段');
+  context.setAnalysisWaveformVisibility(true);
+  assert.equal(context.analysisWaveformVisible('segment_a'), true);
+  assert.equal(context.analysisDraft().waveforms.size, 0);
+  assert.equal(context.analysisDraft().segments.get('segment_a').text, '未保存的校对');
+  assert.deepEqual(preferences, [['waveforms', false], ['waveforms', true]]);
+});
+
 test('快速切换只接受最后一次 Session 请求，旧保存回包不污染当前会话', async () => {
   const requests = new Map();
   const context = sessionHarness((url) => new Promise((resolve) => requests.set(url.split('/').at(-1), resolve)));

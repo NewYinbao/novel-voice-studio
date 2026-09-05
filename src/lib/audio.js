@@ -65,7 +65,9 @@ export function parsePcmWav(buffer) {
     const chunkId = buffer.toString('ascii', offset, offset + 4);
     const size = buffer.readUInt32LE(offset + 4);
     const start = offset + 8;
+    if (start + size > buffer.length) throw new Error('WAV 数据块越界');
     if (chunkId === 'fmt ') {
+      if (size < 16) throw new Error('WAV fmt 数据块无效');
       format = {
         audioFormat: buffer.readUInt16LE(start),
         channels: buffer.readUInt16LE(start + 2),

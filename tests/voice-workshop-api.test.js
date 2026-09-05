@@ -98,7 +98,9 @@ test('提示词设计、多人分析、编辑与按说话人导出形成安全�
       const makeClip = async (name, text) => {
         const filePath = path.join(body.output_dir, 'segments', `${name}.wav`);
         assert.ok(text);
-        await fs.writeFile(filePath, wavBufferFromPcm(Buffer.alloc(5 * 24000 * 2), 24000, 1));
+        const pcm = Buffer.alloc(5 * 24000 * 2);
+        for (let frame = 0; frame < 5 * 24000; frame += 1) pcm.writeInt16LE(Math.round(Math.sin(frame / 24000 * Math.PI * 440) * 6000), frame * 2);
+        await fs.writeFile(filePath, wavBufferFromPcm(pcm, 24000, 1));
         return filePath;
       };
       const speakerOne = await makeClip('speaker-one', '第一位说话人的清晰测试台词');

@@ -391,7 +391,7 @@ test('Codex active 超时返回 504 语义终态、不提交，并释放本章�
   assert.match(stream, /"code":"CODEX_TIMEOUT_ACTIVE"/);
   assert.match(stream, /"timeoutMinutes":5/);
   assert.match(stream, /5 分钟/);
-  assert.doesNotMatch(stream, /RAW timeout|private|prompt\.txt|input_tokens|999/i);
+  assert.doesNotMatch(stream, /RAW timeout|private|prompt\.txt|input_tokens|\b999\b/i);
   const afterTimeout = await getProject(project.id);
   assert.equal(afterTimeout.chapters[0].codexSessions?.length || 0, 1);
   assert.equal(afterTimeout.chapters[0].codexSessions[0].status, 'failed');

@@ -17,6 +17,7 @@ import {
   VOICE_DESIGNS_DIR
 } from './config.js';
 import { concatenateWavs, parsePcmWav } from './audio.js';
+import { cropSegmentAudio, removeSegmentSilence, segmentWaveform, SILENCE_SETTINGS, SILENCE_VERSION } from './segment-audio.js';
 import { createVoice, getVoice, listVoices } from './store.js';
 import { deleteVoiceSource } from './video-voice.js';
 import { ensureDir, id, isPathInside, nowIso, readJson, safeName, writeJsonAtomic } from './utils.js';
@@ -262,7 +263,12 @@ function publicSegment(segment) {
     isOverlap: segment.isOverlap,
     containsOverlap: segment.containsOverlap,
     sourceSegmentId: segment.sourceSegmentId,
-    textAlignment: segment.textAlignment
+    textAlignment: segment.textAlignment,
+    audioRevision: segment.audioRevision || 0,
+    originalDurationMs: segment.originalDurationMs || segment.durationMs,
+    silence: segment.silence || null,
+    canRestoreAudio: Boolean(segment.originalAudioFile && segment.originalAudioFile !== segment.audioFile),
+    needsTranscriptReview: segment.needsTranscriptReview === true
   };
 }
 
@@ -754,6 +760,9 @@ export async function analyzeVoiceSource(source, analysisInput, { settings, prof
       speakers,
       overlaps
     };
+    update(85, '正在清理片段首尾静音和句内长空白');
+    await cleanManifestSegments(manifest, outputDir, update);
+    await checkedWorkspaceBytes(outputDir);
     await writeJsonAtomic(path.join(outputDir, MANIFEST_FILE), manifest);
     await fs.rename(outputDir, finalDir);
     await deleteVoiceSource(source.id, { allowClaimed: true, missingOk: true });
@@ -831,7 +840,7 @@ function findManifestSegmentRecord(manifest, segmentId) {
 
 function validateSegmentPatch(patch = {}) {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw apiError('片段修改参数无效');
-  const allowed = new Set(['text', 'emotion', 'keep', 'speakerId']);
+  const allowed = new Set(['text', 'emotion', 'keep', 'speakerId', 'transcriptReviewed']);
   if (!Object.keys(patch).length || Object.keys(patch).some((key) => !allowed.has(key))) {
     throw apiError('片段修改包含不支持的字段');
   }
@@ -842,6 +851,7 @@ function validateSegmentPatch(patch = {}) {
     throw apiError('语气标识无效');
   }
   if ('keep' in patch && typeof patch.keep !== 'boolean') throw apiError('keep 必须是布尔值');
+  if ('transcriptReviewed' in patch && typeof patch.transcriptReviewed !== 'boolean') throw apiError('台词核对状态无效');
   if ('speakerId' in patch && (
     typeof patch.speakerId !== 'string'
     || (patch.speakerId !== 'overlap' && !SAFE_ITEM_ID_PATTERN.test(patch.speakerId))
@@ -880,7 +890,127 @@ function applySegmentPatch(manifest, segmentId, patch) {
     if ('text' in patch) segment.text = patch.text.trim();
     if ('emotion' in patch) segment.emotion = String(patch.emotion).trim().toLowerCase();
     if ('keep' in patch) segment.keep = patch.keep;
+    if (patch.transcriptReviewed === true) segment.needsTranscriptReview = false;
+    if (segment.silence?.silent) segment.keep = false;
     return segment;
+}
+
+function segmentAudioPath(directory, segment, original = false) {
+  const relative = original ? segment.originalAudioFile || segment.audioFile : segment.audioFile;
+  if (typeof relative !== 'string') throw apiError('片段音频不可用', { statusCode: 404 });
+  const target = path.resolve(directory, ...relative.split('/'));
+  if (!isPathInside(directory, target)) throw apiError('片段音频路径越界', { statusCode: 403 });
+  return target;
+}
+
+async function writeSegmentAudio(manifest, segment, directory, buffer, created) {
+  if (!segment.originalAudioFile) {
+    segment.originalAudioFile = segment.audioFile;
+    segment.originalDurationMs = segment.durationMs;
+  }
+  const relative = `edits/${id('audio')}.wav`;
+  const target = path.join(directory, relative);
+  await ensureDir(path.dirname(target));
+  const [realDirectory, realEdits] = await Promise.all([fs.realpath(directory), fs.realpath(path.dirname(target))]);
+  if (!isPathInside(realDirectory, realEdits)) throw apiError('音频编辑目录越界', { code: 'VOICE_ANALYSIS_PATH_INVALID', statusCode: 502 });
+  await fs.writeFile(target, buffer, { flag: 'wx' });
+  created.push(target);
+  segment.audioFile = relative;
+  segment.mediaUrl = `/media/voice-analyses/${manifest.id}/${relative}`;
+  const wav = parsePcmWav(buffer);
+  segment.durationMs = Math.round(wav.data.length / (wav.sampleRate * wav.channels * 2) * 1000);
+}
+
+async function cleanManifestSegments(manifest, directory, update = () => {}) {
+  const segments = [...manifest.speakers.flatMap((speaker) => speaker.segments), ...manifest.overlaps];
+  const created = [];
+  let removedMs = 0;
+  let changed = 0;
+  let silentCount = 0;
+  try {
+    for (const [index, segment] of segments.entries()) {
+      if (segment.silence?.version === SILENCE_VERSION) continue;
+      const audio = await checkedWav(segmentAudioPath(directory, segment), { root: directory });
+      const cleaned = removeSegmentSilence(audio.buffer);
+      if (!cleaned.silent && cleaned.removedMs > 0) await writeSegmentAudio(manifest, segment, directory, cleaned.buffer, created);
+      segment.silence = { version: SILENCE_VERSION, removedMs: cleaned.removedMs, silent: cleaned.silent };
+      if (cleaned.silent) { segment.keep = false; silentCount += 1; }
+      segment.audioRevision = (segment.audioRevision || 0) + 1;
+      removedMs += cleaned.removedMs;
+      changed += 1;
+      update(85 + Math.round((index + 1) / segments.length * 12), `清理静音 ${index + 1}/${segments.length} · 已去除 ${(removedMs / 1000).toFixed(1)} 秒`);
+    }
+    return { removedMs, changed, silentCount, created };
+  } catch (error) {
+    await Promise.allSettled(created.map((target) => fs.rm(target, { force: true })));
+    throw error;
+  }
+}
+
+export async function cleanVoiceAnalysisSilence(analysisId, update = () => {}) {
+  return withAnalysisLock(analysisId, async () => {
+    const manifest = await readManifest(analysisId);
+    const directory = analysisDirectory(analysisId);
+    const result = await cleanManifestSegments(manifest, directory, update);
+    try {
+      await checkedWorkspaceBytes(directory);
+      if (result.changed) { manifest.revision += 1; await saveManifest(manifest); }
+      return { analysisId, removedMs: result.removedMs, processed: result.changed, silentCount: result.silentCount };
+    } catch (error) {
+      await Promise.allSettled(result.created.map((target) => fs.rm(target, { force: true })));
+      throw error;
+    }
+  });
+}
+
+export async function getVoiceSegmentWaveform(analysisId, segmentId) {
+  const manifest = await readManifest(analysisId);
+  const { segment } = findManifestSegmentRecord(manifest, segmentId);
+  const directory = analysisDirectory(analysisId);
+  const audio = await checkedWav(segmentAudioPath(directory, segment), { root: directory });
+  return { ...segmentWaveform(audio.buffer), audioRevision: segment.audioRevision || 0, mediaUrl: segment.mediaUrl, settings: SILENCE_SETTINGS };
+}
+
+export async function editVoiceSegmentAudio(analysisId, segmentId, input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !['action', 'startMs', 'endMs', 'audioRevision'].includes(key))) throw apiError('音频编辑参数无效');
+  if (!['trim', 'silence', 'restore'].includes(input.action) || !Number.isSafeInteger(input.audioRevision) || input.audioRevision < 0) throw apiError('音频操作或版本无效');
+  if (input.action === 'trim' && (![input.startMs, input.endMs].every(Number.isFinite) || input.startMs < 0 || input.endMs - input.startMs < 100)) throw apiError('请保留至少 0.1 秒的有效裁剪区间');
+  return withAnalysisLock(analysisId, async () => {
+    const manifest = await readManifest(analysisId);
+    const { segment } = findManifestSegmentRecord(manifest, segmentId);
+    if ((segment.audioRevision || 0) !== input.audioRevision) throw apiError('片段音频已更新，请刷新音轨后重新裁剪', { code: 'VOICE_AUDIO_CONFLICT', statusCode: 409 });
+    const directory = analysisDirectory(analysisId);
+    const audio = await checkedWav(segmentAudioPath(directory, segment, input.action === 'restore'), { root: directory });
+    const created = [];
+    let removedMs = 0;
+    try {
+      if (input.action === 'restore') {
+        if (!segment.originalAudioFile) throw apiError('这个片段尚未裁剪，无需恢复');
+        segment.audioFile = segment.originalAudioFile;
+        segment.mediaUrl = `/media/voice-analyses/${manifest.id}/${segment.audioFile.split('/').map(encodeURIComponent).join('/')}`;
+        segment.durationMs = audio.durationMs;
+        segment.silence = null;
+        segment.needsTranscriptReview = true;
+      } else {
+        const buffer = input.action === 'trim' ? cropSegmentAudio(audio.buffer, input.startMs, input.endMs) : audio.buffer;
+        const cleaned = removeSegmentSilence(buffer);
+        if (cleaned.silent && input.action === 'trim') throw apiError('选区只有静音，请重新选择有声音的部分');
+        if (!cleaned.silent && (input.action === 'trim' || cleaned.removedMs > 0)) await writeSegmentAudio(manifest, segment, directory, cleaned.buffer, created);
+        segment.silence = { version: SILENCE_VERSION, removedMs: cleaned.removedMs, silent: cleaned.silent };
+        if (cleaned.silent) segment.keep = false;
+        if (input.action === 'trim') segment.needsTranscriptReview = true;
+        removedMs = cleaned.removedMs;
+      }
+      segment.audioRevision = (segment.audioRevision || 0) + 1;
+      await checkedWorkspaceBytes(directory);
+      manifest.revision += 1;
+      await saveManifest(manifest);
+      return { analysis: publicAnalysis(manifest), segment: publicSegment(segment), removedMs };
+    } catch (error) {
+      await Promise.allSettled(created.map((target) => fs.rm(target, { force: true })));
+      throw error;
+    }
+  });
 }
 
 export async function updateVoiceAnalysisSegments(analysisId, edits) {
@@ -1005,35 +1135,42 @@ export async function exportSpeakerVoice(analysisId, speakerId, exportInput, upd
       });
     }
   }
-  const totalDurationMs = selected.reduce((sum, segment) => sum + segment.durationMs, 0);
-  if (totalDurationMs < MIN_VOICE_CLIP_MS || totalDurationMs > MAX_VOICE_EXPORT_MS) {
-    throw apiError(`选中片段总时长须为 ${MIN_VOICE_CLIP_MS / 1000}–${MAX_VOICE_EXPORT_MS / 1000} 秒`, {
-      code: 'VOICE_EXPORT_DURATION_INVALID', statusCode: 409
-    });
-  }
+  if (selected.some((segment) => segment.needsTranscriptReview)) throw apiError('裁剪后的台词尚未核对，请确认音频与文字一致并保存后再导出', { code: 'VOICE_EXPORT_TRANSCRIPT_REVIEW', statusCode: 409 });
   const jobDir = path.resolve(VOICE_CLIPS_DIR, id('voiceexport'));
   const outputPath = path.join(jobDir, 'reference.wav');
   if (!isPathInside(VOICE_CLIPS_DIR, jobDir)) throw apiError('导出路径无效');
   try {
     await ensureDir(jobDir);
-    update(20, `正在合并 ${selected.length} 个片段`);
-    const parts = selected.map((segment) => ({
-      filePath: path.resolve(analysisDirectory(analysisId), ...segment.audioFile.split('/')),
-      pauseAfterMs: 120
-    }));
-    for (const part of parts) {
-      if (!isPathInside(analysisDirectory(analysisId), part.filePath)) {
-        throw apiError('片段路径越界', { code: 'VOICE_ANALYSIS_PATH_INVALID', statusCode: 500 });
-      }
+    update(20, `正在去除静音并合并 ${selected.length} 个片段`);
+    const parts = [];
+    const audible = [];
+    let totalDurationMs = 0;
+    let removedSilenceMs = 0;
+    for (const [index, segment] of selected.entries()) {
+      const directory = analysisDirectory(analysisId);
+      const source = await checkedWav(segmentAudioPath(directory, segment), { root: directory });
+      const cleaned = removeSegmentSilence(source.buffer);
+      removedSilenceMs += cleaned.removedMs;
+      if (cleaned.silent) continue;
+      if (!segment.text.trim()) throw apiError('选中片段缺少台词，请先补全台词', { code: 'VOICE_EXPORT_TRANSCRIPT_EMPTY', statusCode: 409 });
+      totalDurationMs += cleaned.durationMs + (parts.length ? 120 : 0);
+      if (totalDurationMs > MAX_VOICE_EXPORT_MS) throw apiError(`去静音后的片段总时长不能超过 ${MAX_VOICE_EXPORT_MS / 1000} 秒`, { code: 'VOICE_EXPORT_DURATION_INVALID', statusCode: 409 });
+      const filePath = path.join(jobDir, `part_${index}.wav`);
+      await fs.writeFile(filePath, cleaned.buffer, { flag: 'wx' });
+      parts.push({ filePath, pauseAfterMs: 120 });
+      audible.push(segment);
     }
+    if (totalDurationMs < MIN_VOICE_CLIP_MS) throw apiError(`去静音后不足 ${MIN_VOICE_CLIP_MS / 1000} 秒，请选择更多有效语音`, { code: 'VOICE_EXPORT_DURATION_INVALID', statusCode: 409 });
+    parts.at(-1).pauseAfterMs = 0;
     const merged = await concatenateWavs(parts, outputPath);
     const audio = await checkedWav(outputPath, { root: jobDir });
     if (audio.bytes > MAX_VOICE_BYTES) {
       throw apiError('合并后的参考音频超过大小限制', { code: 'VOICE_EXPORT_TOO_LARGE', statusCode: 413 });
     }
     update(80, '正在保存说话人音色');
-    const transcript = selected.map((segment) => segment.text).filter(Boolean).join('\n').slice(0, 5000);
+    const transcript = audible.map((segment) => segment.text).join('\n');
     if (!transcript) throw apiError('选中片段缺少台词，请先补全台词', { code: 'VOICE_EXPORT_TRANSCRIPT_EMPTY', statusCode: 409 });
+    if (transcript.length > 5000) throw apiError('参考台词超过 5000 字，请减少片段，避免音文不一致', { code: 'VOICE_EXPORT_TRANSCRIPT_TOO_LONG', statusCode: 409 });
     const voice = await createVoice({
       name: exportInput.name || speaker.label,
       tags: ['说话人分析', ...exportInput.tags].slice(0, 10),
@@ -1053,7 +1190,8 @@ export async function exportSpeakerVoice(analysisId, speakerId, exportInput, upd
     return {
       analysisId,
       speakerId: speaker.id,
-      segmentIds: selected.map((segment) => segment.id),
+      segmentIds: audible.map((segment) => segment.id),
+      removedSilenceMs,
       includedOverlap: overlaps.length > 0,
       voiceId: voice.id,
       mediaUrl: voice.reference.mediaUrl,

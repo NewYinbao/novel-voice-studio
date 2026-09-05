@@ -56,6 +56,7 @@ import {
   analyzeVoiceSource, cleanupExpiredVoiceDesigns, commitVoiceDesign, designVoice, discardVoiceDesign,
   exportSpeakerVoice, getVoiceAnalysis, getVoiceDesign, listVoiceAnalyses, listVoiceDesigns,
   updateVoiceAnalysis, updateVoiceAnalysisSegment, updateVoiceAnalysisSegments, updateVoiceAnalysisSpeaker, addVoiceAnalysisSpeaker,
+  cleanVoiceAnalysisSilence, getVoiceSegmentWaveform, editVoiceSegmentAudio,
   validateSpeakerExport, validateVoiceAnalysis, validateVoiceDesign
 } from './lib/voice-workshop.js';
 import {
@@ -1081,6 +1082,22 @@ async function handleApi(req, res, url, {
     res.writeHead(204);
     return res.end();
   }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/clean-silence');
+  if (params && method === 'POST') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) throw Object.assign(new Error('去静音不接受额外参数'), { statusCode: 400 });
+    const analysisId = params.analysisId;
+    await getVoiceAnalysis(analysisId);
+    const existing = jobs.findActive((job) => job.type === 'voice_clean' && job.payload.analysisId === analysisId);
+    return json(res, 202, existing || jobs.create('voice_clean', { analysisId }, (update) => cleanVoiceAnalysisSilence(analysisId, update), { media: true }));
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments/:segmentId/waveform');
+  if (params && method === 'GET') return json(res, 200, await getVoiceSegmentWaveform(params.analysisId, params.segmentId));
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments/:segmentId/audio');
+  if (params && method === 'POST') return json(res, 200, await editVoiceSegmentAudio(params.analysisId, params.segmentId, await parseJsonBody(req, MAX_JSON_BYTES)));
 
   params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments');
   if (params && method === 'PATCH') {
