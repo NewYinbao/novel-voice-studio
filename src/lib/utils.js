@@ -113,10 +113,33 @@ export function mediaType(filePath) {
     '.mp3': 'audio/mpeg',
     '.m4a': 'audio/mp4',
     '.m4b': 'audio/mp4',
+    '.aac': 'audio/aac',
+    '.opus': 'audio/ogg',
+    '.wma': 'audio/x-ms-wma',
+    '.mp4': 'video/mp4',
+    '.m4v': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.mkv': 'video/x-matroska',
+    '.avi': 'video/x-msvideo',
+    '.mpg': 'video/mpeg',
+    '.mpeg': 'video/mpeg',
     '.flac': 'audio/flac',
     '.webm': 'audio/webm',
     '.ogg': 'audio/ogg'
   }[ext] || 'application/octet-stream';
+}
+
+export function parseByteRange(header, size) {
+  const match = String(header).match(/^bytes=(\d*)-(\d*)$/);
+  if (!match || (!match[1] && !match[2]) || !Number.isSafeInteger(size) || size <= 0) return null;
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    return Number.isSafeInteger(suffix) && suffix > 0 ? { start: Math.max(0, size - suffix), end: size - 1 } : null;
+  }
+  const start = Number(match[1]);
+  const requestedEnd = match[2] ? Number(match[2]) : size - 1;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start >= size || requestedEnd < start) return null;
+  return { start, end: Math.min(requestedEnd, size - 1) };
 }
 
 export function isPathInside(parent, candidate) {

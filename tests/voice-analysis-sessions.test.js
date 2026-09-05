@@ -71,6 +71,14 @@ test('历史 Session 跨服务实例持久保存原音频、片段、新对话�
   const untouched = await fetch(`${reopenedBase}/api/voice-analyses/${ids[1]}`).then((response) => response.json());
   assert.equal(untouched.speakers.length, 1);
   assert.equal(untouched.speakers[0].segments[0].text, '初始台词');
+  const batch = (edits) => fetch(`${endpoint}/segments`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ edits }) });
+  const failedBatch = await batch([{ segmentId: 'segment_a', patch: { text: '不能部分写入' } }, { segmentId: 'missing', patch: { keep: false } }]);
+  assert.equal(failedBatch.status, 404);
+  const afterFailure = await fetch(endpoint).then((response) => response.json());
+  assert.equal(afterFailure.speakers[1].segments[0].text, '校对后的台词');
+  assert.equal(afterFailure.revision, reopened.revision);
+  assert.equal((await batch([{ segmentId: 'segment_a', patch: { text: '批量保存台词' } }])).status, 200);
+  assert.equal((await batch([{ segmentId: 'segment_a', patch: { keep: true } }, { segmentId: 'segment_a', patch: { keep: false } }])).status, 400);
   for (const url of [reopened.source.mediaUrl, reopened.speakers[1].segments[0].mediaUrl]) {
     const response = await fetch(`${reopenedBase}${url}`);
     assert.equal(response.status, 200);
@@ -83,6 +91,23 @@ test('历史 Session 跨服务实例持久保存原音频、片段、新对话�
   assert.equal((await post({ label: '超出人数' })).status, 409);
 });
 
+test('批量校对按时间排序且相同时间片段保持原顺序', async () => {
+  const { updateVoiceAnalysisSegments } = await import('../src/lib/voice-workshop.js');
+  const id = 'voiceanalysis_3333333333333333';
+  const directory = path.join(root, 'voice-analyses', id);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'manifest.json'), JSON.stringify({
+    id, revision: 1, source: { fileName: 'source.wav' }, speakers: [{ id: 'speaker_a', label: '甲', segments: [
+      { id: 'segment_z', speakerId: 'speaker_a', startMs: 100, endMs: 900, text: '甲' },
+      { id: 'segment_a', speakerId: 'speaker_a', startMs: 100, endMs: 900, text: '乙' },
+      { id: 'segment_early', speakerId: 'speaker_a', startMs: 0, endMs: 90, text: '丙' },
+    ] }], overlaps: [],
+  }));
+  const result = await updateVoiceAnalysisSegments(id, [{ segmentId: 'segment_a', patch: { text: '修改后的乙' } }]);
+  assert.deepEqual(result.analysis.speakers[0].segments.map((segment) => segment.id), ['segment_early', 'segment_z', 'segment_a']);
+  assert.equal(result.analysis.speakers[0].segments[2].text, '修改后的乙');
+});
+
 const appSource = await fs.readFile(new URL('../public/app.js', import.meta.url), 'utf8');
 function sessionHarness(api) {
   const context = vm.createContext({ api, state: {
@@ -93,6 +118,23 @@ function sessionHarness(api) {
   return context;
 }
 function result(id, revision = 1) { return { id, revision, speakers: [], overlaps: [] }; }
+
+test('长音频分页有界，跨页搜索全部台词且 Session 筛选与页码互相隔离', () => {
+  const context = sessionHarness(async () => null);
+  vm.runInContext(appSource.slice(appSource.indexOf('function analysisSegmentId('), appSource.indexOf('function syncAnalysisDirtyUi(')), context);
+  const segments = Array.from({ length: 531 }, (_, index) => ({ id: `line_${index}`, text: `台词 ${index}` }));
+  context.state.voiceAnalysisId = 'first';
+  assert.equal(context.analysisSegmentPage('speaker_a', segments).items.length, 30);
+  context.analysisDraft().pages.set('speaker_a', 17);
+  assert.equal(context.analysisSegmentPage('speaker_a', segments).items.length, 21);
+  context.analysisDraft().query = '台词 530';
+  const searched = context.analysisSegmentPage('speaker_a', segments);
+  assert.equal(searched.items[0].id, 'line_530');
+  assert.equal(searched.page, 0);
+  context.state.voiceAnalysisId = 'second';
+  assert.equal(context.analysisDraft().query, '');
+  assert.equal(context.analysisSegmentPage('speaker_a', segments).items.length, 30);
+});
 
 test('快速切换只接受最后一次 Session 请求，旧保存回包不污染当前会话', async () => {
   const requests = new Map();

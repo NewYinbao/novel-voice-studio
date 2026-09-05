@@ -191,6 +191,7 @@ class VoiceAnalysisTests(unittest.TestCase):
             result = provider.analyze(self.request(), self.data_root)
 
         self.assertTrue(result["capabilities"]["overlap_detection"])
+        self.assertEqual(provider.model.calls[0]["preset_spk_num"], 2)
         self.assertEqual(len(result["speakers"]), 2)
         self.assertEqual(len(result["overlaps"]), 1)
         self.assertEqual(result["overlaps"][0]["start_ms"], 800)
@@ -213,6 +214,7 @@ class VoiceAnalysisTests(unittest.TestCase):
             for clean in speaker["clean_segments"]
         ]
         self.assertTrue(clean_segments)
+        self.assertEqual(clean_segments[0]["transcript_confidence"], 0.9)
         self.assertTrue(all(Path(item["audio_path"]).is_file() for item in clean_segments))
         self.assertTrue(all(not (item["start_ms"] < 1200 and item["end_ms"] > 800) for item in clean_segments))
         enriched = next(

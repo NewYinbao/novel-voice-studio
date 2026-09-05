@@ -55,11 +55,11 @@ import {
 import {
   analyzeVoiceSource, cleanupExpiredVoiceDesigns, commitVoiceDesign, designVoice, discardVoiceDesign,
   exportSpeakerVoice, getVoiceAnalysis, getVoiceDesign, listVoiceAnalyses, listVoiceDesigns,
-  updateVoiceAnalysis, updateVoiceAnalysisSegment, updateVoiceAnalysisSpeaker, addVoiceAnalysisSpeaker,
+  updateVoiceAnalysis, updateVoiceAnalysisSegment, updateVoiceAnalysisSegments, updateVoiceAnalysisSpeaker, addVoiceAnalysisSpeaker,
   validateSpeakerExport, validateVoiceAnalysis, validateVoiceDesign
 } from './lib/voice-workshop.js';
 import {
-  clamp, decodeBase64Payload, isPathInside, json, mediaType, nowIso, parseJsonBody, safeName, text
+  clamp, decodeBase64Payload, isPathInside, json, mediaType, nowIso, parseByteRange, parseJsonBody, safeName, text
 } from './lib/utils.js';
 
 const jobs = new JobManager(path.join(DATA_DIR, 'jobs.json'));
@@ -117,12 +117,25 @@ function assertLocalOrigin(req) {
   if (!origin) return;
   try {
     const url = new URL(origin);
-    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
-      throw Object.assign(new Error('拒绝非本地页面发起的写入请求'), { statusCode: 403 });
+    const protocol = req.socket.encrypted ? 'https:' : 'http:';
+    if (url.origin !== `${protocol}//${String(req.headers.host).toLowerCase()}`) {
+      throw Object.assign(new Error('只允许当前工作台页面发起写入请求'), { statusCode: 403, code: 'CODEX_AUTH_SAME_ORIGIN_REQUIRED' });
     }
   } catch (error) {
     if (error.statusCode) throw error;
     throw Object.assign(new Error('Origin 无效'), { statusCode: 403 });
+  }
+}
+
+function assertWorkspaceHost(req) {
+  if (req.url?.startsWith('/api/codex/auth/')) return assertLocalHostRequest(req);
+  let host;
+  try { host = new URL(`http://${req.headers.host}`); } catch {}
+  const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', HOST.toLowerCase()]);
+  if (!host || host.username || host.password || host.pathname !== '/' || host.search || host.hash
+    || !allowedHosts.has(host.hostname) || Number(host.port || 80) !== req.socket.localPort) {
+    // Keep the established local-workspace error contract for existing clients.
+    throw Object.assign(new Error('工作台 Host 无效'), { statusCode: 403, code: 'CODEX_AUTH_HOST_INVALID' });
   }
 }
 
@@ -134,13 +147,20 @@ function routeMatch(pathname, pattern) {
   })}$`);
   const match = pathname.match(expression);
   if (!match) return null;
-  return Object.fromEntries(keys.map((key, index) => [key, decodeURIComponent(match[index + 1])]));
+  try { return Object.fromEntries(keys.map((key, index) => [key, decodeURIComponent(match[index + 1])])); }
+  catch { throw Object.assign(new Error('URL 编码无效'), { statusCode: 400 }); }
 }
 
-async function sendFile(req, res, filePath, { cache = false } = {}) {
+async function sendFile(req, res, filePath, { cache = false, root = null, mediaOnly = false } = {}) {
+  if (root) {
+    const [realRoot, realFile] = await Promise.all([fsp.realpath(root), fsp.realpath(filePath)]);
+    if (!isPathInside(realRoot, realFile)) throw Object.assign(new Error('文件路径越界'), { statusCode: 403 });
+    filePath = realFile;
+  }
   const stat = await fsp.stat(filePath);
   if (!stat.isFile()) throw Object.assign(new Error('文件不存在'), { statusCode: 404 });
   const type = mediaType(filePath);
+  if (mediaOnly && !/^(audio|video)\//.test(type)) throw Object.assign(new Error('不是可公开的媒体文件'), { statusCode: 403 });
   const range = req.headers.range;
   const headers = {
     'Content-Type': type,
@@ -149,19 +169,13 @@ async function sendFile(req, res, filePath, { cache = false } = {}) {
     'Cache-Control': cache ? 'no-cache' : 'no-store'
   };
   if (range) {
-    const match = range.match(/^bytes=(\d*)-(\d*)$/);
-    if (!match) {
+    const parsed = parseByteRange(range, stat.size);
+    if (!parsed) {
       res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
       res.end();
       return;
     }
-    const start = match[1] ? Number(match[1]) : 0;
-    const end = match[2] ? Math.min(Number(match[2]), stat.size - 1) : stat.size - 1;
-    if (start > end || start >= stat.size) {
-      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
-      res.end();
-      return;
-    }
+    const { start, end } = parsed;
     res.writeHead(206, { ...headers, 'Content-Length': end - start + 1, 'Content-Range': `bytes ${start}-${end}/${stat.size}` });
     if (req.method === 'HEAD') return res.end();
     return pipeline(fs.createReadStream(filePath, { start, end }), res);
@@ -816,7 +830,10 @@ async function handleApi(req, res, url, {
   if (sessionRecoveryError) throw sessionRecoveryError;
   const { pathname } = url;
   const method = req.method;
-  if (method !== 'GET' && method !== 'HEAD') assertLocalOrigin(req);
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (pathname.startsWith('/api/codex/auth/')) assertSameOriginRequest(req);
+    else assertLocalOrigin(req);
+  }
 
   if (method === 'GET' && pathname === '/api/bootstrap') return json(res, 200, await getBootstrap());
   if (method === 'GET' && pathname === '/api/health') return json(res, 200, { ok: true, time: nowIso() });
@@ -1063,6 +1080,13 @@ async function handleApi(req, res, url, {
     await discardVoiceDesign(params.designId);
     res.writeHead(204);
     return res.end();
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments');
+  if (params && method === 'PATCH') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    if (!body || Object.keys(body).some((key) => key !== 'edits')) throw Object.assign(new Error('批量修改参数无效'), { statusCode: 400 });
+    return json(res, 200, await updateVoiceAnalysisSegments(params.analysisId, body.edits));
   }
 
   params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments/:segmentId');
@@ -1914,7 +1938,10 @@ async function handleApi(req, res, url, {
 }
 
 async function handleMedia(req, res, pathname) {
-  const parts = pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  if (!['GET', 'HEAD'].includes(req.method)) throw Object.assign(new Error('媒体仅支持读取'), { statusCode: 405 });
+  let parts;
+  try { parts = pathname.split('/').filter(Boolean).map(decodeURIComponent); }
+  catch { throw Object.assign(new Error('URL 编码无效'), { statusCode: 400 }); }
   let base;
   let relativeParts;
   if (parts[1] === 'voices') { base = VOICES_DIR; relativeParts = parts.slice(2); }
@@ -1925,7 +1952,8 @@ async function handleMedia(req, res, pathname) {
   else throw Object.assign(new Error('媒体路径无效'), { statusCode: 404 });
   const filePath = path.resolve(base, ...relativeParts);
   if (!isPathInside(base, filePath)) throw Object.assign(new Error('媒体路径无效'), { statusCode: 403 });
-  return sendFile(req, res, filePath);
+  if (!/^(audio|video)\//.test(mediaType(filePath))) throw Object.assign(new Error('不是可公开的媒体文件'), { statusCode: 403 });
+  return sendFile(req, res, filePath, { root: base, mediaOnly: true });
 }
 
 async function handleStatic(req, res, pathname) {
@@ -1935,11 +1963,11 @@ async function handleStatic(req, res, pathname) {
   let filePath = path.resolve(PUBLIC_DIR, relative);
   if (!isPathInside(PUBLIC_DIR, filePath)) throw Object.assign(new Error('路径无效'), { statusCode: 403 });
   try {
-    return await sendFile(req, res, filePath, { cache: !filePath.endsWith('index.html') });
+    return await sendFile(req, res, filePath, { cache: !filePath.endsWith('index.html'), root: PUBLIC_DIR });
   } catch (error) {
     if (error.code !== 'ENOENT' && error.statusCode !== 404) throw error;
     filePath = path.join(PUBLIC_DIR, 'index.html');
-    return sendFile(req, res, filePath);
+    return sendFile(req, res, filePath, { root: PUBLIC_DIR });
   }
 }
 
@@ -1964,6 +1992,7 @@ export function createServer(options = {}) {
     res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');
     try {
+      assertWorkspaceHost(req);
       const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
       if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url, serverOptions);
       if (url.pathname.startsWith('/media/')) return await handleMedia(req, res, url.pathname);

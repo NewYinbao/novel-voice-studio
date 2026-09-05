@@ -569,6 +569,7 @@ class FunASRVoiceAnalysisProvider:
                     merge_length_s=15,
                     sentence_timestamp=True,
                     return_spk_res=True,
+                    preset_spk_num=request.speaker_count,
                 )
             except Exception as error:
                 raise VoiceAnalysisError(
@@ -668,6 +669,8 @@ class FunASRVoiceAnalysisProvider:
                         "end_ms": segment["end_ms"],
                         "text": segment["text"],
                         "emotion": segment["emotion"],
+                        "emotion_confidence": segment.get("emotion_confidence"),
+                        "transcript_confidence": segment.get("transcript_confidence"),
                         "audio_path": str(clean_path),
                         "text_alignment": "segment",
                     }

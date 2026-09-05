@@ -1,12 +1,19 @@
 import { id, nowIso } from './utils.js';
 import { readJson, writeJsonAtomic } from './utils.js';
 
+function compactJob(job) {
+  if (job.type !== 'voice_analyze' || !job.result?.analysis) return job;
+  const { analysis, ...result } = job.result;
+  return { ...job, result: { ...result, analysisId: result.analysisId || analysis.id } };
+}
+
 export class JobManager {
   #jobs = new Map();
   #gpuQueue = Promise.resolve();
   #mediaQueue = Promise.resolve();
   #storagePath;
   #saveTimer;
+  #persistQueue = Promise.resolve();
 
   constructor(storagePath = null) {
     this.#storagePath = storagePath;
@@ -36,7 +43,8 @@ export class JobManager {
 
   async #persist() {
     if (!this.#storagePath) return;
-    await writeJsonAtomic(this.#storagePath, this.list());
+    this.#persistQueue = this.#persistQueue.catch(() => {}).then(() => writeJsonAtomic(this.#storagePath, this.list()));
+    await this.#persistQueue;
   }
 
   async flush() {
@@ -84,13 +92,13 @@ export class JobManager {
     } else {
       queueMicrotask(execute);
     }
-    return job;
+    return compactJob(job);
   }
 
   get(jobId) {
     const job = this.#jobs.get(jobId);
     if (!job) throw Object.assign(new Error('任务不存在'), { statusCode: 404 });
-    return job;
+    return compactJob(job);
   }
 
   findActive(predicate = () => true) {
@@ -100,6 +108,9 @@ export class JobManager {
   }
 
   list() {
-    return [...this.#jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100);
+    let completedCount = 0;
+    return [...this.#jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).filter((job) => (
+      ['queued', 'running'].includes(job.state) || completedCount++ < 100
+    )).map(compactJob);
   }
 }

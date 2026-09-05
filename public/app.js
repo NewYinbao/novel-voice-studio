@@ -71,6 +71,8 @@ const state = {
   notifiedJobs: new Set(),
   saveTimers: new Map(),
   lineSaveErrors: new Map(),
+  lineSaveQueues: new Map(),
+  lineFailedDrafts: new Map(),
   codexPackage: null,
   codexSessionId: null,
   codexVersionId: null,
@@ -386,7 +388,7 @@ function analysisSessionKey() { return state.voiceAnalysisId || state.voiceAnaly
 
 function analysisDraft(analysisId = analysisSessionKey()) {
   if (!state.voiceAnalysisDrafts.has(analysisId)) {
-    state.voiceAnalysisDrafts.set(analysisId, { segments: new Map(), speakers: new Map(), addLabel: '', scrollTop: 0 });
+    state.voiceAnalysisDrafts.set(analysisId, { segments: new Map(), speakers: new Map(), addLabel: '', scrollTop: 0, query: '', speakerFilter: 'all', pages: new Map() });
   }
   return state.voiceAnalysisDrafts.get(analysisId);
 }
@@ -738,6 +740,18 @@ function applyCodexProjectSnapshot(project, { allowSwitch = false, expectedGener
     if (key.startsWith(requestPrefix)) state.codexSessionScriptRequests.set(key, generation + 1);
   }
   state.project = project;
+  for (const [key, record] of [...state.lineFailedDrafts, ...state.saveTimers]) {
+    if (!key.startsWith(`${projectId}:`)) continue;
+    const line = findLineInProject(project, key.slice(projectId.length + 1));
+    if (line) {
+      Object.assign(line, record.patch);
+      if (record.patch.speakerId) {
+        const role = project.characters.find((item) => item.id === record.patch.speakerId);
+        if (role) { line.speaker = role.name; line.needsReview = false; }
+      }
+      line.render = { status: 'stale' };
+    }
+  }
   return true;
 }
 
@@ -2473,8 +2487,8 @@ function studioHtml() {
   const chapter = currentChapter();
   const lines = chapter?.scenes?.flatMap((scene) => scene.lines || []) || [];
   const missingVoices = missingVoicesForLines(lines);
-  const rendered = allProjectLines().filter((line) => line.render?.status === 'ready').length;
-  const total = allProjectLines().length;
+  const rendered = lines.filter((line) => line.render?.status === 'ready').length;
+  const total = lines.length;
   const missingNames = missingVoices.slice(0, 4).map((item) => item.name).join('、');
   const missingMore = missingVoices.length > 4 ? `等 ${missingVoices.length} 个角色` : '';
   const collaborationActive = chapterHasActiveCollaboration(chapter?.id);
@@ -2500,7 +2514,7 @@ function studioHtml() {
       </aside>
       <section class="script-workspace">
         <div class="script-toolbar">
-          <div class="chapter-heading"><h2>${escapeHtml(chapter?.title || '尚无章节')}</h2><small>${chapter?.charCount || 0} 字 · ${lines.length} 个片段 · ${rendered}/${total} 已生成</small></div>
+          <div class="chapter-heading"><h2>${escapeHtml(chapter?.title || '尚无章节')}</h2><small>${chapter?.charCount || 0} 字 · ${lines.length} 个片段 · 本章 ${rendered}/${total} 已生成</small></div>
           <div class="toolbar-tools">
             ${[['all','全部'],['dialogue','对白'],['narration','旁白'],['review','待确认']].map(([id,label]) => `<button class="filter-chip ${state.lineFilter === id ? 'active' : ''}" data-action="filter-lines" data-filter="${id}">${label}</button>`).join('')}
           </div>
@@ -2707,6 +2721,30 @@ function analysisEndMs(segment = {}) { return Number(segment.endMs ?? (segment.e
 function analysisSegmentText(segment = {}) { return segment.text ?? segment.transcript ?? ''; }
 function analysisMediaUrl(segment = {}) { return segment.mediaUrl || segment.audioUrl || segment.audio_url || ''; }
 
+const ANALYSIS_PAGE_SIZE = 30;
+function analysisSegmentPage(groupId, segments) {
+  const draft = analysisDraft();
+  const query = draft.query.trim().toLocaleLowerCase();
+  const matches = segments.filter((segment) => !query || String(draft.segments.get(analysisSegmentId(segment))?.text ?? analysisSegmentText(segment)).toLocaleLowerCase().includes(query));
+  const pageCount = Math.max(1, Math.ceil(matches.length / ANALYSIS_PAGE_SIZE));
+  const page = Math.max(0, Math.min(draft.pages.get(groupId) || 0, pageCount - 1));
+  return { matches, page, pageCount, items: matches.slice(page * ANALYSIS_PAGE_SIZE, (page + 1) * ANALYSIS_PAGE_SIZE) };
+}
+
+function analysisPagerHtml(groupId, pagination) {
+  if (pagination.pageCount <= 1) return '';
+  return `<div class="analysis-pagination"><span>${pagination.matches.length} 段 · 每页 ${ANALYSIS_PAGE_SIZE} 段</span><button class="button small" data-action="analysis-page" data-group-id="${escapeHtml(groupId)}" data-page="${pagination.page - 1}" ${pagination.page === 0 ? 'disabled' : ''}>上一页</button><b>${pagination.page + 1} / ${pagination.pageCount}</b><button class="button small" data-action="analysis-page" data-group-id="${escapeHtml(groupId)}" data-page="${pagination.page + 1}" ${pagination.page + 1 === pagination.pageCount ? 'disabled' : ''}>下一页</button></div>`;
+}
+
+function syncAnalysisDirtyUi() {
+  const count = analysisDraft().segments.size;
+  const saving = [...state.voiceAnalysisMutations].some((key) => key.startsWith(`${state.voiceAnalysisId}:`));
+  const label = $('[data-analysis-dirty]');
+  if (label) { label.textContent = saving ? '正在保存…' : count ? `${count} 段尚未保存（含其他页）` : '所有片段修改已保存'; label.classList.toggle('dirty', count > 0); }
+  const save = $('[data-action="save-all-analysis"]');
+  if (save) save.disabled = !count || saving;
+}
+
 function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
   const id = analysisSegmentId(segment);
   segment = { ...segment, ...analysisDraft().segments.get(id) };
@@ -2723,7 +2761,7 @@ function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
   }).join('');
   return `<article class="analysis-segment ${overlap ? 'overlap' : ''}" data-segment-id="${escapeHtml(id)}">
     <div class="segment-time"><strong>${formatTime(start / 1000)} – ${formatTime(end / 1000)}</strong><small>${((end - start) / 1000).toFixed(1)} 秒${overlap ? ' · 多人重叠' : ''}</small>${mediaUrl ? `<button type="button" class="segment-play" data-action="play-analysis-segment" data-url="${escapeHtml(mediaUrl)}" data-name="${overlap ? '重叠语音' : '说话人片段'} ${formatTime(start / 1000)}">▶ 试听</button>` : ''}</div>
-    <label class="segment-transcript"><span>台词</span><textarea class="field" rows="2" data-analysis-text>${escapeHtml(analysisSegmentText(segment))}</textarea></label>
+    <label class="segment-transcript"><span>台词${segment.containsOverlap ? ' · 可能含重叠，需复核' : ''}</span><textarea class="field" rows="2" data-analysis-text>${escapeHtml(analysisSegmentText(segment))}</textarea></label>
     <label class="segment-emotion"><span>语气</span><select class="select-field" data-analysis-emotion>${emotionOptions}</select><small>${segment.emotionConfidence != null ? `识别信心 ${Math.round(Number(segment.emotionConfidence) * 100)}%` : '可手动修改'}</small></label>
     <label class="segment-speaker"><span>归属</span><select class="select-field" data-analysis-speaker>${overlap ? `<option value="overlap" ${!currentSpeakerId || currentSpeakerId === 'overlap' ? 'selected' : ''}>多人重叠 · 待复核</option>` : ''}${speakerOptions}</select></label>
     <label class="segment-keep"><input type="checkbox" data-analysis-keep ${keep ? 'checked' : ''}><span>${overlap ? '保留待复核' : '用于该人音色'}</span></label>
@@ -2734,12 +2772,15 @@ function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
 function analysisSpeakerHtml(speaker, index) {
   const id = speaker.id || speaker.speakerId || speaker.speaker_id || `speaker_${index + 1}`;
   const segments = speaker.segments || [];
+  const pagination = analysisSegmentPage(id, segments);
+  if (analysisDraft().speakerFilter !== 'all' && analysisDraft().speakerFilter !== id) return '';
+  if (analysisDraft().query && !pagination.matches.length) return '';
   const totalMs = Number(speaker.totalDurationMs ?? (speaker.totalDurationSeconds ?? speaker.total_duration_seconds ?? 0) * 1000) || segments.reduce((sum, item) => sum + Math.max(0, analysisEndMs(item) - analysisStartMs(item)), 0);
   const cleanCount = segments.filter((segment) => segment.keep !== false).length;
   return `<section class="speaker-group panel" data-speaker-id="${escapeHtml(id)}">
     <header class="speaker-group-head"><span class="speaker-index">${String(index + 1).padStart(2, '0')}</span><div><span class="eyebrow">SPEAKER</span><h2>${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}</h2><p>${segments.length} 段 · 约 ${formatTime(totalMs / 1000)} · ${cleanCount} 段已选作克隆样本</p></div><label class="speaker-select"><input type="checkbox" data-analysis-speaker-select ${segments.length ? 'checked' : 'disabled'}><span>批量导出</span></label></header>
-    <div class="speaker-export-bar"><label><span>导出名称</span><input class="field" data-speaker-export-name value="${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}"></label><label class="include-overlap-choice" title="重叠语音会污染音色，仅在你确认可用时选择"><input type="checkbox" data-speaker-include-overlap><span>尝试包含已保留的重叠段</span></label><button type="button" class="button primary small" data-action="export-analysis-speaker" data-speaker-id="${escapeHtml(id)}">导出这个音色</button></div>
-    <div class="analysis-segments">${segments.length ? segments.map((segment) => analysisSegmentHtml(segment, { speakers: state.voiceAnalysis?.speakers || [] })).join('') : '<div class="empty-inline">还没有片段。请在其他片段的“归属”中选择这位对话人，再保存修改。</div>'}</div>
+    <div class="speaker-export-bar"><label><span>导出名称</span><input class="field" data-speaker-export-name value="${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}"></label><label class="include-overlap-choice" title="重叠语音会污染音色，仅在你确认可用时选择"><input type="checkbox" data-speaker-include-overlap><span>尝试包含已保留的重叠段</span></label><button type="button" class="button primary small" data-action="export-analysis-speaker" data-speaker-id="${escapeHtml(id)}" ${segments.length ? '' : 'disabled'}>导出这个音色</button></div>
+    ${analysisPagerHtml(id, pagination)}<div class="analysis-segments">${segments.length ? pagination.items.map((segment) => analysisSegmentHtml(segment, { speakers: state.voiceAnalysis?.speakers || [] })).join('') : '<div class="empty-inline">还没有片段。请在其他片段的“归属”中选择这位对话人，再保存修改。</div>'}</div>${analysisPagerHtml(id, pagination)}
   </section>`;
 }
 
@@ -2766,7 +2807,8 @@ function renderVoiceAnalysisStudio() {
   const content = $('.analysis-session-content', main);
   const key = analysisSessionKey();
   const job = (state.bootstrap.jobs || []).find((item) => item.id === state.voiceAnalysisJobId);
-  const signature = JSON.stringify([key, state.voiceAnalysis?.revision, job?.state, job?.progress, job?.message]);
+  const draft = analysisDraft(key);
+  const signature = JSON.stringify([key, state.voiceAnalysis?.revision, job?.state, job?.progress, job?.message, draft.query, draft.speakerFilter, [...draft.pages]]);
   if (content._signature !== signature) {
     if (content.dataset.sessionKey) analysisDraft(content.dataset.sessionKey).scrollTop = content.scrollTop;
     const sameSession = content.dataset.sessionKey === key;
@@ -2775,7 +2817,7 @@ function renderVoiceAnalysisStudio() {
     const segmentId = active?.closest('[data-segment-id]')?.dataset.segmentId;
     const field = active && ['data-analysis-text', 'data-analysis-emotion', 'data-analysis-speaker', 'data-analysis-keep'].find((name) => active.hasAttribute(name));
     const focusSelector = sameSession && (segmentId && field ? `[data-segment-id="${CSS.escape(segmentId)}"] [${field}]` : active?.id ? `#${CSS.escape(active.id)}` : null);
-    const selection = active?.tagName === 'TEXTAREA' ? [active.selectionStart, active.selectionEnd] : null;
+    const selection = active && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : null;
     content.innerHTML = state.voiceAnalysisJobId ? voiceAnalysisJobHtml(job) : voiceAnalysisHtml();
     if (player) $('.analysis-source-player', content)?.replaceWith(player);
     content.dataset.sessionKey = key;
@@ -2802,6 +2844,7 @@ function renderVoiceAnalysisStudio() {
     content.scrollTop = analysisDraft(key).scrollTop;
   }
   $('#transport').hidden = !['analysis-segment'].includes(state.loadedAudio?.kind);
+  syncAnalysisDirtyUi();
 }
 
 function captureAnalysisInput(input) {
@@ -2813,14 +2856,20 @@ function captureAnalysisInput(input) {
   if (input.id === 'analysis-speaker-label') analysisDraft().addLabel = input.value;
   const row = input.closest('.analysis-segment');
   if (row) {
-    analysisDraft().segments.set(row.dataset.segmentId, {
+    const patch = {
       text: row.querySelector('[data-analysis-text]').value,
       emotion: row.querySelector('[data-analysis-emotion]').value,
       speakerId: row.querySelector('[data-analysis-speaker]').value,
       keep: row.querySelector('[data-analysis-keep]').checked
-    });
+    };
+    const original = [...(state.voiceAnalysis?.speakers || []).flatMap((speaker) => speaker.segments), ...(state.voiceAnalysis?.overlaps || [])]
+      .find((segment) => analysisSegmentId(segment) === row.dataset.segmentId);
+    const unchanged = original && patch.text === original.text && patch.emotion === original.emotion
+      && patch.speakerId === (original.isOverlap ? 'overlap' : original.speakerId) && patch.keep === original.keep;
+    if (unchanged) analysisDraft().segments.delete(row.dataset.segmentId);
+    else analysisDraft().segments.set(row.dataset.segmentId, patch);
     const save = row.querySelector('[data-action="save-analysis-segment"]');
-    if (!save.disabled) save.textContent = '保存修改 *';
+    if (!save.disabled) save.textContent = unchanged ? '保存修改' : '保存修改 *';
   }
   const group = input.closest('.speaker-group');
   if (group && !row) analysisDraft().speakers.set(group.dataset.speakerId, {
@@ -2828,6 +2877,7 @@ function captureAnalysisInput(input) {
     includeOverlap: group.querySelector('[data-speaker-include-overlap]').checked,
     selected: group.querySelector('[data-analysis-speaker-select]').checked
   });
+  syncAnalysisDirtyUi();
 }
 
 function voiceAnalysisHtml() {
@@ -2851,14 +2901,20 @@ function voiceAnalysisHtml() {
   const speakers = analysis.speakers || [];
   const overlaps = analysis.overlaps || [];
   const capabilities = analysis.capabilities || {};
+  const draft = analysisDraft();
+  const overlapPage = analysisSegmentPage('overlap', overlaps);
+  const showOverlap = ['all', 'overlap'].includes(draft.speakerFilter) && (!draft.query || overlapPage.matches.length);
+  const speakerGroups = speakers.map(analysisSpeakerHtml).join('');
   return `<section class="page voice-tool-page voice-analysis-page">
-    <div class="tool-page-head"><button class="back-button" data-nav="voices" aria-label="返回音色库">‹</button><div><span class="eyebrow">SPEAKER LAB · SESSION</span><h1>${escapeHtml(analysis.name || '多人音频分析')}</h1><p>${speakers.length} 个对话人 · ${speakers.reduce((sum, item) => sum + (item.segments?.length || 0), 0)} 个独立片段 · ${overlaps.length} 个重叠片段。保存的修改会随此 Session 保留。</p></div><div class="analysis-head-actions"><button class="button primary" data-action="export-selected-speakers">批量导出已选说话人</button></div></div>
+    <div class="tool-page-head"><button class="back-button" data-nav="voices" aria-label="返回音色库">‹</button><div><span class="eyebrow">SPEAKER LAB · SESSION</span><h1>${escapeHtml(analysis.name || '多人音频分析')}</h1><p>${speakers.length} 个对话人 · ${speakers.reduce((sum, item) => sum + (item.segments?.length || 0), 0)} 个独立片段 · ${overlaps.length} 个重叠片段。保存的修改会随此 Session 保留。</p></div><div class="analysis-head-actions"><button class="button primary" data-action="export-selected-speakers" title="导出当前筛选下已勾选的对话人，包含各分页中保留的片段">导出当前筛选音色</button></div></div>
     <section class="panel analysis-source-panel"><div><span class="eyebrow">ORIGINAL SOURCE</span><h2>${escapeHtml(analysis.source?.fileName || '原始媒体')}</h2><p>原始文件与拆分片段已存档 · ${formatTime(analysis.durationMs / 1000)}</p></div>${analysis.source?.mediaUrl ? `<${analysis.source.kind === 'video' ? 'video' : 'audio'} class="analysis-source-player" controls preload="metadata" src="${escapeHtml(analysis.source.mediaUrl)}" aria-label="当前 Session 原始媒体"></${analysis.source.kind === 'video' ? 'video' : 'audio'}><a class="button small" href="${escapeHtml(analysis.source.mediaUrl)}" download="${escapeHtml(analysis.source.fileName)}">⇩ 下载原文件</a>` : '<p>此历史记录没有可用的原文件。</p>'}</section>
     <form id="analysis-add-speaker-form" class="analysis-add-speaker"><label for="analysis-speaker-label">添加对话人</label><input id="analysis-speaker-label" class="field" name="label" maxlength="80" placeholder="例如：主持人、小林" value="${escapeHtml(analysisDraft().addLabel)}" required><button class="button" type="submit" ${state.voiceAnalysisMutations.has(`${analysis.id}:speaker`) ? 'disabled' : ''}>＋ 添加对话人</button><small>添加后，在片段“归属”中分配台词。</small></form>
     <div class="analysis-capabilities" role="status"><span class="${capabilities.asr === false ? 'off' : ''}">转写 ${capabilities.asr === false ? '不可用' : '已完成'}</span><span class="${capabilities.diarization === false ? 'off' : ''}">说话人 ${capabilities.diarization === false ? '不可用' : '已分离'}</span><span class="${capabilities.emotion === false ? 'off' : ''}">语气 ${capabilities.emotion === false ? '仅可手动' : '已识别'}</span><span class="${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? 'off' : ''}">重叠检测 ${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '未启用' : '已启用'}</span></div>
     ${(analysis.warnings || []).length ? `<div class="analysis-warning" role="status"><strong>分析提示</strong><ul>${analysis.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>` : ''}
-    <div class="speaker-groups">${speakers.map(analysisSpeakerHtml).join('')}</div>
-    <section class="overlap-group panel"><header class="speaker-group-head overlap-head"><span class="speaker-index">!</span><div><span class="eyebrow">OVERLAPPED SPEECH</span><h2>多人重叠 / 需人工复核</h2><p>这些片段默认不进入任何人的克隆样本。“保留”只表示存档供复核，不代表已完成语音分离。</p></div></header><div class="analysis-segments">${overlaps.length ? overlaps.map((segment) => analysisSegmentHtml(segment, { overlap: true, speakers })).join('') : `<div class="empty-inline">${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '当前未启用可靠的重叠语音检测模型；系统没有伪造检测结果。' : '未检测到重叠语音。'}</div>`}</div></section>
+    <div class="analysis-review-tools"><label>搜索台词<input id="analysis-search" class="field" type="search" placeholder="在本 Session 全部片段中查找" value="${escapeHtml(draft.query)}"></label><label>对话人筛选<select id="analysis-speaker-filter" class="select-field"><option value="all">全部对话人</option>${speakers.map((speaker) => `<option value="${escapeHtml(speaker.id)}" ${draft.speakerFilter === speaker.id ? 'selected' : ''}>${escapeHtml(speaker.label)} · ${speaker.segments.length} 段</option>`).join('')}<option value="overlap" ${draft.speakerFilter === 'overlap' ? 'selected' : ''}>多人重叠 · ${overlaps.length} 段</option></select></label><div><span data-analysis-dirty role="status"></span><button class="button primary small" data-action="save-all-analysis">保存全部修改</button></div></div>
+    <div class="speaker-groups">${speakerGroups}</div>
+    ${!speakerGroups && !showOverlap ? '<div class="empty-inline">没有匹配的台词，可清空搜索或切换对话人。</div>' : ''}
+    ${showOverlap ? `<section class="overlap-group panel"><header class="speaker-group-head overlap-head"><span class="speaker-index">!</span><div><span class="eyebrow">OVERLAPPED SPEECH</span><h2>多人重叠 / 需人工复核</h2><p>这些片段默认不进入任何人的克隆样本。“保留”只表示存档供复核，不代表已完成语音分离。</p></div></header>${analysisPagerHtml('overlap', overlapPage)}<div class="analysis-segments">${overlaps.length ? overlapPage.items.map((segment) => analysisSegmentHtml(segment, { overlap: true, speakers })).join('') : `<div class="empty-inline">${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '当前未启用可靠的重叠语音检测模型；系统没有伪造检测结果。' : '未检测到重叠语音。'}</div>`}</div>${analysisPagerHtml('overlap', overlapPage)}</section>` : ''}
   </section>`;
 }
 
@@ -3384,9 +3440,9 @@ async function waitForPendingLineSaves(projectId, requestId, timeoutMs = 8000) {
     if (requestId !== state.codexRequestId) return false;
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
-  if (hasPending()) throw new Error('仍有台词正在自动保存，请稍后再发送给协作后端。');
+  if (hasPending()) throw new Error('仍有台词正在自动保存，请稍后再试。');
   const failed = [...state.lineSaveErrors.entries()].filter(([key]) => key.startsWith(`${projectId}:`));
-  if (failed.length) throw new Error(`有 ${failed.length} 句台词自动保存失败，请重新修改并保存后再发送给协作后端。`);
+  if (failed.length) throw new Error(`有 ${failed.length} 句台词自动保存失败，请重新修改并保存后再继续。`);
   return requestId === state.codexRequestId;
 }
 
@@ -3857,6 +3913,7 @@ function discardVoiceBindings() {
 
 async function saveVoiceBindings() {
   if (state.voiceBindingSaving || !state.project) return;
+  const projectId = state.project.id;
   const assignments = voiceBindingDraftEntries();
   if (!assignments.length) return;
   stopVoiceBindingPreview({ clear: true });
@@ -3864,13 +3921,17 @@ async function saveVoiceBindings() {
   state.voiceBindingSaving = true;
   renderView();
   try {
-    const result = await api(`/api/projects/${encodeURIComponent(state.project.id)}/characters/voices`, {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/characters/voices`, {
       method: 'PATCH', body: { assignments }
     });
     const updatedProject = result?.project || result;
     if (!updatedProject?.id) throw new Error('服务未返回更新后的项目，请重新检测后再试。');
     applyCodexProjectSnapshot(updatedProject);
-    state.voiceBindingDraft.clear();
+    if (state.project?.id === projectId) {
+      for (const assignment of assignments) {
+        if (state.voiceBindingDraft.get(assignment.roleId) === assignment.voiceId) state.voiceBindingDraft.delete(assignment.roleId);
+      }
+    }
     toast('角色音色已批量保存', `已原子更新 ${assignments.length} 个角色；现在可以继续生成语音。`);
   } catch (error) {
     toast('批量绑定没有保存', `${error.message}；全部本地草稿仍保留，可修正后重试。`, 'error');
@@ -3901,6 +3962,8 @@ async function importCodexResult() {
 }
 
 async function requestRender(scope, lineId = '', demoFallback = false) {
+  const projectId = state.project?.id;
+  if (!projectId || !await waitForPendingLineSaves(projectId, state.codexRequestId) || state.project?.id !== projectId) return;
   const targets = renderTargetsForScope(scope, lineId);
   if (!targets.length) return toast('没有可生成的台词', '当前范围没有包含朗读文本的旁白或对白。', 'warn');
   const lineIds = scope === 'line' || scope === 'chapter' ? targets.map((line) => line.id) : [];
@@ -3923,6 +3986,8 @@ async function requestRender(scope, lineId = '', demoFallback = false) {
 
 async function exportProject() {
   try {
+    const projectId = state.project?.id;
+    if (!projectId || !await waitForPendingLineSaves(projectId, state.codexRequestId) || state.project?.id !== projectId) return;
     const job = await api(`/api/projects/${state.project.id}/export`, { method: 'POST', body: { format: 'wav' } });
     toast('导出任务已提交', '完成后可在任务结果中打开 WAV。'); trackJob(job);
   } catch (error) { toast('暂时无法导出', error.message, 'error'); }
@@ -3936,7 +4001,7 @@ function scheduleLineSave(lineId, patch) {
   state.lineSaveErrors.delete(key);
   const current = state.saveTimers.get(key);
   if (current) clearTimeout(current.timer);
-  const merged = { ...(current?.patch || {}), ...patch };
+  const merged = { ...(state.lineFailedDrafts.get(key)?.patch || {}), ...(current?.patch || {}), ...patch };
   const revision = (current?.revision || 0) + 1;
   const localLine = findLine(lineId);
   if (localLine) {
@@ -3948,23 +4013,31 @@ function scheduleLineSave(lineId, patch) {
     localLine.render = { status: 'stale' };
   }
   const record = { timer: null, patch: merged, revision, projectId };
-  record.timer = setTimeout(async () => {
-    try {
-      const savedProject = await api(`/api/projects/${projectId}/lines/${lineId}`, { method: 'PATCH', body: merged });
-      if (state.saveTimers.get(key) !== record || state.project?.id !== projectId) return;
-      invalidateCodexProjectRefresh(projectId);
-      const savedLine = findLineInProject(savedProject, lineId);
-      const currentLine = findLine(lineId);
-      if (savedLine && currentLine) Object.assign(currentLine, savedLine);
-      state.project.updatedAt = savedProject.updatedAt;
-      state.lineSaveErrors.delete(key);
-    } catch (error) {
-      state.lineSaveErrors.set(key, error.message || '自动保存失败');
-      toast('自动保存失败', error.message, 'error');
-    }
-    finally {
-      if (state.saveTimers.get(key) === record) state.saveTimers.delete(key);
-    }
+  record.timer = setTimeout(() => {
+    const queued = (state.lineSaveQueues.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+      try {
+        const savedProject = await api(`/api/projects/${projectId}/lines/${lineId}`, { method: 'PATCH', body: merged });
+        if (state.saveTimers.get(key) !== record) return;
+        state.lineSaveErrors.delete(key);
+        state.lineFailedDrafts.delete(key);
+        if (state.project?.id !== projectId) return;
+        invalidateCodexProjectRefresh(projectId);
+        const savedLine = findLineInProject(savedProject, lineId);
+        const currentLine = findLine(lineId);
+        if (savedLine && currentLine) Object.assign(currentLine, savedLine);
+        state.project.updatedAt = savedProject.updatedAt;
+      } catch (error) {
+        if (state.saveTimers.get(key) === record) {
+          state.lineSaveErrors.set(key, error.message || '自动保存失败');
+          state.lineFailedDrafts.set(key, { patch: merged });
+          toast('自动保存失败', `${error.message}；修改仍保留，请重试后再刷新。`, 'error');
+        }
+      } finally {
+        if (state.saveTimers.get(key) === record) state.saveTimers.delete(key);
+      }
+    });
+    state.lineSaveQueues.set(key, queued);
+    void queued.finally(() => { if (state.lineSaveQueues.get(key) === queued) state.lineSaveQueues.delete(key); });
   }, 480);
   state.saveTimers.set(key, record);
 }
@@ -4445,10 +4518,11 @@ async function saveAnalysisSegment(segmentId) {
   if (!row) return;
   const analysisId = state.voiceAnalysisId;
   const mutationKey = `${analysisId}:${segmentId}`;
-  if (state.voiceAnalysisMutations.has(mutationKey)) return;
+  if (state.voiceAnalysisMutations.has(mutationKey) || state.voiceAnalysisMutations.has(`${analysisId}:bulk`)) return;
   state.voiceAnalysisMutations.add(mutationKey);
   captureAnalysisInput(row.querySelector('[data-analysis-text]'));
   const patch = analysisDraft(analysisId).segments.get(segmentId);
+  if (!patch) { state.voiceAnalysisMutations.delete(mutationKey); syncAnalysisDirtyUi(); return; }
   const button = row.querySelector('[data-action="save-analysis-segment"]');
   if (button) { button.disabled = true; button.textContent = '保存中…'; }
   try {
@@ -4461,6 +4535,29 @@ async function saveAnalysisSegment(segmentId) {
   } finally {
     state.voiceAnalysisMutations.delete(mutationKey);
     if (button?.isConnected) { button.disabled = false; button.textContent = '保存修改'; }
+    if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
+  }
+}
+
+async function saveAllAnalysisEdits() {
+  const analysisId = state.voiceAnalysisId;
+  if (!analysisId || [...state.voiceAnalysisMutations].some((key) => key.startsWith(`${analysisId}:`))) return;
+  const edits = [...analysisDraft(analysisId).segments].map(([segmentId, patch]) => ({ segmentId, patch }));
+  if (!edits.length) return;
+  const key = `${analysisId}:bulk`;
+  state.voiceAnalysisMutations.add(key);
+  syncAnalysisDirtyUi();
+  try {
+    const result = await api(`/api/voice-analyses/${analysisId}/segments`, { method: 'PATCH', body: { edits } });
+    for (const edit of edits) {
+      if (analysisDraft(analysisId).segments.get(edit.segmentId) === edit.patch) analysisDraft(analysisId).segments.delete(edit.segmentId);
+    }
+    rememberVoiceAnalysis(result.analysis);
+    toast('全部修改已保存', `${edits.length} 段已一起写入此 Session。`);
+  } catch (error) {
+    toast('批量保存未完成', `${error.message}；全部草稿仍然保留。`, 'error');
+  } finally {
+    state.voiceAnalysisMutations.delete(key);
     if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
   }
 }
@@ -4491,6 +4588,7 @@ async function addAnalysisSpeaker(form) {
 
 async function exportAnalysisSpeaker(speakerId, group = null, analysis = state.voiceAnalysis) {
   if (!analysis?.id || !speakerId) return null;
+  if (analysisDraft(analysis.id).segments.size || [...state.voiceAnalysisMutations].some((key) => key.startsWith(`${analysis.id}:`))) throw new Error('请先保存全部片段修改，再导出音色，避免使用旧台词。');
   const root = group || $(`.speaker-group[data-speaker-id="${CSS.escape(speakerId)}"]`);
   const name = root?.querySelector('[data-speaker-export-name]')?.value.trim();
   if (!name) throw new Error('请填写导出音色名称');
@@ -4611,6 +4709,14 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'select-analysis-session') { await selectVoiceAnalysisSession(target.dataset.sessionId); return; }
+    if (action === 'analysis-page') {
+      analysisDraft().pages.set(target.dataset.groupId, Math.max(0, Number(target.dataset.page) || 0));
+      renderVoiceAnalysisStudio();
+      const group = target.dataset.groupId === 'overlap' ? $('.overlap-group') : $(`.speaker-group[data-speaker-id="${CSS.escape(target.dataset.groupId)}"]`);
+      group?.scrollIntoView({ block: 'start' });
+      return;
+    }
+    if (action === 'save-all-analysis') { await saveAllAnalysisEdits(); return; }
     if (action === 'save-analysis-segment') { await saveAnalysisSegment(target.dataset.segmentId); return; }
     if (action === 'export-analysis-speaker') { await exportAnalysisSpeaker(target.dataset.speakerId); return; }
     if (action === 'export-selected-speakers') { await exportSelectedAnalysisSpeakers(); return; }
@@ -4884,6 +4990,12 @@ document.addEventListener('submit', (event) => {
 
 document.addEventListener('change', async (event) => {
   captureAnalysisInput(event.target);
+  if (event.target.id === 'analysis-speaker-filter') {
+    analysisDraft().speakerFilter = event.target.value;
+    analysisDraft().pages.clear();
+    renderVoiceAnalysisStudio();
+    return;
+  }
   const input = event.target;
   if (input.name === 'script-mode') {
     state.codexMode = CODEX_MODE_LABELS[input.value] ? input.value : 'faithful';
@@ -5014,6 +5126,12 @@ document.addEventListener('change', async (event) => {
 document.addEventListener('input', (event) => {
   const input = event.target;
   captureAnalysisInput(input);
+  if (input.id === 'analysis-search') {
+    analysisDraft().query = input.value;
+    analysisDraft().pages.clear();
+    renderVoiceAnalysisStudio();
+    return;
+  }
   if (input.closest?.('#voice-design-form')) {
     const form = input.closest('#voice-design-form');
     const data = new FormData(form);
@@ -5207,6 +5325,13 @@ window.addEventListener('hashchange', async () => {
     }
     void recoverActiveCodexSessions();
   }
+});
+
+window.addEventListener('beforeunload', (event) => {
+  const dirty = state.saveTimers.size || state.lineFailedDrafts.size || state.voiceBindingDraft.size
+    || state.voiceAnalysisSubmitting || state.voiceAnalysisMutations.size
+    || [...state.voiceAnalysisDrafts.values()].some((draft) => draft.segments.size);
+  if (dirty) { event.preventDefault(); event.returnValue = ''; }
 });
 
 window.addEventListener('pagehide', () => {

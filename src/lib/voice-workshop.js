@@ -118,7 +118,8 @@ function normalizedEmotion(value) {
   return EMOTION_IDS.has(emotion) ? emotion : EMOTION_ALIASES.get(emotion) || 'neutral';
 }
 
-function finiteConfidence(value, fallback = 0) {
+function finiteConfidence(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : fallback;
 }
@@ -622,6 +623,18 @@ function normalizedCapabilities(value) {
   ]));
 }
 
+export function workerSpeakerSegments(speaker) {
+  const segments = Array.isArray(speaker?.segments) ? speaker.segments : [];
+  if (!Array.isArray(speaker?.clean_segments)) return segments;
+  const clean = speaker.clean_segments;
+  const represented = new Set(clean.map((segment) => String(segment.source_segment_id || segment.id || segment.segment_id || '')));
+  // Preserve excluded ASR sentences for review. "Not usable for cloning" must
+  // not mean losing their transcript and original audio from the session.
+  const excluded = segments.filter((segment) => !represented.has(String(segment.id || segment.segment_id || '')))
+    .map((segment) => ({ ...segment, contains_overlap: true }));
+  return [...clean, ...excluded].sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0));
+}
+
 export async function analyzeVoiceSource(source, analysisInput, { settings, profile }, update = () => {}) {
   const analysisId = id('voiceanalysis');
   const outputDir = path.resolve(VOICE_ANALYSIS_JOBS_DIR, analysisId);
@@ -667,8 +680,7 @@ export async function analyzeVoiceSource(source, analysisInput, { settings, prof
       throw apiError('重叠片段数量超过安全限制', { code: 'VOICE_ANALYSIS_RESULT_TOO_LARGE', statusCode: 502 });
     }
     const segmentCount = rawSpeakers.reduce((sum, speaker) => {
-      const segments = Array.isArray(speaker?.clean_segments) ? speaker.clean_segments : speaker?.segments;
-      return sum + (Array.isArray(segments) ? segments.length : 0);
+      return sum + workerSpeakerSegments(speaker).length;
     }, 0);
     if ((segmentCount === 0 && rawOverlaps.length === 0) || segmentCount > MAX_VOICE_ANALYSIS_SEGMENTS) {
       throw apiError('语音片段数量无效或超过安全限制', { code: 'VOICE_ANALYSIS_RESULT_TOO_LARGE', statusCode: 502 });
@@ -686,9 +698,7 @@ export async function analyzeVoiceSource(source, analysisInput, { settings, prof
     const speakers = [];
     for (const { rawSpeaker, speakerId, index } of speakerRecords) {
       const segments = [];
-      const workerSegments = Array.isArray(rawSpeaker.clean_segments)
-        ? rawSpeaker.clean_segments
-        : rawSpeaker.segments || [];
+      const workerSegments = workerSpeakerSegments(rawSpeaker);
       for (const rawSegment of workerSegments) {
         segments.push(await normalizeWorkerSegment(rawSegment, {
           outputDir, profile, analysisId, speakerId, seenSegmentIds
@@ -748,7 +758,7 @@ export async function analyzeVoiceSource(source, analysisInput, { settings, prof
     await fs.rename(outputDir, finalDir);
     await deleteVoiceSource(source.id, { allowClaimed: true, missingOk: true });
     update(100, '说话人分析已完成');
-    return { analysisId, analysis: publicAnalysis(manifest) };
+    return { analysisId, name: manifest.name, durationMs: manifest.durationMs, speakerCount: speakers.length };
   } catch (error) {
     await Promise.allSettled([
       fs.rm(outputDir, { recursive: true, force: true }),
@@ -819,7 +829,7 @@ function findManifestSegmentRecord(manifest, segmentId) {
   throw apiError('片段不存在', { code: 'VOICE_SEGMENT_NOT_FOUND', statusCode: 404 });
 }
 
-export async function updateVoiceAnalysisSegment(analysisId, segmentId, patch = {}) {
+function validateSegmentPatch(patch = {}) {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw apiError('片段修改参数无效');
   const allowed = new Set(['text', 'emotion', 'keep', 'speakerId']);
   if (!Object.keys(patch).length || Object.keys(patch).some((key) => !allowed.has(key))) {
@@ -838,8 +848,9 @@ export async function updateVoiceAnalysisSegment(analysisId, segmentId, patch = 
   )) {
     throw apiError('说话人标识无效', { code: 'VOICE_SPEAKER_ID_INVALID' });
   }
-  return withAnalysisLock(analysisId, async () => {
-    const manifest = await readManifest(analysisId);
+}
+
+function applySegmentPatch(manifest, segmentId, patch) {
     const record = findManifestSegmentRecord(manifest, segmentId);
     const { segment } = record;
     if ('speakerId' in patch && patch.speakerId !== 'overlap') {
@@ -869,15 +880,33 @@ export async function updateVoiceAnalysisSegment(analysisId, segmentId, patch = 
     if ('text' in patch) segment.text = patch.text.trim();
     if ('emotion' in patch) segment.emotion = String(patch.emotion).trim().toLowerCase();
     if ('keep' in patch) segment.keep = patch.keep;
+    return segment;
+}
+
+export async function updateVoiceAnalysisSegments(analysisId, edits) {
+  if (!Array.isArray(edits) || !edits.length || edits.length > MAX_VOICE_ANALYSIS_SEGMENTS) throw apiError('片段修改列表无效');
+  const ids = new Set();
+  for (const edit of edits) {
+    if (!edit || Object.keys(edit).some((key) => !['segmentId', 'patch'].includes(key)) || typeof edit.segmentId !== 'string' || !SAFE_ITEM_ID_PATTERN.test(edit.segmentId) || ids.has(edit.segmentId)) {
+      throw apiError('片段标识无效或重复');
+    }
+    validateSegmentPatch(edit.patch);
+    ids.add(edit.segmentId);
+  }
+  return withAnalysisLock(analysisId, async () => {
+    const manifest = await readManifest(analysisId);
+    const segments = edits.map((edit) => publicSegment(applySegmentPatch(manifest, edit.segmentId, edit.patch)));
+    for (const speaker of manifest.speakers) speaker.segments.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+    manifest.overlaps.sort((a, b) => a.startMs - b.startMs);
     manifest.revision += 1;
     await saveManifest(manifest);
-    return {
-      analysis: publicAnalysis(manifest),
-      segment: publicSegment(segment),
-      revision: manifest.revision,
-      updatedAt: manifest.updatedAt
-    };
+    return { analysis: publicAnalysis(manifest), segments, revision: manifest.revision, updatedAt: manifest.updatedAt };
   });
+}
+
+export async function updateVoiceAnalysisSegment(analysisId, segmentId, patch = {}) {
+  const result = await updateVoiceAnalysisSegments(analysisId, [{ segmentId, patch }]);
+  return { ...result, segment: result.segments[0] };
 }
 
 export async function updateVoiceAnalysisSpeaker(analysisId, speakerId, patch = {}) {

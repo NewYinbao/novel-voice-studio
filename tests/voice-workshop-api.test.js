@@ -251,6 +251,7 @@ test('提示词设计、多人分析、编辑与按说话人导出形成安全�
   assert.equal(analysisJob.state, 'completed', JSON.stringify(analysisJob.error));
   assert.match(analysisJob.result.analysisId, /^voiceanalysis_[a-f0-9]{16}$/);
   assert.equal(analysisCalls, 1);
+  assert.equal(analysisJob.result.analysis, undefined, '任务响应只返回索引，不重复携带完整台词');
   assert.equal(maxActiveGpuCalls, 1);
   await assert.rejects(() => fs.stat(path.join(VOICE_SOURCES_DIR, upload.id)), { code: 'ENOENT' });
 
