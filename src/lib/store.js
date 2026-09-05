@@ -8,6 +8,8 @@ import {
   PROJECTS_DIR,
   SETTINGS_PATH,
   TMP_DIR,
+  VOICE_ANALYSES_DIR,
+  VOICE_DESIGNS_DIR,
   VOICES_DIR
 } from './config.js';
 import { ensureDir, id, nowIso, readJson, safeName, writeJsonAtomic } from './utils.js';
@@ -49,7 +51,7 @@ async function withProjectLock(projectId, fn) {
 export async function initStore() {
   await Promise.all([
     ensureDir(DATA_DIR), ensureDir(PROJECTS_DIR), ensureDir(VOICES_DIR),
-    ensureDir(EXPORTS_DIR), ensureDir(TMP_DIR)
+    ensureDir(EXPORTS_DIR), ensureDir(TMP_DIR), ensureDir(VOICE_ANALYSES_DIR), ensureDir(VOICE_DESIGNS_DIR)
   ]);
   const settings = await readJson(SETTINGS_PATH);
   if (!settings) await writeJsonAtomic(SETTINGS_PATH, DEFAULT_SETTINGS);
@@ -265,7 +267,8 @@ function normalizeVoiceProvenance(value) {
 }
 
 export async function createVoice({
-  name, tags = [], language = 'zh-CN', transcript = '', kind = 'recorded', consent = false, audio, provenance = null
+  name, tags = [], language = 'zh-CN', transcript = '', kind = 'recorded', consent = false, audio, provenance = null,
+  design = null
 }) {
   if (!consent) throw Object.assign(new Error('请确认你有权使用该声音样本'), { statusCode: 400 });
   const voiceId = id('voice');
@@ -307,6 +310,14 @@ export async function createVoice({
     defaults: { speed: 1, pitch: 0 },
     quality: { state: 'unchecked', notes: ['安装 FFmpeg 后可执行响度、静音和削波检测'] }
   };
+  if (design && typeof design === 'object') {
+    voice.design = {
+      designId: /^voicedesign_[a-f0-9]{16}$/.test(String(design.designId || '')) ? String(design.designId) : null,
+      prompt: String(design.prompt || '').trim().slice(0, 4000),
+      previewText: String(design.previewText || '').trim().slice(0, 2000),
+      modelId: String(design.modelId || '').trim().slice(0, 200)
+    };
+  }
   await writeJsonAtomic(voicePath(voiceId), voice);
   return voice;
 }

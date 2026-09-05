@@ -10,6 +10,9 @@ export const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 export const TMP_DIR = path.join(DATA_DIR, '.tmp');
 export const VOICE_SOURCES_DIR = path.join(TMP_DIR, 'voice-sources');
 export const VOICE_CLIPS_DIR = path.join(TMP_DIR, 'voice-clips');
+export const VOICE_ANALYSIS_JOBS_DIR = path.join(TMP_DIR, 'voice-analysis');
+export const VOICE_ANALYSES_DIR = path.join(DATA_DIR, 'voice-analyses');
+export const VOICE_DESIGNS_DIR = path.join(DATA_DIR, 'voice-designs');
 export const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 export const SCRIPT_SCHEMA_PATH = path.join(ROOT_DIR, 'schemas', 'audiobook-script.schema.json');
 
@@ -19,6 +22,12 @@ export const MAX_VOICE_BYTES = 25 * 1024 * 1024;
 export const MAX_VOICE_SOURCE_BYTES = 1024 * 1024 * 1024;
 export const MIN_VOICE_CLIP_MS = 3_000;
 export const MAX_VOICE_CLIP_MS = 60_000;
+export const MAX_VOICE_ANALYSIS_SPEAKERS = 20;
+export const MAX_VOICE_ANALYSIS_SEGMENTS = 5000;
+export const MAX_VOICE_ANALYSIS_OVERLAPS = 1000;
+export const MAX_VOICE_ANALYSIS_DURATION_MS = 12 * 60 * 60_000;
+export const MAX_VOICE_ANALYSIS_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024;
+export const MAX_VOICE_EXPORT_MS = 5 * 60_000;
 
 export const EMOTIONS = [
   { id: 'neutral', label: '平静', glyph: '—' },

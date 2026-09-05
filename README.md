@@ -112,6 +112,49 @@ npm start
 
 工作器监听 `127.0.0.1:7861`，健康检查为 `http://127.0.0.1:7861/health`。
 
+如果要同时使用“提示词音色设计”和“长音视频多人拆分”，安装完整音色工作台：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-worker.ps1 `
+  -Engine all `
+  -ModelDir "D:\AIModels\voice-studio"
+```
+
+已有 Qwen 环境时也可以只补分析依赖和 SenseVoice、VAD、标点、CAM++ 模型：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-worker.ps1 `
+  -Engine analysis `
+  -ModelDir "D:\AIModels\voice-studio"
+```
+
+### 用提示词设计音色
+
+音色库中的“提示词音色设计”是独立页面。它使用 `Qwen3-TTS-12Hz-1.7B-VoiceDesign` 生成短母版；16GB 显卡一次只驻留一个模型，生成后会卸载 VoiceDesign，再由 Base 模型在制作整书时克隆母版。
+
+生成与入库是两个明确步骤：
+
+1. 写声音、年龄感、播音风格、节奏及试读文案，点击“生成试听候选”。
+2. 候选不会出现在正式音色库；先试听并检查声线、吐字、停连和情绪。
+3. 满意后点击“试听满意，加入音色库”。重复点击不会重复创建音色；不满意可以丢弃或修改提示词再生成。未提交候选默认保留 7 天。
+
+高质量 ICL 克隆需要**参考音频和与其逐字匹配的准确文字**。只有音频也能提取声纹，但稳定性和相似度通常更差；自动转写只能作为初稿，入库前应人工校正。VoiceDesign 候选会把试读文案与母版一起保存，正是为了后续 Base 克隆时使用准确配对。
+
+### 从长音视频拆分多人音色
+
+音色库中的“多人音频拆分”支持长短音频或视频，处理流程为：
+
+1. SenseVoice + FSMN-VAD 完成语音识别和时间切分，ct-punc 补标点，CAM++ 按说话人聚类。
+2. 页面按说话人分组展示片段，可逐段试听，并修改台词、语气及说话人归属。
+3. 每组只用明确保留的干净片段导出音色；导出前仍应校正自动台词，确保音频与文字匹配。
+4. 多人同时说话的区间单独列出，默认不进入任何人的克隆素材。与重叠区相交的整句也会保守排除，不会把残片错误配上整句文字。
+
+左侧“历史 Session”会列出所有已完成的拆分，原始媒体、拆分 WAV、台词、语气和对话人归属一起保存在 `data/voice-analyses/<session-id>/`，刷新页面或重启服务后仍可查看、试听和下载原文件。新任务运行时可以继续编辑旧会话，后台完成不会抢占当前选中的 Session。尚未点击“保存修改”的片段只在当前页面内按 Session 暂存，刷新前请先保存。
+
+拆分结果上方可“添加对话人”（每个 Session 最多 20 人）；在片段的“归属”中选中新对话人并保存，即可纠正自动分组。新建对话人不会复制或改变原音频。失败任务仅保留任务记录，没有完整的音频存档，需要重新上传处理。
+
+可靠的重叠检测是可选能力：需要先在 Hugging Face 接受 `pyannote/speaker-diarization-community-1` 条款，并在启动工作器的终端设置自己的 `HF_TOKEN`；未配置时界面会明确显示“重叠检测未启用”，不会伪造结果。当前功能只负责**检测并单列**混合语音，不承诺把同一时间重叠的多人声音完美分离。
+
 ### 从长视频或音频制作音色
 
 进入“音色库”并选择“制作新音色 → 从长媒体裁剪”：
@@ -123,9 +166,15 @@ npm start
 
 单个长媒体默认上限为 1GB，不使用 Base64、不会整体读入内存；裁剪任务串行执行。提交成功或失败后会清理来源和中间文件，应用重启时也会回收未完成任务的临时素材。浏览器无法预览的容器或编码需先转为 MP4、WebM、WAV、MP3 或 M4A。
 
-### 导入默认开源测试音色
+### 导入常用开源测试音色
 
-应用和模型工作器启动后，可一次性导入 AISHELL-3 的两位男声和一位女声，并自动绑定到指定作品：
+应用启动后，可一次性导入 5 类 × 3 个常用角色预置：年长教师感、中年男声、中年女声、少女感和少年感。命令还会保留原有的 3 个基础测试音色：
+
+```powershell
+npm run seed:voices
+```
+
+无参数命令只修改音色库，不会更改任何作品的角色绑定。如果确实需要把原有的旁白/男声/女声基础音色绑定到某一作品，必须显式传入项目 ID：
 
 ```powershell
 npm run seed:voices -- --project-id project_xxxxxxxxxxxxxxxx
@@ -137,7 +186,7 @@ npm run seed:voices -- --project-id project_xxxxxxxxxxxxxxxx
 npm run seed:voices -- --project-id project_xxxxxxxxxxxxxxxx --render
 ```
 
-脚本可重复执行，不会重复创建已经就绪的默认音色。样本来自 [AISHELL-3](https://huggingface.co/datasets/AISHELL/AISHELL-3)，数据集标注为 Apache-2.0；音色卡会保留 `AISHELL-3`、许可证和说话人编号标签。这些默认项只用于本地开发与流程测试，发布成品前仍应按作品用途自行复核许可和声音权利。
+脚本可重复执行，不会重复创建已经就绪的预置音色；首次需联网，之后会复用 `data/.tmp/aishell3-defaults/` 中经 SHA-256 校验的缓存。样本来自 [AISHELL-3](https://huggingface.co/datasets/AISHELL/AISHELL-3)，数据集标注为 Apache-2.0；音色卡会保留选角类型、年龄组、性别、口音、许可证和匿名说话人编号。AISHELL-3 的元数据定义 B 组为 14–25 岁、C 组为 26–40 岁、D 组为 41 岁以上；“年长教师感”“中年”“少女感”“少年感”只是有声书选角标签，不表示说话人的真实职业或精确年龄。这些预置只用于本地开发与流程测试，发布成品前仍应按作品用途自行复核许可和声音权利。
 
 ### CosyVoice 3 注意事项
 

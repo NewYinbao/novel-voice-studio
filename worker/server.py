@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,20 @@ from audio_extract import (
     extract_audio_segment,
 )
 from providers.cosyvoice import CosyVoiceProvider
-from providers.qwen3_tts import Qwen3TTSProvider
+from providers.qwen3_tts import (
+    VOICE_DESIGN_MODEL_ID,
+    Qwen3TTSProvider,
+    Qwen3VoiceDesignProvider,
+)
+from voice_analysis import (
+    FunASRVoiceAnalysisProvider,
+    VoiceAnalysisError,
+    VoiceAnalysisRequest,
+    VoiceAnalysisTimeout,
+    VoiceAnalysisUnavailable,
+    validate_analysis_paths,
+    voice_analysis_capabilities,
+)
 
 
 WORKER_DIR = Path(__file__).resolve().parent
@@ -33,6 +47,7 @@ ENV_BIN_DIRS = [Path(sys.prefix), Path(sys.prefix) / "Scripts", Path(sys.prefix)
 os.environ["PATH"] = os.pathsep.join([*(str(item) for item in ENV_BIN_DIRS if item.exists()), os.environ.get("PATH", "")])
 HOST = os.environ.get("NVS_WORKER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("NVS_WORKER_PORT", "7861"))
+VOICE_DESIGN_ID_PATTERN = re.compile(r"^voicedesign_[a-f0-9]{16}$")
 
 
 class TTSRequest(BaseModel):
@@ -71,6 +86,31 @@ class TTSRequest(BaseModel):
             raise ValueError("参考音频不存在")
         return str(target)
 
+
+class VoiceDesignRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=200)
+    model_id: Literal["Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"] = VOICE_DESIGN_MODEL_ID
+    text: str = Field(min_length=1, max_length=1000)
+    prompt: str = Field(min_length=1, max_length=2000)
+    language: str = Field(default="zh-CN", min_length=1, max_length=32)
+    output_path: str = Field(min_length=1, max_length=4096)
+
+
+def validate_voice_design_output(value: str) -> str:
+    target = Path(value).expanduser().resolve()
+    expected_root = DATA_DIR / ".tmp" / "voice-clips"
+    if (
+        target.parent.parent != expected_root
+        or not VOICE_DESIGN_ID_PATTERN.fullmatch(target.parent.name)
+        or target.name != "reference.wav"
+    ):
+        raise ValueError(
+            "output_path 必须为专用 VoiceDesign 临时路径 "
+            "data/.tmp/voice-clips/voicedesign_<16>/reference.wav"
+        )
+    if target.exists():
+        raise ValueError("output_path 已存在，拒绝覆盖")
+    return str(target)
 
 PROVIDERS = {
     "cosyvoice": CosyVoiceProvider,
@@ -120,6 +160,44 @@ class EngineManager:
                 self.provider = candidate
                 self.key = key
             return self.provider.synthesize(request)
+
+    def design_voice(self, request: VoiceDesignRequest) -> dict[str, Any]:
+        if request.model_id != VOICE_DESIGN_MODEL_ID:
+            raise ValueError(f"VoiceDesign 模型未列入允许清单：{request.model_id}")
+        with self.lock:
+            key = ("qwen3_tts_voice_design", request.model_id)
+            if self.key != key:
+                if self.provider is not None:
+                    self.provider.unload()
+                self.provider = None
+                self.key = None
+                candidate = Qwen3VoiceDesignProvider(request.model_id, MODEL_ROOT)
+                try:
+                    candidate.load()
+                except Exception:
+                    candidate.unload()
+                    raise
+                self.provider = candidate
+                self.key = key
+            return self.provider.synthesize(request)
+
+    def analyze_voice(self, request: VoiceAnalysisRequest) -> dict[str, Any]:
+        with self.lock:
+            key = ("voice_analysis", "SenseVoiceSmall+fsmn-vad+ct-punc+cam++")
+            if self.key != key:
+                if self.provider is not None:
+                    self.provider.unload()
+                self.provider = None
+                self.key = None
+                candidate = FunASRVoiceAnalysisProvider(MODEL_ROOT)
+                try:
+                    candidate.load()
+                except Exception:
+                    candidate.unload()
+                    raise
+                self.provider = candidate
+                self.key = key
+            return self.provider.analyze(request, DATA_DIR)
 
     @property
     def loaded_engine(self) -> str | None:
@@ -190,7 +268,13 @@ def health() -> dict[str, Any]:
         },
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ffprobe": shutil.which("ffprobe") is not None,
+        "voice_analysis": voice_analysis_capabilities(),
     }
+
+
+@app.get("/v1/voice-analysis/capabilities")
+def get_voice_analysis_capabilities() -> dict[str, Any]:
+    return voice_analysis_capabilities()
 
 
 @app.post("/v1/audio/extract")
@@ -205,6 +289,41 @@ def extract_audio(request: AudioExtractRequest) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/v1/voice/design")
+def design_voice(request: VoiceDesignRequest) -> dict[str, Any]:
+    try:
+        request = request.model_copy(update={
+            "output_path": validate_voice_design_output(request.output_path),
+        })
+        return manager.design_voice(request)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        message = str(error)
+        code = "GPU_OOM" if "out of memory" in message.lower() else "VOICE_DESIGN_FAILED"
+        raise HTTPException(status_code=503, detail=f"{code}: {message}") from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"VOICE_DESIGN_FAILED: {error}") from error
+
+
+@app.post("/v1/voice-analysis")
+def analyze_voice(request: VoiceAnalysisRequest) -> dict[str, Any]:
+    try:
+        # Validate before a potentially expensive model download/load.
+        validate_analysis_paths(request, DATA_DIR)
+        return manager.analyze_voice(request)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except VoiceAnalysisUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except VoiceAnalysisTimeout as error:
+        raise HTTPException(status_code=504, detail=str(error)) from error
+    except VoiceAnalysisError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"VOICE_ANALYSIS_FAILED: {error}") from error
 
 
 @app.post("/v1/tts")

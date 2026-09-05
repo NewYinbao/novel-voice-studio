@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .base import TTSProvider, atomic_audio_target
+from .base import TTSProvider, atomic_audio_target, exclusive_audio_target
 
 
 LANGUAGES = {
@@ -15,6 +15,8 @@ LANGUAGES = {
     "de": "German", "fr": "French", "ru": "Russian", "pt": "Portuguese",
     "es": "Spanish", "it": "Italian",
 }
+
+VOICE_DESIGN_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
 
 class Qwen3TTSProvider(TTSProvider):
@@ -108,3 +110,60 @@ class Qwen3TTSProvider(TTSProvider):
         self.prompt_cache.clear()
         self.model = None
         super().unload()
+
+
+class Qwen3VoiceDesignProvider(Qwen3TTSProvider):
+    """Natural-language voice design using the dedicated Qwen3-TTS model."""
+
+    provider_id = "qwen3_tts_voice_design"
+
+    def synthesize(self, request: Any) -> dict[str, Any]:
+        if self.model_id != VOICE_DESIGN_MODEL_ID:
+            raise ValueError(f"VoiceDesign 模型未列入允许清单：{self.model_id}")
+        if self.model is None:
+            self.load()
+
+        import soundfile as sf
+
+        language = LANGUAGES.get(request.language.lower(), "Auto")
+        wavs, sample_rate = self.model.generate_voice_design(
+            text=request.text,
+            instruct=request.prompt,
+            language=language,
+            non_streaming_mode=True,
+        )
+        if not wavs:
+            raise RuntimeError("Qwen3-TTS VoiceDesign 没有返回音频")
+
+        target, partial = exclusive_audio_target(request.output_path)
+        completed = False
+        try:
+            sf.write(
+                str(partial),
+                wavs[0],
+                sample_rate,
+                format="WAV",
+                subtype="PCM_16",
+            )
+            if not partial.is_file() or partial.stat().st_size <= 44:
+                raise RuntimeError("Qwen3-TTS VoiceDesign 没有生成有效 WAV")
+            partial.replace(target)
+            completed = True
+        finally:
+            partial.unlink(missing_ok=True)
+            if not completed:
+                target.unlink(missing_ok=True)
+
+        info = sf.info(str(target))
+        return {
+            "request_id": request.request_id,
+            "output_path": str(target),
+            "audio_path": str(target),
+            "duration_ms": round(info.duration * 1000),
+            "duration_seconds": info.duration,
+            "sample_rate": int(info.samplerate),
+            "channels": int(info.channels),
+            "engine": self.provider_id,
+            "model_id": self.model_id,
+            "warnings": [],
+        }

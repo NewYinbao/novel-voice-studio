@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('qwen', 'base', 'cosyvoice')]
+    [ValidateSet('qwen', 'base', 'cosyvoice', 'analysis', 'all')]
     [string]$Engine = 'qwen',
     [string]$EnvName = 'novel-voice',
     [string]$Runner = '',
@@ -70,15 +70,41 @@ if ($Engine -ne 'base') {
     Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-m', 'pip', 'install', '--upgrade', 'torchcodec'))
 }
 
-if ($Engine -eq 'qwen') {
+if ($Engine -in @('qwen', 'all')) {
     Write-Host 'Installing the native-Windows Qwen3-TTS engine...' -ForegroundColor Cyan
     Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-m', 'pip', 'install', '--upgrade', 'qwen-tts', 'huggingface-hub'))
     if (-not $SkipModelDownload) {
         $TargetRoot = if ($ModelDir) { $ModelDir } else { Join-Path $WorkerRoot 'models' }
         New-Item -ItemType Directory -Force -Path $TargetRoot | Out-Null
-        $Target = Join-Path $TargetRoot 'Qwen3-TTS-12Hz-0.6B-Base'
-        Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-c', "import sys; from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base', local_dir=sys.argv[1])", $Target))
+        $QwenModels = @(
+            @{ Id = 'Qwen/Qwen3-TTS-12Hz-0.6B-Base'; Directory = 'Qwen3-TTS-12Hz-0.6B-Base' },
+            @{ Id = 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign'; Directory = 'Qwen3-TTS-12Hz-1.7B-VoiceDesign' }
+        )
+        foreach ($Model in $QwenModels) {
+            $Target = Join-Path $TargetRoot $Model.Directory
+            Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-c', "import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], local_dir=sys.argv[2])", $Model.Id, $Target))
+        }
     }
+}
+
+if ($Engine -in @('analysis', 'all')) {
+    Write-Host 'Installing local voice analysis (SenseVoice, VAD, punctuation, CAM++ and pyannote)...' -ForegroundColor Cyan
+    Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-m', 'pip', 'install', '-r', (Join-Path $WorkerRoot 'requirements-analysis.txt')))
+    if (-not $SkipModelDownload) {
+        $TargetRoot = if ($ModelDir) { $ModelDir } else { Join-Path $WorkerRoot 'models' }
+        New-Item -ItemType Directory -Force -Path $TargetRoot | Out-Null
+        $AnalysisModels = @(
+            @{ Id = 'iic/SenseVoiceSmall'; Directory = 'SenseVoiceSmall' },
+            @{ Id = 'iic/speech_fsmn_vad_zh-cn-16k-common-pytorch'; Directory = 'fsmn-vad' },
+            @{ Id = 'iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch'; Directory = 'ct-punc' },
+            @{ Id = 'iic/speech_campplus_sv_zh-cn_16k-common'; Directory = 'cam-plus-plus' }
+        )
+        foreach ($Model in $AnalysisModels) {
+            $Target = Join-Path $TargetRoot $Model.Directory
+            Invoke-Env $ResolvedRunner ($RunPrefix + @('python', '-c', "import sys; from modelscope import snapshot_download; snapshot_download(sys.argv[1], local_dir=sys.argv[2])", $Model.Id, $Target))
+        }
+    }
+    Write-Warning 'Overlap detection requires accepting pyannote/speaker-diarization-community-1 terms and setting HF_TOKEN, or setting NVS_PYANNOTE_MODEL to an offline model directory.'
 }
 
 if ($Engine -eq 'cosyvoice') {

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DATA_DIR, MAX_BOOK_BYTES, MAX_JSON_BYTES, MAX_VOICE_BYTES, MAX_VOICE_SOURCE_BYTES,
   MAX_VOICE_CLIP_MS, MIN_VOICE_CLIP_MS, PROJECTS_DIR, PUBLIC_DIR, TTS_ENGINES,
-  VOICES_DIR, EXPORTS_DIR, EMOTIONS
+  VOICES_DIR, VOICE_ANALYSES_DIR, VOICE_DESIGNS_DIR, EXPORTS_DIR, EMOTIONS
 } from './lib/config.js';
 import { engineCompatibility, getSystemProfile } from './lib/system.js';
 import {
@@ -53,6 +53,12 @@ import {
   saveVoiceSource, validateVoiceExtraction
 } from './lib/video-voice.js';
 import {
+  analyzeVoiceSource, cleanupExpiredVoiceDesigns, commitVoiceDesign, designVoice, discardVoiceDesign,
+  exportSpeakerVoice, getVoiceAnalysis, getVoiceDesign, listVoiceAnalyses, listVoiceDesigns,
+  updateVoiceAnalysis, updateVoiceAnalysisSegment, updateVoiceAnalysisSpeaker, addVoiceAnalysisSpeaker,
+  validateSpeakerExport, validateVoiceAnalysis, validateVoiceDesign
+} from './lib/voice-workshop.js';
+import {
   clamp, decodeBase64Payload, isPathInside, json, mediaType, nowIso, parseJsonBody, safeName, text
 } from './lib/utils.js';
 
@@ -60,6 +66,7 @@ const jobs = new JobManager(path.join(DATA_DIR, 'jobs.json'));
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 4317);
 const codexSessionLocks = new Map();
+const idempotencyLocks = new Map();
 
 function createMutationLock() {
   let pending = Promise.resolve();
@@ -71,6 +78,39 @@ function createMutationLock() {
 }
 
 const withGlobalVoiceMutationLock = createMutationLock();
+
+function idempotencyKey(req) {
+  const value = String(req.headers['idempotency-key'] || '').trim();
+  if (!value) return null;
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+    throw Object.assign(new Error('Idempotency-Key 格式无效'), {
+      code: 'IDEMPOTENCY_KEY_INVALID', statusCode: 400
+    });
+  }
+  return value;
+}
+
+function previousIdempotentJob(type, key, scope) {
+  if (!key) return null;
+  return jobs.list().find((job) => (
+    job.type === type
+    && job.payload?.idempotencyKey === key
+    && job.payload?.idempotencyScope === scope
+  )) || null;
+}
+
+async function withIdempotencyLock(type, key, scope, operation) {
+  if (!key) return operation();
+  const lockKey = `${type}:${scope}:${key}`;
+  const previous = idempotencyLocks.get(lockKey) || Promise.resolve();
+  const next = previous.catch(() => {}).then(operation);
+  idempotencyLocks.set(lockKey, next);
+  try {
+    return await next;
+  } finally {
+    if (idempotencyLocks.get(lockKey) === next) idempotencyLocks.delete(lockKey);
+  }
+}
 
 function assertLocalOrigin(req) {
   const origin = req.headers.origin;
@@ -737,8 +777,8 @@ export async function recoverInterruptedCodexSessions(progressManager) {
 
 async function getBootstrap() {
   const settings = await getSettings();
-  const [profile, projects, voices] = await Promise.all([
-    getSystemProfile(settings), listProjects(), listVoices()
+  const [profile, projects, voices, voiceAnalyses, voiceDesigns] = await Promise.all([
+    getSystemProfile(settings), listProjects(), listVoices(), listVoiceAnalyses(), listVoiceDesigns()
   ]);
   return {
     app: {
@@ -754,6 +794,8 @@ async function getBootstrap() {
     engines: engineCompatibility(profile, settings.selectedEngine, settings.qualityMode),
     projects,
     voices,
+    voiceAnalyses,
+    voiceDesigns,
     emotions: EMOTIONS,
     jobs: jobs.list()
   };
@@ -906,6 +948,34 @@ async function handleApi(req, res, url, {
     const voice = await createVoice({ ...body, audio });
     return json(res, 201, voice);
   }
+  if (method === 'POST' && pathname === '/api/voices/design') {
+    const body = validateVoiceDesign(await parseJsonBody(req, MAX_JSON_BYTES));
+    const key = idempotencyKey(req);
+    const scope = 'voices:design';
+    const job = await withIdempotencyLock('voice_design', key, scope, async () => {
+      const existing = previousIdempotentJob('voice_design', key, scope);
+      if (existing) return existing;
+      const settings = await getSettings();
+      const profile = await systemProfileResolver(settings, { refresh: true });
+      if (!profile.worker?.online) {
+        throw Object.assign(new Error('模型工作器未启动，无法设计音色'), {
+          code: 'WORKER_OFFLINE', statusCode: 503
+        });
+      }
+      return jobs.create(
+        'voice_design',
+        {
+          name: body.name,
+          modelId: body.modelId,
+          idempotencyKey: key,
+          idempotencyScope: scope
+        },
+        (update) => designVoice(body, { settings, profile }, update),
+        { gpu: true }
+      );
+    });
+    return json(res, 202, job);
+  }
   if (method === 'POST' && pathname === '/api/voice-sources') {
     const source = await saveVoiceSource(req, {
       fileName: url.searchParams.get('fileName'),
@@ -915,8 +985,145 @@ async function handleApi(req, res, url, {
     return json(res, 201, source);
   }
 
+  if (method === 'GET' && pathname === '/api/voice-analyses') {
+    return json(res, 200, await listVoiceAnalyses());
+  }
+  if (method === 'GET' && pathname === '/api/voice-designs') {
+    return json(res, 200, await listVoiceDesigns());
+  }
+
   params = routeMatch(pathname, '/api/jobs/:jobId');
   if (params && method === 'GET') return json(res, 200, jobs.get(params.jobId));
+
+  params = routeMatch(pathname, '/api/voice-sources/:sourceId/analyze');
+  if (params && method === 'POST') {
+    const body = validateVoiceAnalysis(await parseJsonBody(req, MAX_JSON_BYTES));
+    const key = idempotencyKey(req);
+    const scope = `voice-source:${params.sourceId}`;
+    const job = await withIdempotencyLock('voice_analyze', key, scope, async () => {
+      const existing = previousIdempotentJob('voice_analyze', key, scope);
+      if (existing) return existing;
+      const settings = await getSettings();
+      const profile = await systemProfileResolver(settings, { refresh: true });
+      if (!profile.worker?.online) {
+        throw Object.assign(new Error('模型工作器未启动，无法分析音视频'), {
+          code: 'WORKER_OFFLINE', statusCode: 503
+        });
+      }
+      if (!profile.worker.ffmpeg || !profile.worker.ffprobe) {
+        throw Object.assign(new Error('工作器需要 FFmpeg 和 FFprobe 才能分析音视频'), {
+          code: 'VOICE_ANALYSIS_MEDIA_TOOLS_UNAVAILABLE', statusCode: 503
+        });
+      }
+      if (profile.worker.voice_analysis?.ready === false) {
+        const missing = Array.isArray(profile.worker.voice_analysis.missing_dependencies)
+          ? profile.worker.voice_analysis.missing_dependencies.join('、')
+          : '';
+        throw Object.assign(new Error(`分析模型依赖尚未就绪${missing ? `：${missing}` : ''}`), {
+          code: 'VOICE_ANALYSIS_UNAVAILABLE', statusCode: 503
+        });
+      }
+      const source = await claimVoiceSource(params.sourceId);
+      try {
+        return jobs.create(
+          'voice_analyze',
+          {
+            sourceId: source.id,
+            name: body.name,
+            fileName: source.fileName,
+            idempotencyKey: key,
+            idempotencyScope: scope
+          },
+          (update) => analyzeVoiceSource(source, body, { settings, profile }, update),
+          { gpu: true }
+        );
+      } catch (error) {
+        await deleteVoiceSource(source.id, { allowClaimed: true, missingOk: true }).catch(() => {});
+        throw error;
+      }
+    });
+    return json(res, 202, job);
+  }
+
+  params = routeMatch(pathname, '/api/voice-designs/:designId/commit');
+  if (params && method === 'POST') {
+    const body = await parseJsonBody(req, MAX_JSON_BYTES);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) {
+      throw Object.assign(new Error('确认候选不接受额外参数'), {
+        code: 'VOICE_DESIGN_COMMIT_INVALID', statusCode: 400
+      });
+    }
+    const committed = await commitVoiceDesign(params.designId);
+    return json(res, committed.alreadyCommitted ? 200 : 201, committed);
+  }
+
+  params = routeMatch(pathname, '/api/voice-designs/:designId');
+  if (params && method === 'GET') return json(res, 200, await getVoiceDesign(params.designId));
+  if (params && method === 'DELETE') {
+    await discardVoiceDesign(params.designId);
+    res.writeHead(204);
+    return res.end();
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/segments/:segmentId');
+  if (params && method === 'PATCH') {
+    const updated = await updateVoiceAnalysisSegment(
+      params.analysisId,
+      params.segmentId,
+      await parseJsonBody(req, MAX_JSON_BYTES)
+    );
+    return json(res, 200, updated);
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/speakers/:speakerId/export');
+  if (params && method === 'POST') {
+    const body = validateSpeakerExport(await parseJsonBody(req, MAX_JSON_BYTES));
+    const analysis = await getVoiceAnalysis(params.analysisId);
+    if (!analysis.speakers.some((speaker) => speaker.id === params.speakerId)) {
+      throw Object.assign(new Error('说话人不存在'), { code: 'VOICE_SPEAKER_NOT_FOUND', statusCode: 404 });
+    }
+    const key = idempotencyKey(req);
+    const scope = `voice-analysis:${params.analysisId}:speaker:${params.speakerId}`;
+    const job = await withIdempotencyLock('voice_export', key, scope, async () => {
+      const existing = previousIdempotentJob('voice_export', key, scope);
+      if (existing) return existing;
+      return jobs.create(
+        'voice_export',
+        {
+          analysisId: params.analysisId,
+          speakerId: params.speakerId,
+          name: body.name,
+          includeOverlap: body.includeOverlap,
+          idempotencyKey: key,
+          idempotencyScope: scope
+        },
+        (update) => exportSpeakerVoice(params.analysisId, params.speakerId, body, update),
+        { media: true }
+      );
+    });
+    return json(res, 202, job);
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/speakers');
+  if (params && method === 'POST') {
+    return json(res, 201, await addVoiceAnalysisSpeaker(params.analysisId, await parseJsonBody(req, MAX_JSON_BYTES)));
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId/speakers/:speakerId');
+  if (params && method === 'PATCH') {
+    const updated = await updateVoiceAnalysisSpeaker(
+      params.analysisId,
+      params.speakerId,
+      await parseJsonBody(req, MAX_JSON_BYTES)
+    );
+    return json(res, 200, updated);
+  }
+
+  params = routeMatch(pathname, '/api/voice-analyses/:analysisId');
+  if (params && method === 'GET') return json(res, 200, await getVoiceAnalysis(params.analysisId));
+  if (params && method === 'PATCH') {
+    return json(res, 200, await updateVoiceAnalysis(params.analysisId, await parseJsonBody(req, MAX_JSON_BYTES)));
+  }
 
   params = routeMatch(pathname, '/api/voice-sources/:sourceId/extract');
   if (params && method === 'POST') {
@@ -1711,6 +1918,8 @@ async function handleMedia(req, res, pathname) {
   let base;
   let relativeParts;
   if (parts[1] === 'voices') { base = VOICES_DIR; relativeParts = parts.slice(2); }
+  else if (parts[1] === 'voice-analyses') { base = VOICE_ANALYSES_DIR; relativeParts = parts.slice(2); }
+  else if (parts[1] === 'voice-designs') { base = VOICE_DESIGNS_DIR; relativeParts = parts.slice(2); }
   else if (parts[1] === 'projects') { base = PROJECTS_DIR; relativeParts = parts.slice(2); }
   else if (parts[1] === 'exports') { base = EXPORTS_DIR; relativeParts = parts.slice(2); }
   else throw Object.assign(new Error('媒体路径无效'), { statusCode: 404 });
@@ -1792,6 +2001,7 @@ async function main() {
   await initStore();
   // 上传 token 只存在于当前浏览器会话；进程重启后，遗留来源和裁剪结果都不可恢复。
   await resetVoiceSourceWorkspace();
+  await cleanupExpiredVoiceDesigns();
   await jobs.init();
   const server = createServer();
   server.listen(PORT, HOST, () => {

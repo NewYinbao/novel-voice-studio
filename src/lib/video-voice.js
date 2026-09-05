@@ -6,6 +6,7 @@ import {
   MAX_VOICE_CLIP_MS,
   MAX_VOICE_SOURCE_BYTES,
   MIN_VOICE_CLIP_MS,
+  VOICE_ANALYSIS_JOBS_DIR,
   VOICE_CLIPS_DIR,
   VOICE_SOURCES_DIR
 } from './config.js';
@@ -135,9 +136,13 @@ export async function cleanupExpiredVoiceSources(now = Date.now()) {
 export async function resetVoiceSourceWorkspace() {
   await Promise.all([
     fs.rm(VOICE_SOURCES_DIR, { recursive: true, force: true }),
-    fs.rm(VOICE_CLIPS_DIR, { recursive: true, force: true })
+    fs.rm(VOICE_CLIPS_DIR, { recursive: true, force: true }),
+    fs.rm(VOICE_ANALYSIS_JOBS_DIR, { recursive: true, force: true })
   ]);
-  await Promise.all([ensureDir(VOICE_SOURCES_DIR), ensureDir(VOICE_CLIPS_DIR)]);
+  await Promise.all([
+    ensureDir(VOICE_SOURCES_DIR), ensureDir(VOICE_CLIPS_DIR),
+    ensureDir(VOICE_ANALYSIS_JOBS_DIR)
+  ]);
 }
 
 export async function saveVoiceSource(stream, {

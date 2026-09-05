@@ -130,6 +130,26 @@ const state = {
   voiceBindingPickerRoleId: '',
   voiceBindingPreview: null,
   voiceBindingPreviewRequestId: 0,
+  voiceDesignSubmitting: false,
+  voiceDesignPreset: 'news-authoritative-male',
+  voiceDesignForm: null,
+  voiceDesignDrafts: [],
+  voiceDesignDraft: null,
+  voiceDesignAuditionedIds: new Set(),
+  voiceDesignCommitSubmitting: false,
+  voiceDesignDiscardSubmitting: false,
+  voiceDesignRequestId: 0,
+  voiceAnalysisFile: null,
+  voiceAnalysisId: null,
+  voiceAnalysis: null,
+  voiceAnalysisJobId: null,
+  voiceAnalysisSubmitting: false,
+  voiceAnalysisUploadController: null,
+  voiceAnalysisRequestId: 0,
+  voiceAnalysisCache: new Map(),
+  voiceAnalysisDrafts: new Map(),
+  voiceAnalysisForm: null,
+  voiceAnalysisMutations: new Set(),
   modalTrigger: null
 };
 
@@ -139,9 +159,43 @@ const statusLabels = {
 };
 const jobLabels = {
   script: '剧本润色', render: '语音生成', export: '音频导出',
-  extract: '音色裁剪', voice_extract: '音色裁剪', 'voice-extract': '音色裁剪'
+  extract: '音色裁剪', voice_extract: '音色裁剪', 'voice-extract': '音色裁剪',
+  voice_design: '文字设计音色', voice_analyze: '多人语音分析', voice_export: '说话人音色导出'
 };
 const coverColors = ['#78dfc9', '#ffb86b', '#aea4ff', '#f07d9e', '#78aef8'];
+
+const VOICE_DESIGN_PRESETS = [
+  {
+    id: 'news-authoritative-male', label: '新闻男播 · 权威', name: '新闻男播 · 权威稳重',
+    prompt: '中年专业新闻男播，标准普通话，音色浑厚但不压迫，胸腔共鸣充足。字头清晰，字尾干净，停连准确，节奏稳健，语气客观、克制、权威，避免日常聊天感和夸张表演。'
+  },
+  {
+    id: 'news-friendly-male', label: '新闻男播 · 亲和', name: '新闻男播 · 清晰亲和',
+    prompt: '专业新闻与民生节目男播，标准普通话，声音清亮、可信、有亲和力。吐字规整，速度中等，重音有层次，有播音员的专业感，但不生硬。'
+  },
+  {
+    id: 'news-dignified-female', label: '新闻女播 · 端庄', name: '新闻女播 · 端庄大气',
+    prompt: '成熟专业新闻女播，一级普通话风格，音色明亮稳定，气息充足，吐字清晰、端庄大气。句子起落克制，停连和逻辑重音明确，去除口语化语调。'
+  },
+  {
+    id: 'documentary-deep-male', label: '纪录片 · 深沉男声', name: '纪录片旁白 · 深沉男声',
+    prompt: '成熟男性纪录片旁白，标准普通话，低沉、宽厚、富有空间感。语速稍慢，停顿充分，叙述克制而有画面感，不故作沙哑，不像广告配音。'
+  },
+  {
+    id: 'documentary-rational-female', label: '纪录片 · 知性女声', name: '纪录片旁白 · 知性女声',
+    prompt: '成熟知性女性纪录片旁白，标准普通话，声音温润、理性、通透。吐字准确，长句层次清楚，既有专业解说感又保留人文温度。'
+  },
+  {
+    id: 'literary-restrained-male', label: '文学旁白 · 克制男声', name: '文学旁白 · 克制男声',
+    prompt: '文学有声书专业男旁白，标准普通话，音色沉静、克制、有书卷气。重视句子内部的停连和潜台词，情绪含蓄，不朗诵诗歌式拔高，不日常随意。'
+  },
+  {
+    id: 'literary-warm-female', label: '文学旁白 · 温润女声', name: '文学旁白 · 温润女声',
+    prompt: '文学有声书专业女旁白，标准普通话，音色温润、清澈、成熟，有叙事感和陪伴感。节奏从容，吐字干净，情绪细腻但不煽情，适合长时间聆听。'
+  }
+];
+
+const VOICE_DESIGN_PREVIEW_TEXT = '今天是二零二六年八月九日。清晨六点三十分，一列火车驶过山谷；远方的灯光，正在薄雾中缓缓醒来。';
 
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
@@ -290,6 +344,91 @@ async function refreshBootstrap({ render = false } = {}) {
   updateTopbar();
   renderJobs();
   if (render) renderView();
+}
+
+async function loadVoiceAnalysis(analysisId) {
+  if (!analysisId) return null;
+  const requestId = ++state.voiceAnalysisRequestId;
+  if (analysisId.startsWith('job_')) {
+    const job = (state.bootstrap.jobs || []).find((item) => item.id === analysisId)
+      || await api(`/api/jobs/${encodeURIComponent(analysisId)}`);
+    if (requestId !== state.voiceAnalysisRequestId) return null;
+    if (job.type !== 'voice_analyze') throw new Error('这不是多人拆分任务');
+    state.bootstrap.jobs = [job, ...(state.bootstrap.jobs || []).filter((item) => item.id !== job.id)];
+    if (job.result?.analysisId) return loadVoiceAnalysis(job.result.analysisId);
+    state.voiceAnalysisJobId = job.id;
+    state.voiceAnalysisId = null;
+    state.voiceAnalysis = null;
+    return job;
+  }
+  const analysis = await api(`/api/voice-analyses/${encodeURIComponent(analysisId)}`);
+  if (requestId !== state.voiceAnalysisRequestId) return null;
+  rememberVoiceAnalysis(analysis);
+  state.voiceAnalysisId = analysis.id || analysisId;
+  state.voiceAnalysisJobId = null;
+  state.voiceAnalysis = state.voiceAnalysisCache.get(analysis.id);
+  return state.voiceAnalysis;
+}
+
+function rememberVoiceAnalysis(analysis) {
+  const cached = state.voiceAnalysisCache.get(analysis.id);
+  if (cached && cached.revision > analysis.revision) return;
+  state.voiceAnalysisCache.set(analysis.id, analysis);
+  const summary = { ...analysis, speakerCount: analysis.speakers.length,
+    segmentCount: analysis.speakers.reduce((sum, speaker) => sum + speaker.segments.length, 0), overlapCount: analysis.overlaps.length };
+  delete summary.speakers;
+  delete summary.overlaps;
+  state.bootstrap.voiceAnalyses = [summary, ...(state.bootstrap.voiceAnalyses || []).filter((item) => item.id !== analysis.id)];
+  if (state.voiceAnalysisId === analysis.id) state.voiceAnalysis = analysis;
+}
+
+function analysisSessionKey() { return state.voiceAnalysisId || state.voiceAnalysisJobId || 'new'; }
+
+function analysisDraft(analysisId = analysisSessionKey()) {
+  if (!state.voiceAnalysisDrafts.has(analysisId)) {
+    state.voiceAnalysisDrafts.set(analysisId, { segments: new Map(), speakers: new Map(), addLabel: '', scrollTop: 0 });
+  }
+  return state.voiceAnalysisDrafts.get(analysisId);
+}
+
+async function selectVoiceAnalysisSession(sessionId) {
+  if (sessionId === analysisSessionKey()) { state.voiceAnalysisRequestId += 1; return; }
+  if (!await loadVoiceAnalysis(sessionId) || state.view !== 'voice-analysis') return;
+  resetPlayback();
+  history.pushState(null, '', `#/voice-analysis/${analysisSessionKey()}`);
+  renderVoiceAnalysisStudio();
+}
+
+function voiceDesignId(design = {}) {
+  return design?.id || design?.designId || '';
+}
+
+async function loadVoiceDesignDrafts({ selectId = '' } = {}) {
+  const requestId = ++state.voiceDesignRequestId;
+  const payload = await api('/api/voice-designs');
+  if (requestId !== state.voiceDesignRequestId) return null;
+  const designs = (Array.isArray(payload) ? payload : payload?.designs || [])
+    .filter((item) => item && voiceDesignId(item))
+    .sort((a, b) => String(b.createdAt || b.updatedAt || '').localeCompare(String(a.createdAt || a.updatedAt || '')));
+  state.voiceDesignDrafts = designs;
+  const preferredId = selectId || voiceDesignId(state.voiceDesignDraft);
+  state.voiceDesignDraft = designs.find((item) => voiceDesignId(item) === preferredId)
+    || designs.find((item) => item.status === 'draft')
+    || designs[0]
+    || null;
+  return state.voiceDesignDraft;
+}
+
+function resetVoiceAnalysisPage({ discardUpload = false } = {}) {
+  state.voiceAnalysisRequestId += 1;
+  state.voiceAnalysisUploadController?.abort();
+  state.voiceAnalysisUploadController = null;
+  state.voiceAnalysisFile = null;
+  state.voiceAnalysisId = null;
+  state.voiceAnalysis = null;
+  state.voiceAnalysisJobId = null;
+  state.voiceAnalysisSubmitting = false;
+  if (discardUpload && state.voiceSourceId && !state.voiceExtractSubmitted) discardRemoteVoiceSource(state.voiceSourceId);
 }
 
 async function loadProject(projectId) {
@@ -2065,7 +2204,7 @@ function updateCodexSessionSidebar() {
 }
 
 function updateTopbar() {
-  const activeView = state.view === 'codex' ? 'studio' : state.view;
+  const activeView = state.view === 'codex' ? 'studio' : ['voice-design', 'voice-analysis'].includes(state.view) ? 'voices' : state.view;
   $$('.main-nav button').forEach((button) => button.classList.toggle('active', button.dataset.nav === activeView));
   const active = state.bootstrap?.jobs.filter((job) => ['queued', 'running'].includes(job.state)).length || 0;
   $('#job-count').textContent = active;
@@ -2477,7 +2616,13 @@ function selectStudioLine(lineId) {
 function voicesHtml() {
   const voices = state.bootstrap.voices;
   return `<section class="page voices-page">
-    <div class="page-head"><div><span class="eyebrow">VOICE LIBRARY</span><h1>角色音色库</h1><p>录制本人授权的声音，或导入许可证允许使用的开源音色，为角色建立可复用音色。</p></div><div class="head-actions"><button class="button primary" data-action="new-voice">＋ 制作新音色</button></div></div>
+    <div class="page-head"><div><span class="eyebrow">VOICE LIBRARY</span><h1>角色音色库</h1><p>从提示词设计、多人音视频拆分，到本人录音和授权样本，在本机建立可复用的角色音色。</p></div><div class="head-actions"><button class="button primary" data-action="new-voice">＋ 录音 / 导入</button></div></div>
+    <div class="voice-workflow-grid" aria-label="音色制作方式">
+      <article class="voice-workflow-card design"><span class="workflow-kicker">VOICE DESIGN</span><div class="workflow-icon" aria-hidden="true">✦</div><h2>用提示词设计音色</h2><p>描述年龄感、音色、播音风格和节奏，由 Qwen VoiceDesign 生成纯合成母版。</p><div class="workflow-tags"><span>播音腔</span><span>纯合成</span><span>可复用</span></div><button class="button primary" data-nav="voice-design">进入音色设计 →</button></article>
+      <article class="voice-workflow-card analysis"><span class="workflow-kicker">SPEAKER LAB</span><div class="workflow-icon" aria-hidden="true">≡</div><h2>从长音视频拆分多人音色</h2><p>自动转写、说话人分离和语气识别；重叠语音独立复核，再按人导出音色。</p><div class="workflow-tags"><span>长音频</span><span>多说话人</span><span>可校正</span></div><button class="button" data-nav="voice-analysis">进入多人拆分 →</button></article>
+      <article class="voice-workflow-card capture"><span class="workflow-kicker">QUICK CAPTURE</span><div class="workflow-icon" aria-hidden="true">◉</div><h2>录制或导入单人样本</h2><p>适合已经准备好准确台词的 3–60 秒干净单人录音，也可手工从媒体中裁剪。</p><div class="workflow-tags"><span>最快</span><span>单人</span><span>精确台词</span></div><button class="button" data-action="new-voice">录音 / 导入 →</button></article>
+    </div>
+    <div class="section-head voice-library-head"><div><span class="eyebrow">SAVED VOICES</span><h2>已保存音色</h2></div><span class="voice-count">${voices.length} 个</span></div>
     <div class="voice-grid"><article class="voice-card new-voice-card" data-action="new-voice" role="button" tabindex="0"><span class="plus">＋</span><strong>制作新音色</strong><small>麦克风录制或导入音频</small></article>${voices.map(voiceCardHtml).join('')}</div>
   </section>`;
 }
@@ -2489,6 +2634,232 @@ function voiceCardHtml(voice) {
     <div class="tag-row">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
     <div class="voice-card-actions">${voice.reference?.mediaUrl ? `<button class="button small" data-action="play-voice" data-url="${voice.reference.mediaUrl}" data-name="${escapeHtml(voice.name)}">▶ 试听原声</button>` : '<button class="button small" disabled>无参考音频</button>'}<button class="icon-button" data-action="delete-voice" data-voice-id="${voice.id}" aria-label="删除">×</button></div>
   </article>`;
+}
+
+function voiceDesignHtml() {
+  const selected = VOICE_DESIGN_PRESETS.find((item) => item.id === state.voiceDesignPreset) || VOICE_DESIGN_PRESETS[0];
+  const formDraft = state.voiceDesignForm || {
+    name: selected.name,
+    language: 'zh-CN',
+    prompt: selected.prompt,
+    previewText: VOICE_DESIGN_PREVIEW_TEXT,
+    tags: '播音腔, 纯合成, Qwen VoiceDesign',
+    consent: false
+  };
+  const latest = (state.bootstrap.jobs || []).find((job) => job.type === 'voice_design');
+  const workerOnline = Boolean(state.bootstrap?.system?.worker?.online);
+  const draft = state.voiceDesignDraft;
+  const draftId = voiceDesignId(draft);
+  const mediaUrl = draft?.mediaUrl || draft?.reference?.mediaUrl || '';
+  const committed = draft?.status === 'committed' || Boolean(draft?.voiceId);
+  const auditioned = draftId && state.voiceDesignAuditionedIds.has(draftId);
+  const activeJob = latest && ['queued', 'running'].includes(latest.state) ? latest : null;
+  const draftHistory = state.voiceDesignDrafts.length > 1
+    ? `<div class="design-draft-history"><span>最近候选</span>${state.voiceDesignDrafts.slice(0, 6).map((item) => {
+      const id = voiceDesignId(item);
+      return `<button type="button" class="${id === draftId ? 'active' : ''}" data-action="select-voice-design-draft" data-design-id="${escapeHtml(id)}"><b>${escapeHtml(item.name || '未命名候选')}</b><small>${item.status === 'committed' ? '已入库' : '待试听'}</small></button>`;
+    }).join('')}</div>`
+    : '';
+  const resultPanel = draft
+    ? `<h3>${escapeHtml(draft.name || '设计音色候选')}</h3>
+      <div class="design-candidate-state ${committed ? 'committed' : 'draft'}"><i></i><span>${committed ? '已加入音色库' : '候选母版 · 尚未入库'}</span></div>
+      <p>${committed ? '这个候选已经成为正式音色，可前往音色库绑定角色。' : '先完整试听；满意后再明确加入音色库。不满意可以修改左侧提示词重新生成。'}</p>
+      ${draft.expiresAt && !committed ? `<small class="design-expiry">候选保留至 ${escapeHtml(new Date(draft.expiresAt).toLocaleDateString('zh-CN'))}</small>` : ''}
+      <div class="design-candidate-actions">
+        <button class="button" data-action="play-voice-design-draft" data-design-id="${escapeHtml(draftId)}" data-url="${escapeHtml(mediaUrl)}" data-name="${escapeHtml(draft.name || '设计音色候选')}" ${mediaUrl ? '' : 'disabled'}>▶ ${auditioned ? '再次试听' : '先试听候选'}</button>
+        ${committed
+          ? '<button class="button primary" data-nav="voices">前往音色库 →</button>'
+          : `<button class="button primary" data-action="commit-voice-design" data-design-id="${escapeHtml(draftId)}" ${!auditioned || state.voiceDesignCommitSubmitting ? 'disabled' : ''}>${state.voiceDesignCommitSubmitting ? '正在加入…' : '✓ 试听满意，加入音色库'}</button><button class="button ghost" data-action="discard-voice-design" data-design-id="${escapeHtml(draftId)}" ${state.voiceDesignDiscardSubmitting ? 'disabled' : ''}>丢弃候选</button>`}
+      </div>
+      ${!committed ? `<p class="design-audition-note" data-design-audition-note>${auditioned ? '已试听，现在可以确认入库。' : '“加入音色库”会在开始试听后启用。'}</p>` : ''}
+      ${draftHistory}`
+    : latest
+      ? `<h3>${escapeHtml(jobLabels[latest.type] || latest.type)}</h3><div class="analysis-status-row"><span class="job-state ${latest.state}">${escapeHtml(statusLabels[latest.state] || latest.state)}</span><b>${latest.progress || 0}%</b></div><div class="meter"><span style="width:${latest.progress || 0}%"></span></div><p>${escapeHtml(latest.error?.message || latest.message || '等待模型处理')}</p>`
+      : '<h3>尚未生成候选</h3><p>选择预设或写下你自己的声音描述。生成只会创建试听候选，不会自动加入音色库。</p>';
+  return `<section class="page voice-tool-page voice-design-page">
+    <div class="tool-page-head"><button class="back-button" data-nav="voices" aria-label="返回音色库">‹</button><div><span class="eyebrow">VOICE DESIGN</span><h1>提示词音色设计</h1><p>先生成候选母版并试听，只有你明确确认满意后，才会加入正式音色库。</p></div><span class="tool-readiness ${workerOnline ? 'ready' : 'offline'}"><i></i>${workerOnline ? '模型工作器在线' : '模型工作器离线'}</span></div>
+    <div class="voice-design-layout">
+      <form id="voice-design-form" class="panel voice-design-form" novalidate>
+        <div class="form-section-head"><div><span class="eyebrow">01 · PERSONA</span><h2>选择起点</h2></div><small>选一个预设后仍可自由修改</small></div>
+        <div class="design-preset-grid" role="list">${VOICE_DESIGN_PRESETS.map((preset) => `<button type="button" class="design-preset ${preset.id === selected.id ? 'active' : ''}" data-action="select-voice-design-preset" data-preset-id="${preset.id}" aria-pressed="${preset.id === selected.id}">${escapeHtml(preset.label)}</button>`).join('')}</div>
+        <div class="form-grid voice-design-fields">
+          <label class="form-group"><span>音色名称</span><input class="field" name="name" required maxlength="80" value="${escapeHtml(formDraft.name)}"></label>
+          <label class="form-group"><span>语言</span><select class="select-field" name="language"><option value="zh-CN" ${formDraft.language === 'zh-CN' ? 'selected' : ''}>普通话</option><option value="zh-TW" ${formDraft.language === 'zh-TW' ? 'selected' : ''}>中文（自动）</option><option value="en" ${formDraft.language === 'en' ? 'selected' : ''}>英语</option></select></label>
+          <label class="form-group full"><span>声音与表达提示词</span><textarea class="field design-prompt" name="prompt" rows="7" required maxlength="1200">${escapeHtml(formDraft.prompt)}</textarea><small>建议写清：年龄感、性别感、声线、普通话程度、吐字、节奏、情绪和需要避免的风格。</small></label>
+          <label class="form-group full"><span>母版试读文案</span><textarea class="field" name="previewText" rows="4" required maxlength="500">${escapeHtml(formDraft.previewText)}</textarea><small>这段文字会和生成的参考音频一起保存，用于高质量克隆。</small></label>
+          <label class="form-group full"><span>标签</span><input class="field" name="tags" value="${escapeHtml(Array.isArray(formDraft.tags) ? formDraft.tags.join(', ') : formDraft.tags)}" maxlength="200"></label>
+        </div>
+        <label class="checkbox-row consent-row"><input type="checkbox" name="consent" required ${formDraft.consent ? 'checked' : ''}><span>我知道该音色由开源模型合成，使用时会保留模型来源，不冒充真实人物。</span></label>
+        <div class="tool-form-actions"><span class="model-footnote">Qwen3-TTS 1.7B VoiceDesign · 生成后只保存为 7 天试听候选，不会自动入库</span><button class="button primary" type="submit" ${state.voiceDesignSubmitting || !workerOnline ? 'disabled' : ''}>${state.voiceDesignSubmitting ? '正在提交…' : '✦ 生成试听候选'}</button></div>
+      </form>
+      <aside class="voice-design-aside">
+        <section class="panel design-explainer"><span class="eyebrow">HOW IT WORKS</span><h3>三步锁定角色声音</h3><ol><li><b>生成候选</b><span>按提示词设计音色和播音韵律</span></li><li><b>试听验收</b><span>确认吐字、声线和情绪符合预期</span></li><li><b>明确入库</b><span>满意后保存母版与准确文字供 Base 克隆</span></li></ol></section>
+        ${activeJob ? `<section class="panel design-generating"><span class="eyebrow">GENERATING</span><div class="analysis-status-row"><span class="job-state ${activeJob.state}">${escapeHtml(statusLabels[activeJob.state] || activeJob.state)}</span><b>${activeJob.progress || 0}%</b></div><div class="meter"><span style="width:${activeJob.progress || 0}%"></span></div><p>${escapeHtml(activeJob.message || '正在生成新的试听候选')}</p></section>` : ''}
+        <section class="panel latest-design"><span class="eyebrow">AUDITION & APPROVE</span>${resultPanel}</section>
+      </aside>
+    </div>
+  </section>`;
+}
+
+function analysisSegmentId(segment = {}) { return segment.id || segment.segmentId || segment.segment_id || segment.overlapId || segment.overlap_id || ''; }
+function analysisStartMs(segment = {}) { return Number(segment.startMs ?? (segment.startSeconds ?? segment.start_seconds ?? 0) * 1000) || 0; }
+function analysisEndMs(segment = {}) { return Number(segment.endMs ?? (segment.endSeconds ?? segment.end_seconds ?? 0) * 1000) || 0; }
+function analysisSegmentText(segment = {}) { return segment.text ?? segment.transcript ?? ''; }
+function analysisMediaUrl(segment = {}) { return segment.mediaUrl || segment.audioUrl || segment.audio_url || ''; }
+
+function analysisSegmentHtml(segment, { overlap = false, speakers = [] } = {}) {
+  const id = analysisSegmentId(segment);
+  segment = { ...segment, ...analysisDraft().segments.get(id) };
+  const start = analysisStartMs(segment);
+  const end = analysisEndMs(segment);
+  const mediaUrl = analysisMediaUrl(segment);
+  const keep = segment.keep === true;
+  const emotion = segment.emotion || 'neutral';
+  const emotionOptions = state.bootstrap.emotions.map((item) => `<option value="${item.id}" ${item.id === emotion ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('');
+  const currentSpeakerId = segment.speakerId || segment.speaker_id || '';
+  const speakerOptions = speakers.map((speaker, index) => {
+    const speakerId = speaker.id || speaker.speakerId || speaker.speaker_id || `speaker_${index + 1}`;
+    return `<option value="${escapeHtml(speakerId)}" ${speakerId === currentSpeakerId ? 'selected' : ''}>${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}</option>`;
+  }).join('');
+  return `<article class="analysis-segment ${overlap ? 'overlap' : ''}" data-segment-id="${escapeHtml(id)}">
+    <div class="segment-time"><strong>${formatTime(start / 1000)} – ${formatTime(end / 1000)}</strong><small>${((end - start) / 1000).toFixed(1)} 秒${overlap ? ' · 多人重叠' : ''}</small>${mediaUrl ? `<button type="button" class="segment-play" data-action="play-analysis-segment" data-url="${escapeHtml(mediaUrl)}" data-name="${overlap ? '重叠语音' : '说话人片段'} ${formatTime(start / 1000)}">▶ 试听</button>` : ''}</div>
+    <label class="segment-transcript"><span>台词</span><textarea class="field" rows="2" data-analysis-text>${escapeHtml(analysisSegmentText(segment))}</textarea></label>
+    <label class="segment-emotion"><span>语气</span><select class="select-field" data-analysis-emotion>${emotionOptions}</select><small>${segment.emotionConfidence != null ? `识别信心 ${Math.round(Number(segment.emotionConfidence) * 100)}%` : '可手动修改'}</small></label>
+    <label class="segment-speaker"><span>归属</span><select class="select-field" data-analysis-speaker>${overlap ? `<option value="overlap" ${!currentSpeakerId || currentSpeakerId === 'overlap' ? 'selected' : ''}>多人重叠 · 待复核</option>` : ''}${speakerOptions}</select></label>
+    <label class="segment-keep"><input type="checkbox" data-analysis-keep ${keep ? 'checked' : ''}><span>${overlap ? '保留待复核' : '用于该人音色'}</span></label>
+    <button type="button" class="button small" data-action="save-analysis-segment" data-segment-id="${escapeHtml(id)}" ${state.voiceAnalysisMutations.has(`${state.voiceAnalysisId}:${id}`) ? 'disabled' : ''}>${analysisDraft().segments.has(id) ? '保存修改 *' : '保存修改'}</button>
+  </article>`;
+}
+
+function analysisSpeakerHtml(speaker, index) {
+  const id = speaker.id || speaker.speakerId || speaker.speaker_id || `speaker_${index + 1}`;
+  const segments = speaker.segments || [];
+  const totalMs = Number(speaker.totalDurationMs ?? (speaker.totalDurationSeconds ?? speaker.total_duration_seconds ?? 0) * 1000) || segments.reduce((sum, item) => sum + Math.max(0, analysisEndMs(item) - analysisStartMs(item)), 0);
+  const cleanCount = segments.filter((segment) => segment.keep !== false).length;
+  return `<section class="speaker-group panel" data-speaker-id="${escapeHtml(id)}">
+    <header class="speaker-group-head"><span class="speaker-index">${String(index + 1).padStart(2, '0')}</span><div><span class="eyebrow">SPEAKER</span><h2>${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}</h2><p>${segments.length} 段 · 约 ${formatTime(totalMs / 1000)} · ${cleanCount} 段已选作克隆样本</p></div><label class="speaker-select"><input type="checkbox" data-analysis-speaker-select ${segments.length ? 'checked' : 'disabled'}><span>批量导出</span></label></header>
+    <div class="speaker-export-bar"><label><span>导出名称</span><input class="field" data-speaker-export-name value="${escapeHtml(speaker.label || `说话人 ${String(index + 1).padStart(2, '0')}`)}"></label><label class="include-overlap-choice" title="重叠语音会污染音色，仅在你确认可用时选择"><input type="checkbox" data-speaker-include-overlap><span>尝试包含已保留的重叠段</span></label><button type="button" class="button primary small" data-action="export-analysis-speaker" data-speaker-id="${escapeHtml(id)}">导出这个音色</button></div>
+    <div class="analysis-segments">${segments.length ? segments.map((segment) => analysisSegmentHtml(segment, { speakers: state.voiceAnalysis?.speakers || [] })).join('') : '<div class="empty-inline">还没有片段。请在其他片段的“归属”中选择这位对话人，再保存修改。</div>'}</div>
+  </section>`;
+}
+
+function voiceAnalysisSidebarHtml() {
+  const sessions = [...(state.bootstrap.voiceAnalyses || [])].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const pending = (state.bootstrap.jobs || []).filter((job) => job.type === 'voice_analyze' && !job.result?.analysisId);
+  const selectedKey = analysisSessionKey();
+  const row = (id, title, subtitle, date, status) => `<button class="analysis-session ${selectedKey === id ? 'active' : ''}" data-action="select-analysis-session" data-session-id="${escapeHtml(id)}" ${selectedKey === id ? 'aria-current="true"' : ''}><span class="analysis-session-title">${escapeHtml(title)}</span><span>${escapeHtml(subtitle)}</span><small><time>${escapeHtml(new Date(date).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }))}</time><i>${escapeHtml(status)}</i></small></button>`;
+  return `<div class="analysis-sidebar-head"><button class="button ghost small" data-nav="voices">‹ 音色库</button><span class="eyebrow">SPEAKER LAB</span><h2>拆分会话</h2><button class="button ${selectedKey === 'new' ? 'primary' : ''}" data-action="new-voice-analysis" ${state.voiceAnalysisSubmitting ? 'disabled' : ''}>＋ 新建 Session</button></div><nav class="analysis-session-list" aria-label="历史拆分 Session">${pending.length ? '<span class="analysis-list-label">处理任务</span>' : ''}${pending.map((job) => row(job.id, job.payload?.fileName || job.payload?.name || '多人拆分', job.message || '', job.createdAt, statusLabels[job.state] || job.state)).join('')}<span class="analysis-list-label">历史 Session · ${sessions.length}</span>${sessions.map((item) => row(item.id, item.name || item.source?.fileName || '未命名拆分', `${item.speakerCount} 位对话人 · ${formatTime(item.durationMs / 1000)}`, item.createdAt, '已存档')).join('') || '<p class="empty-inline">完成一次拆分后，会话会保留在这里。</p>'}</nav><p class="analysis-sidebar-note">原始媒体与拆分片段保存在本机。<br>已保存的校对和对话人刷新后仍可找回。</p>`;
+}
+
+function voiceAnalysisJobHtml(job) {
+  return `<section class="page voice-analysis-page"><span class="eyebrow">SPEAKER LAB · SESSION</span><h1>${escapeHtml(job?.payload?.fileName || job?.payload?.name || '多人拆分任务')}</h1><div class="panel analysis-job-panel"><h2>${job?.state === 'failed' ? '本次拆分未完成' : '正在本机处理'}</h2><div class="analysis-status-row"><span>${escapeHtml(statusLabels[job?.state] || '')}</span><b>${job?.progress || 0}%</b></div><div class="meter"><span style="width:${job?.progress || 0}%"></span></div><p>${escapeHtml(job?.error?.message || job?.message || '等待任务状态')}</p><small>${job?.state === 'failed' ? '没有生成拆分存档，请新建 Session 重新上传。' : '可以切换到历史 Session 校对；此任务会继续运行，不会覆盖其他会话。'}</small></div></section>`;
+}
+
+function renderVoiceAnalysisStudio() {
+  const main = $('#app-main');
+  if (!$('#voice-analysis-workspace', main)) {
+    main.innerHTML = '<section id="voice-analysis-workspace" class="analysis-workspace"><aside class="analysis-sidebar"></aside><div class="analysis-session-content"></div></section>';
+  }
+  const sidebar = $('.analysis-sidebar', main);
+  const sidebarHtml = voiceAnalysisSidebarHtml();
+  if (sidebar._html !== sidebarHtml) { sidebar.innerHTML = sidebarHtml; sidebar._html = sidebarHtml; }
+  const content = $('.analysis-session-content', main);
+  const key = analysisSessionKey();
+  const job = (state.bootstrap.jobs || []).find((item) => item.id === state.voiceAnalysisJobId);
+  const signature = JSON.stringify([key, state.voiceAnalysis?.revision, job?.state, job?.progress, job?.message]);
+  if (content._signature !== signature) {
+    if (content.dataset.sessionKey) analysisDraft(content.dataset.sessionKey).scrollTop = content.scrollTop;
+    const sameSession = content.dataset.sessionKey === key;
+    const player = sameSession ? $('.analysis-source-player', content) : null;
+    const active = content.contains(document.activeElement) ? document.activeElement : null;
+    const segmentId = active?.closest('[data-segment-id]')?.dataset.segmentId;
+    const field = active && ['data-analysis-text', 'data-analysis-emotion', 'data-analysis-speaker', 'data-analysis-keep'].find((name) => active.hasAttribute(name));
+    const focusSelector = sameSession && (segmentId && field ? `[data-segment-id="${CSS.escape(segmentId)}"] [${field}]` : active?.id ? `#${CSS.escape(active.id)}` : null);
+    const selection = active?.tagName === 'TEXTAREA' ? [active.selectionStart, active.selectionEnd] : null;
+    content.innerHTML = state.voiceAnalysisJobId ? voiceAnalysisJobHtml(job) : voiceAnalysisHtml();
+    if (player) $('.analysis-source-player', content)?.replaceWith(player);
+    content.dataset.sessionKey = key;
+    content._signature = signature;
+    if (key === 'new' && state.voiceAnalysisForm) {
+      const form = $('#voice-analysis-form');
+      form.elements.language.value = state.voiceAnalysisForm.language;
+      form.elements.speakerCount.value = state.voiceAnalysisForm.speakerCount;
+      form.elements.consent.checked = state.voiceAnalysisForm.consent;
+    }
+    for (const group of $$('.speaker-group', content)) {
+      const draft = analysisDraft().speakers.get(group.dataset.speakerId);
+      if (!draft) continue;
+      group.querySelector('[data-speaker-export-name]').value = draft.name;
+      group.querySelector('[data-speaker-include-overlap]').checked = draft.includeOverlap;
+      const selected = group.querySelector('[data-analysis-speaker-select]');
+      selected.checked = draft.selected && !selected.disabled;
+    }
+    if (focusSelector) {
+      const focus = $(focusSelector, content);
+      focus?.focus({ preventScroll: true });
+      if (selection) focus?.setSelectionRange(...selection);
+    }
+    content.scrollTop = analysisDraft(key).scrollTop;
+  }
+  $('#transport').hidden = !['analysis-segment'].includes(state.loadedAudio?.kind);
+}
+
+function captureAnalysisInput(input) {
+  if (!input.closest?.('#voice-analysis-workspace')) return;
+  if (input.closest('#voice-analysis-form')) {
+    const data = new FormData(input.closest('form'));
+    state.voiceAnalysisForm = { language: data.get('language'), speakerCount: data.get('speakerCount'), consent: data.get('consent') === 'on' };
+  }
+  if (input.id === 'analysis-speaker-label') analysisDraft().addLabel = input.value;
+  const row = input.closest('.analysis-segment');
+  if (row) {
+    analysisDraft().segments.set(row.dataset.segmentId, {
+      text: row.querySelector('[data-analysis-text]').value,
+      emotion: row.querySelector('[data-analysis-emotion]').value,
+      speakerId: row.querySelector('[data-analysis-speaker]').value,
+      keep: row.querySelector('[data-analysis-keep]').checked
+    });
+    const save = row.querySelector('[data-action="save-analysis-segment"]');
+    if (!save.disabled) save.textContent = '保存修改 *';
+  }
+  const group = input.closest('.speaker-group');
+  if (group && !row) analysisDraft().speakers.set(group.dataset.speakerId, {
+    name: group.querySelector('[data-speaker-export-name]').value,
+    includeOverlap: group.querySelector('[data-speaker-include-overlap]').checked,
+    selected: group.querySelector('[data-analysis-speaker-select]').checked
+  });
+}
+
+function voiceAnalysisHtml() {
+  const analysis = state.voiceAnalysis;
+  if (!analysis) {
+    return `<section class="page voice-tool-page voice-analysis-page">
+      <div class="tool-page-head"><button class="back-button" data-nav="voices" aria-label="返回音色库">‹</button><div><span class="eyebrow">SPEAKER LAB</span><h1>多人音视频拆分</h1><p>导入长音频或视频，在本机完成语音转写、说话人分离、语气识别和重叠语音标记。</p></div></div>
+      <div class="analysis-intro-layout">
+        <form id="voice-analysis-form" class="panel analysis-upload-panel" novalidate>
+          <span class="eyebrow">01 · SOURCE</span><h2>选择音频或视频</h2>
+          <div class="drop-zone analysis-drop-zone" id="voice-analysis-drop-zone" role="button" tabindex="0"><div><span class="drop-icon">⇧</span><strong>拖入长短音频 / 视频</strong><small>WAV、MP3、M4A、FLAC、MP4、MOV、MKV、WebM · 最大 1GB</small><div class="selected-file" id="voice-analysis-file-label">${state.voiceAnalysisFile ? `${escapeHtml(state.voiceAnalysisFile.name)} · ${(state.voiceAnalysisFile.size / 1024 / 1024).toFixed(2)} MB` : ''}</div></div><input id="voice-analysis-file" type="file" accept="audio/*,video/*,.mkv,.avi,.mov,.m4v,.flac,.opus,.wma" hidden></div>
+          <div class="analysis-upload-options"><label class="form-group"><span>语言</span><select class="select-field" name="language"><option value="zh">中文（推荐）</option><option value="auto">自动识别</option><option value="en">英语</option></select></label><label class="form-group"><span>预计说话人</span><select class="select-field" name="speakerCount"><option value="">自动判断</option>${[1,2,3,4,5,6,7,8].map((count) => `<option value="${count}">${count} 人</option>`).join('')}</select></label></div>
+          <label class="checkbox-row consent-row"><input type="checkbox" name="consent" required><span>我有权处理该音视频及其中人声，并了解可识别声音可能涉及人格权与敏感个人信息。</span></label>
+          <div class="tool-form-actions"><span>处理全程本地完成，时长越长所需时间越多。</span><button class="button primary" type="submit" ${state.voiceAnalysisSubmitting ? 'disabled' : ''}>${state.voiceAnalysisSubmitting ? '正在上传…' : '开始识别与分人'}</button></div>
+        </form>
+        <aside class="analysis-pipeline panel"><span class="eyebrow">LOCAL PIPELINE</span><h2>它会做什么</h2><ol><li><i>1</i><div><strong>语音转写</strong><span>音频用 ASR 识别台词；这不是图像 OCR。</span></div></li><li><i>2</i><div><strong>说话人日志</strong><span>判断谁在什么时间说话，匿名分组。</span></div></li><li><i>3</i><div><strong>语气与重叠</strong><span>识别语气；可靠检测到的多人重叠段单独列出。</span></div></li><li><i>4</i><div><strong>人工复核导出</strong><span>修正文字与语气，每个人单独生成音色。</span></div></li></ol><div class="analysis-caveat">重叠语音不等于已分离出每个人的干净声音，默认不用于克隆。</div></aside>
+      </div>
+    </section>`;
+  }
+
+  const speakers = analysis.speakers || [];
+  const overlaps = analysis.overlaps || [];
+  const capabilities = analysis.capabilities || {};
+  return `<section class="page voice-tool-page voice-analysis-page">
+    <div class="tool-page-head"><button class="back-button" data-nav="voices" aria-label="返回音色库">‹</button><div><span class="eyebrow">SPEAKER LAB · SESSION</span><h1>${escapeHtml(analysis.name || '多人音频分析')}</h1><p>${speakers.length} 个对话人 · ${speakers.reduce((sum, item) => sum + (item.segments?.length || 0), 0)} 个独立片段 · ${overlaps.length} 个重叠片段。保存的修改会随此 Session 保留。</p></div><div class="analysis-head-actions"><button class="button primary" data-action="export-selected-speakers">批量导出已选说话人</button></div></div>
+    <section class="panel analysis-source-panel"><div><span class="eyebrow">ORIGINAL SOURCE</span><h2>${escapeHtml(analysis.source?.fileName || '原始媒体')}</h2><p>原始文件与拆分片段已存档 · ${formatTime(analysis.durationMs / 1000)}</p></div>${analysis.source?.mediaUrl ? `<${analysis.source.kind === 'video' ? 'video' : 'audio'} class="analysis-source-player" controls preload="metadata" src="${escapeHtml(analysis.source.mediaUrl)}" aria-label="当前 Session 原始媒体"></${analysis.source.kind === 'video' ? 'video' : 'audio'}><a class="button small" href="${escapeHtml(analysis.source.mediaUrl)}" download="${escapeHtml(analysis.source.fileName)}">⇩ 下载原文件</a>` : '<p>此历史记录没有可用的原文件。</p>'}</section>
+    <form id="analysis-add-speaker-form" class="analysis-add-speaker"><label for="analysis-speaker-label">添加对话人</label><input id="analysis-speaker-label" class="field" name="label" maxlength="80" placeholder="例如：主持人、小林" value="${escapeHtml(analysisDraft().addLabel)}" required><button class="button" type="submit" ${state.voiceAnalysisMutations.has(`${analysis.id}:speaker`) ? 'disabled' : ''}>＋ 添加对话人</button><small>添加后，在片段“归属”中分配台词。</small></form>
+    <div class="analysis-capabilities" role="status"><span class="${capabilities.asr === false ? 'off' : ''}">转写 ${capabilities.asr === false ? '不可用' : '已完成'}</span><span class="${capabilities.diarization === false ? 'off' : ''}">说话人 ${capabilities.diarization === false ? '不可用' : '已分离'}</span><span class="${capabilities.emotion === false ? 'off' : ''}">语气 ${capabilities.emotion === false ? '仅可手动' : '已识别'}</span><span class="${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? 'off' : ''}">重叠检测 ${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '未启用' : '已启用'}</span></div>
+    ${(analysis.warnings || []).length ? `<div class="analysis-warning" role="status"><strong>分析提示</strong><ul>${analysis.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>` : ''}
+    <div class="speaker-groups">${speakers.map(analysisSpeakerHtml).join('')}</div>
+    <section class="overlap-group panel"><header class="speaker-group-head overlap-head"><span class="speaker-index">!</span><div><span class="eyebrow">OVERLAPPED SPEECH</span><h2>多人重叠 / 需人工复核</h2><p>这些片段默认不进入任何人的克隆样本。“保留”只表示存档供复核，不代表已完成语音分离。</p></div></header><div class="analysis-segments">${overlaps.length ? overlaps.map((segment) => analysisSegmentHtml(segment, { overlap: true, speakers })).join('') : `<div class="empty-inline">${capabilities.overlapDetection === false || capabilities.overlap_detection === false ? '当前未启用可靠的重叠语音检测模型；系统没有伪造检测结果。' : '未检测到重叠语音。'}</div>`}</div></section>
+  </section>`;
 }
 
 function modelsHtml() {
@@ -2538,6 +2909,8 @@ function renderView() {
     return;
   }
   else if (state.view === 'voices') main.innerHTML = voicesHtml();
+  else if (state.view === 'voice-design') main.innerHTML = voiceDesignHtml();
+  else if (state.view === 'voice-analysis') { renderVoiceAnalysisStudio(); return; }
   else if (state.view === 'models') main.innerHTML = modelsHtml();
   else main.innerHTML = dashboardHtml();
   const transport = $('#transport');
@@ -2554,6 +2927,7 @@ function autoSizeTextareas() {
 }
 
 async function navigate(view, projectId = null, chapterId = null) {
+  if (state.view === 'voice-analysis' && view !== 'voice-analysis') state.voiceAnalysisRequestId += 1;
   if (state.view === 'codex' && view !== 'codex') {
     if (state.codexBusy) {
       toast('正在提交协作任务', '收到后台任务编号后再离开本页。', 'warn');
@@ -2572,12 +2946,19 @@ async function navigate(view, projectId = null, chapterId = null) {
       state.selectedChapterId = chapterId;
     }
   }
+  if (view === 'voice-design') await loadVoiceDesignDrafts().catch((error) => toast('无法读取音色候选', error.message, 'error'));
+  if (view === 'voice-analysis') {
+    state.bootstrap.voiceAnalyses = await api('/api/voice-analyses');
+    if (projectId) await loadVoiceAnalysis(projectId);
+  }
   state.view = view;
   if (!['studio', 'codex'].includes(view) || (previousProjectId && state.project?.id !== previousProjectId)) resetPlayback();
   const hash = view === 'studio' && state.project
     ? `#/studio/${state.project.id}`
     : view === 'codex' && state.project && currentChapter()
       ? `#/codex/${state.project.id}/${currentChapter().id}`
+      : view === 'voice-analysis' && analysisSessionKey() !== 'new'
+        ? `#/voice-analysis/${analysisSessionKey()}`
       : `#/${view}`;
   if (location.hash !== hash) history.pushState(null, '', hash);
   renderView();
@@ -2585,7 +2966,7 @@ async function navigate(view, projectId = null, chapterId = null) {
 
 function parseRoute() {
   const [, view = 'projects', id, chapterId] = location.hash.match(/^#\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?/) || [];
-  return { view: ['projects', 'studio', 'codex', 'voices', 'models'].includes(view) ? view : 'projects', id, chapterId };
+  return { view: ['projects', 'studio', 'codex', 'voices', 'voice-design', 'voice-analysis', 'models'].includes(view) ? view : 'projects', id, chapterId };
 }
 
 function projectModalHtml() {
@@ -3194,7 +3575,12 @@ function jobCardHtml(job) {
   const message = batchScript
     ? (['completed', 'failed'].includes(job.state) ? '逐章结果如下；失败章节可单独重试。' : '模型章节按队列串行运行；关闭任务抽屉不会停止处理。')
     : failure?.summary || `${job.message || ''}${job.error ? ` · ${job.error.message}` : ''}`;
-  return `<article class="job-card ${className}"><div class="job-card-head"><strong>${escapeHtml(jobLabels[job.type] || job.type)}</strong><span>${escapeHtml(status)} · ${job.progress}%</span></div><div class="meter"><span style="width:${job.progress}%"></span></div><p>${escapeHtml(message)}</p>${scriptBatchJobHtml(job)}${job.result?.mediaUrl ? `<a class="job-download" href="${job.result.mediaUrl}" download="${escapeHtml(job.result.fileName || 'audiobook.wav')}">⇩ 下载 ${escapeHtml(job.result.fileName || 'WAV')}</a>` : ''}</article>`;
+  const resultAction = job.type === 'voice_design' && job.result?.designId
+    ? '<button class="job-download" data-nav="voice-design">▶ 打开候选并试听</button>'
+    : job.result?.mediaUrl
+      ? `<a class="job-download" href="${job.result.mediaUrl}" download="${escapeHtml(job.result.fileName || 'audiobook.wav')}">⇩ 下载 ${escapeHtml(job.result.fileName || 'WAV')}</a>`
+      : '';
+  return `<article class="job-card ${className}"><div class="job-card-head"><strong>${escapeHtml(jobLabels[job.type] || job.type)}</strong><span>${escapeHtml(status)} · ${job.progress}%</span></div><div class="meter"><span style="width:${job.progress}%"></span></div><p>${escapeHtml(message)}</p>${scriptBatchJobHtml(job)}${resultAction}</article>`;
 }
 
 function jobCompletionNotice(job) {
@@ -3205,6 +3591,7 @@ function jobCompletionNotice(job) {
     return { title: failureCount ? '批量转脚本部分完成' : '批量转脚本完成', message: `${successCount} 章成功 · ${failureCount} 章未完成`, type: failureCount ? 'warn' : 'success' };
   }
   if (job.state === 'failed') return { title: `${label}失败`, message: job.error?.message || job.message, type: 'error' };
+  if (job.type === 'voice_design') return { title: '试听候选已生成', message: '请先试听；满意后再点击“加入音色库”。', type: 'success' };
   const failure = renderFailureOutcome(job);
   if (failure) return { title: `${label}${failure.partial ? '部分失败' : '失败'}`, message: failure.summary, type: failure.type };
   if (job.result?.demo) return { title: `${label}完成`, message: '已生成演示音轨，真实 TTS 启动并绑定音色后可重新生成。', type: 'warn' };
@@ -3233,19 +3620,45 @@ async function pollJobs() {
     state.bootstrap.jobs = jobs;
     renderJobs();
     let changed = false;
+    let completedDesignId = '';
     for (const job of jobs) {
       if (!state.watchedJobs.has(job.id) || !['completed', 'failed'].includes(job.state) || state.notifiedJobs.has(job.id)) continue;
       state.notifiedJobs.add(job.id);
       changed = true;
+      if (job.type === 'voice_design' && job.state === 'completed') completedDesignId = job.result?.designId || job.result?.design?.id || '';
       const notice = jobCompletionNotice(job);
       toast(notice.title, notice.message, notice.type, 6000);
     }
     if (changed) {
       await refreshBootstrap();
       if (state.project) await loadProject(state.project.id);
-      renderView();
+      if (completedDesignId && state.view === 'voice-design') {
+        await loadVoiceDesignDrafts({ selectId: completedDesignId });
+      } else if (state.view === 'voice-design') {
+        await loadVoiceDesignDrafts().catch(() => null);
+      }
+      if (state.view !== 'voice-analysis') renderView();
     }
-    if (!jobs.some((job) => ['queued', 'running'].includes(job.state))) {
+    if (state.view === 'voice-analysis') {
+      const selectedJob = jobs.find((job) => job.id === state.voiceAnalysisJobId);
+      if (selectedJob?.result?.analysisId) {
+        const expectedKey = analysisSessionKey();
+        const selectionRequest = state.voiceAnalysisRequestId;
+        const analysis = await api(`/api/voice-analyses/${selectedJob.result.analysisId}`);
+        rememberVoiceAnalysis(analysis);
+        if (state.view === 'voice-analysis' && expectedKey === analysisSessionKey() && selectionRequest === state.voiceAnalysisRequestId) {
+          state.voiceAnalysisId = analysis.id;
+          state.voiceAnalysis = analysis;
+          state.voiceAnalysisJobId = null;
+          history.replaceState(null, '', `#/voice-analysis/${analysis.id}`);
+        }
+      }
+      if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
+    }
+    const awaitingSelectedAnalysis = state.view === 'voice-analysis' && jobs.some((job) => (
+      job.id === state.voiceAnalysisJobId && job.result?.analysisId
+    ));
+    if (!awaitingSelectedAnalysis && !jobs.some((job) => ['queued', 'running'].includes(job.state))) {
       clearInterval(state.jobTimer); state.jobTimer = null;
     }
   } catch { /* transient polling failure */ }
@@ -3891,6 +4304,233 @@ async function submitVoice(form) {
   } catch (error) { toast('保存音色失败', error.message, 'error'); submit.disabled = false; submit.textContent = '保存到音色库'; }
 }
 
+async function submitVoiceDesign(form) {
+  if (state.voiceDesignSubmitting) return;
+  const data = new FormData(form);
+  if (data.get('consent') !== 'on') return toast('需要确认合成音色说明', '请勾选合成音色的来源与用途确认。', 'warn');
+  const body = {
+    name: String(data.get('name') || '').trim(),
+    prompt: String(data.get('prompt') || '').trim(),
+    previewText: String(data.get('previewText') || '').trim(),
+    language: String(data.get('language') || 'zh-CN'),
+    tags: String(data.get('tags') || '').split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+    consent: true
+  };
+  if (!body.name || !body.prompt || !body.previewText) return toast('信息不完整', '请填写音色名称、提示词和母版试读文案。', 'warn');
+  state.voiceDesignForm = { ...body, tags: body.tags.join(', ') };
+  state.voiceDesignSubmitting = true;
+  renderView();
+  try {
+    const payload = await api('/api/voices/design', { method: 'POST', body });
+    const job = payload.job || payload;
+    toast('候选生成已提交', '完成后请先试听；只有你点击确认，候选才会加入音色库。');
+    await trackJob(job);
+  } catch (error) {
+    toast('音色设计提交失败', error.message, 'error');
+  } finally {
+    state.voiceDesignSubmitting = false;
+    if (state.view === 'voice-design') renderView();
+  }
+}
+
+async function commitVoiceDesign(designId) {
+  if (!designId || state.voiceDesignCommitSubmitting) return;
+  if (!state.voiceDesignAuditionedIds.has(designId)) {
+    return toast('请先试听候选', '试听按钮启用后，再决定是否加入音色库。', 'warn');
+  }
+  state.voiceDesignCommitSubmitting = true;
+  renderView();
+  try {
+    const payload = await api(`/api/voice-designs/${encodeURIComponent(designId)}/commit`, { method: 'POST', body: {} });
+    state.voiceDesignDraft = payload.design || state.voiceDesignDraft;
+    await refreshBootstrap();
+    await loadVoiceDesignDrafts({ selectId: designId });
+    toast(payload.alreadyCommitted ? '音色已在库中' : '音色已加入音色库', payload.alreadyCommitted ? '没有重复创建音色。' : '现在可以把它绑定给小说角色。');
+  } catch (error) {
+    toast('加入音色库失败', error.message, 'error');
+  } finally {
+    state.voiceDesignCommitSubmitting = false;
+    if (state.view === 'voice-design') renderView();
+  }
+}
+
+async function discardVoiceDesign(designId) {
+  if (!designId || state.voiceDesignDiscardSubmitting) return;
+  if (!confirm('丢弃这个试听候选？已经正式入库的音色不会被删除。')) return;
+  state.voiceDesignDiscardSubmitting = true;
+  renderView();
+  try {
+    await api(`/api/voice-designs/${encodeURIComponent(designId)}`, { method: 'DELETE' });
+    state.voiceDesignAuditionedIds.delete(designId);
+    if (state.loadedAudio?.kind === 'voice-design' && state.loadedAudio.id === designId) resetPlayback();
+    state.voiceDesignDraft = null;
+    await loadVoiceDesignDrafts();
+    toast('候选已丢弃', '正式音色库没有发生变化。');
+  } catch (error) {
+    toast('丢弃候选失败', error.message, 'error');
+  } finally {
+    state.voiceDesignDiscardSubmitting = false;
+    if (state.view === 'voice-design') renderView();
+  }
+}
+
+async function uploadVoiceAnalysisSource(file) {
+  const controller = new AbortController();
+  state.voiceAnalysisUploadController = controller;
+  const response = await fetch(`/api/voice-sources?fileName=${encodeURIComponent(file.name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+    signal: controller.signal
+  });
+  const payload = await response.json().catch(() => ({ message: `HTTP ${response.status}` }));
+  if (!response.ok) throw new Error(payload.message || payload.detail || '原始媒体上传失败');
+  const sourceId = payload.id || payload.sourceId;
+  if (!sourceId) throw new Error('服务器未返回媒体 source id');
+  return { ...payload, id: sourceId };
+}
+
+async function submitVoiceAnalysis(form) {
+  if (state.voiceAnalysisSubmitting) return;
+  const file = state.voiceAnalysisFile;
+  const data = new FormData(form);
+  if (!file) return toast('尚未选择媒体', '请先选择音频或视频文件。', 'warn');
+  if (data.get('consent') !== 'on') return toast('需要权利确认', '请确认你有权处理这份音视频中的声音。', 'warn');
+  const submit = form.querySelector('button[type="submit"]');
+  state.voiceAnalysisSubmitting = true;
+  const selectionRequest = state.voiceAnalysisRequestId;
+  if (submit) { submit.disabled = true; submit.textContent = '正在上传原始媒体…'; }
+  let sourceId = '';
+  try {
+    const source = await uploadVoiceAnalysisSource(file);
+    sourceId = source.id;
+    if (submit?.isConnected) submit.textContent = '正在创建本地分析任务…';
+    const speakerCountRaw = String(data.get('speakerCount') || '');
+    const payload = await api(`/api/voice-sources/${encodeURIComponent(source.id)}/analyze`, { method: 'POST', body: {
+      language: String(data.get('language') || 'zh'),
+      speakerCount: speakerCountRaw ? Number(speakerCountRaw) : null,
+      consent: true
+    } });
+    const job = payload.job || payload;
+    sourceId = '';
+    state.voiceAnalysisFile = null;
+    state.voiceAnalysisForm = null;
+    if (state.view === 'voice-analysis' && selectionRequest === state.voiceAnalysisRequestId) {
+      state.voiceAnalysisJobId = job.id;
+      state.voiceAnalysisId = null;
+      state.voiceAnalysis = null;
+      history.pushState(null, '', `#/voice-analysis/${job.id}`);
+    }
+    toast('多人语音分析已提交', '任务将在本机转写、分人并识别语气；可在任务抽屉查看进度。');
+    await trackJob(job);
+  } catch (error) {
+    if (sourceId) discardRemoteVoiceSource(sourceId);
+    if (error.name !== 'AbortError') toast('多人语音分析失败', error.message, 'error');
+  } finally {
+    state.voiceAnalysisSubmitting = false;
+    state.voiceAnalysisUploadController = null;
+    const uploadButton = $('#voice-analysis-form button[type="submit"]');
+    if (uploadButton) { uploadButton.disabled = false; uploadButton.textContent = '开始识别与分人'; }
+    if (state.view === 'voice-analysis') renderView();
+  }
+}
+
+function analysisSegmentElement(segmentId) {
+  return $(`.analysis-segment[data-segment-id="${CSS.escape(segmentId)}"]`);
+}
+
+async function saveAnalysisSegment(segmentId) {
+  if (!state.voiceAnalysisId || !segmentId) return;
+  const row = analysisSegmentElement(segmentId);
+  if (!row) return;
+  const analysisId = state.voiceAnalysisId;
+  const mutationKey = `${analysisId}:${segmentId}`;
+  if (state.voiceAnalysisMutations.has(mutationKey)) return;
+  state.voiceAnalysisMutations.add(mutationKey);
+  captureAnalysisInput(row.querySelector('[data-analysis-text]'));
+  const patch = analysisDraft(analysisId).segments.get(segmentId);
+  const button = row.querySelector('[data-action="save-analysis-segment"]');
+  if (button) { button.disabled = true; button.textContent = '保存中…'; }
+  try {
+    const updated = await api(`/api/voice-analyses/${encodeURIComponent(analysisId)}/segments/${encodeURIComponent(segmentId)}`, { method: 'PATCH', body: patch });
+    if (analysisDraft(analysisId).segments.get(segmentId) === patch) analysisDraft(analysisId).segments.delete(segmentId);
+    rememberVoiceAnalysis(updated.analysis || updated);
+    toast('片段已保存');
+  } catch (error) {
+    toast('保存片段失败', error.message, 'error');
+  } finally {
+    state.voiceAnalysisMutations.delete(mutationKey);
+    if (button?.isConnected) { button.disabled = false; button.textContent = '保存修改'; }
+    if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
+  }
+}
+
+async function addAnalysisSpeaker(form) {
+  const analysisId = state.voiceAnalysisId;
+  if (!analysisId) return;
+  const label = form.elements.label.value.trim();
+  if (!label) return;
+  const mutationKey = `${analysisId}:speaker`;
+  if (state.voiceAnalysisMutations.has(mutationKey)) return;
+  state.voiceAnalysisMutations.add(mutationKey);
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    const result = await api(`/api/voice-analyses/${analysisId}/speakers`, { method: 'POST', body: { label } });
+    rememberVoiceAnalysis(result.analysis);
+    if (analysisDraft(analysisId).addLabel.trim() === label) analysisDraft(analysisId).addLabel = '';
+    toast('对话人已添加', `请在片段的“归属”中选择“${label}”，再保存修改。`);
+  } catch (error) {
+    toast('添加对话人失败', error.message, 'error');
+  } finally {
+    state.voiceAnalysisMutations.delete(mutationKey);
+    if (button.isConnected) button.disabled = false;
+    if (state.view === 'voice-analysis') renderVoiceAnalysisStudio();
+  }
+}
+
+async function exportAnalysisSpeaker(speakerId, group = null, analysis = state.voiceAnalysis) {
+  if (!analysis?.id || !speakerId) return null;
+  const root = group || $(`.speaker-group[data-speaker-id="${CSS.escape(speakerId)}"]`);
+  const name = root?.querySelector('[data-speaker-export-name]')?.value.trim();
+  if (!name) throw new Error('请填写导出音色名称');
+  const button = root?.querySelector('[data-action="export-analysis-speaker"]');
+  if (button) { button.disabled = true; button.textContent = '提交中…'; }
+  try {
+    const payload = await api(`/api/voice-analyses/${encodeURIComponent(analysis.id)}/speakers/${encodeURIComponent(speakerId)}/export`, { method: 'POST', body: {
+      name,
+      tags: ['多人拆分', '自动转写', 'speaker-diarization'],
+      language: analysis.language || 'zh-CN',
+      consent: true,
+      includeOverlap: Boolean(root?.querySelector('[data-speaker-include-overlap]')?.checked)
+    } });
+    const job = payload.job || payload;
+    await trackJob(job);
+    toast('说话人音色导出已提交', `${name} 将从已保留的干净片段生成参考样本。`);
+    return job;
+  } finally {
+    if (button?.isConnected) { button.disabled = false; button.textContent = '导出这个音色'; }
+  }
+}
+
+async function exportSelectedAnalysisSpeakers() {
+  const analysis = state.voiceAnalysis;
+  const groups = $$('.speaker-group').filter((group) => {
+    const selected = group.querySelector('[data-analysis-speaker-select]');
+    return selected?.checked && !selected.disabled;
+  });
+  if (!groups.length) return toast('尚未选择说话人', '请至少勾选一组说话人。', 'warn');
+  let submitted = 0;
+  for (const group of groups) {
+    try {
+      if (await exportAnalysisSpeaker(group.dataset.speakerId, group, analysis)) submitted += 1;
+    } catch (error) {
+      toast('部分说话人未提交', error.message, 'error');
+    }
+  }
+  if (submitted) toast('批量导出已建立', `共提交 ${submitted} 个独立音色任务。`);
+}
+
 document.addEventListener('click', async (event) => {
   const scriptLine = event.target.closest('.script-line[data-line-id]');
   if (scriptLine) selectStudioLine(scriptLine.dataset.lineId);
@@ -3912,6 +4552,79 @@ document.addEventListener('click', async (event) => {
       if (demo) await navigate('studio', demo.id); else showModal(projectModalHtml()); return;
     }
     if (action === 'open-project') { await navigate('studio', target.dataset.projectId); return; }
+    if (action === 'select-voice-design-preset') {
+      const preset = VOICE_DESIGN_PRESETS.find((item) => item.id === target.dataset.presetId);
+      if (!preset) return;
+      state.voiceDesignPreset = preset.id;
+      state.voiceDesignForm = {
+        ...(state.voiceDesignForm || { language: 'zh-CN', previewText: VOICE_DESIGN_PREVIEW_TEXT, tags: '播音腔, 纯合成, Qwen VoiceDesign', consent: false }),
+        name: preset.name,
+        prompt: preset.prompt
+      };
+      const form = $('#voice-design-form');
+      if (form) {
+        form.elements.name.value = preset.name;
+        form.elements.prompt.value = preset.prompt;
+        $$('.design-preset', form).forEach((button) => {
+          const active = button.dataset.presetId === preset.id;
+          button.classList.toggle('active', active);
+          button.setAttribute('aria-pressed', String(active));
+        });
+        form.elements.prompt.focus();
+      }
+      return;
+    }
+    if (action === 'select-voice-design-draft') {
+      const draft = state.voiceDesignDrafts.find((item) => voiceDesignId(item) === target.dataset.designId);
+      if (!draft) return;
+      state.voiceDesignDraft = draft;
+      renderView();
+      return;
+    }
+    if (action === 'play-voice-design-draft') {
+      const designId = target.dataset.designId;
+      const audio = $('#audio-player');
+      audio.src = target.dataset.url;
+      await audio.play();
+      state.voiceDesignAuditionedIds.add(designId);
+      state.loadedAudio = { kind: 'voice-design', id: designId, url: target.dataset.url };
+      $('#transport').hidden = false;
+      $('#transport-title').textContent = target.dataset.name || '设计音色候选';
+      $('#transport-subtitle').textContent = '候选母版 · 尚未自动入库';
+      target.textContent = '▶ 再次试听';
+      const commit = $(`[data-action="commit-voice-design"][data-design-id="${CSS.escape(designId)}"]`);
+      if (commit) commit.disabled = false;
+      const note = $('[data-design-audition-note]');
+      if (note) note.textContent = '已试听，现在可以确认入库。';
+      return;
+    }
+    if (action === 'commit-voice-design') { await commitVoiceDesign(target.dataset.designId); return; }
+    if (action === 'discard-voice-design') { await discardVoiceDesign(target.dataset.designId); return; }
+    if (action === 'new-voice-analysis') {
+      if (state.voiceAnalysisSubmitting) return;
+      if (analysisSessionKey() === 'new') { $('#voice-analysis-drop-zone')?.focus(); return; }
+      resetVoiceAnalysisPage();
+      resetPlayback();
+      history.pushState(null, '', '#/voice-analysis');
+      renderView();
+      requestAnimationFrame(() => $('#voice-analysis-drop-zone')?.focus());
+      return;
+    }
+    if (action === 'select-analysis-session') { await selectVoiceAnalysisSession(target.dataset.sessionId); return; }
+    if (action === 'save-analysis-segment') { await saveAnalysisSegment(target.dataset.segmentId); return; }
+    if (action === 'export-analysis-speaker') { await exportAnalysisSpeaker(target.dataset.speakerId); return; }
+    if (action === 'export-selected-speakers') { await exportSelectedAnalysisSpeakers(); return; }
+    if (action === 'play-analysis-segment') {
+      $('.analysis-source-player')?.pause();
+      const audio = $('#audio-player');
+      audio.src = target.dataset.url;
+      await audio.play();
+      state.loadedAudio = { kind: 'analysis-segment', id: target.dataset.name, url: target.dataset.url };
+      $('#transport').hidden = false;
+      $('#transport-title').textContent = target.dataset.name || '分析片段';
+      $('#transport-subtitle').textContent = '说话人分析样音';
+      return;
+    }
     if (action === 'leave-codex-room') { await leaveCodexStudio(); return; }
     if (action === 'start-codex-login') { await startCodexLogin(); return; }
     if (action === 'cancel-codex-login') { await cancelCodexLogin(); return; }
@@ -4162,11 +4875,15 @@ document.addEventListener('submit', (event) => {
   event.preventDefault();
   if (event.target.id === 'project-form') submitProject(event.target);
   if (event.target.id === 'voice-form') submitVoice(event.target);
+  if (event.target.id === 'voice-design-form') submitVoiceDesign(event.target);
+  if (event.target.id === 'voice-analysis-form') submitVoiceAnalysis(event.target);
+  if (event.target.id === 'analysis-add-speaker-form') addAnalysisSpeaker(event.target);
   if (event.target.id === 'codex-chat-form') submitCodexMessage();
   if (event.target.id === 'bulk-script-form') submitBulkScript();
 });
 
 document.addEventListener('change', async (event) => {
+  captureAnalysisInput(event.target);
   const input = event.target;
   if (input.name === 'script-mode') {
     state.codexMode = CODEX_MODE_LABELS[input.value] ? input.value : 'faithful';
@@ -4268,6 +4985,12 @@ document.addEventListener('change', async (event) => {
     else resetVoiceSource({ discardRemote: true });
     return;
   }
+  if (input.id === 'voice-analysis-file') {
+    state.voiceAnalysisFile = input.files[0] || null;
+    const label = $('#voice-analysis-file-label');
+    if (label) label.textContent = state.voiceAnalysisFile ? `${state.voiceAnalysisFile.name} · ${(state.voiceAnalysisFile.size / 1024 / 1024).toFixed(2)} MB` : '';
+    return;
+  }
   if (input.dataset.lineField) {
     const value = ['intensity', 'pace', 'pauseAfterMs'].includes(input.dataset.lineField) ? Number(input.value) : input.value;
     scheduleLineSave(input.dataset.lineId, { [input.dataset.lineField]: value });
@@ -4290,6 +5013,20 @@ document.addEventListener('change', async (event) => {
 
 document.addEventListener('input', (event) => {
   const input = event.target;
+  captureAnalysisInput(input);
+  if (input.closest?.('#voice-design-form')) {
+    const form = input.closest('#voice-design-form');
+    const data = new FormData(form);
+    state.voiceDesignForm = {
+      name: String(data.get('name') || ''),
+      language: String(data.get('language') || 'zh-CN'),
+      prompt: String(data.get('prompt') || ''),
+      previewText: String(data.get('previewText') || ''),
+      tags: String(data.get('tags') || ''),
+      consent: data.get('consent') === 'on'
+    };
+    return;
+  }
   if (input.id === 'codex-chat-prompt') { state.codexDrafts.set(codexDraftKey(), input.value); return; }
   if (input.id === 'codex-model') { state.codexModel = input.value; return; }
   if (input.dataset.clipBoundary) {
@@ -4329,11 +5066,12 @@ document.addEventListener('click', async (event) => {
 document.addEventListener('click', (event) => {
   const clickedInsideVoiceBindingPicker = event.composedPath().some((node) => node instanceof Element && node.classList?.contains('voice-binding-picker'));
   if (state.voiceBindingPickerRoleId && !clickedInsideVoiceBindingPicker) closeVoiceBindingPicker();
-  const zone = event.target.closest('#book-drop-zone, #voice-drop-zone, #voice-source-drop-zone');
+  const zone = event.target.closest('#book-drop-zone, #voice-drop-zone, #voice-source-drop-zone, #voice-analysis-drop-zone');
   if (!zone || event.target.matches('input')) return;
   if (zone.id === 'book-drop-zone') $('#modal-book-file')?.click();
   else if (zone.id === 'voice-drop-zone') $('#modal-voice-file')?.click();
-  else $('#modal-voice-source-file')?.click();
+  else if (zone.id === 'voice-source-drop-zone') $('#modal-voice-source-file')?.click();
+  else $('#voice-analysis-file')?.click();
 });
 
 document.addEventListener('keydown', (event) => {
@@ -4395,10 +5133,18 @@ for (const type of ['dragleave', 'drop']) document.addEventListener(type, (event
     } else if (zone.id === 'voice-drop-zone') {
       state.voiceFile = file; state.recordingBlob = null; $('#voice-file-label').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
     } else if (zone.id === 'voice-source-drop-zone') loadVoiceSourceFile(file);
+    else if (zone.id === 'voice-analysis-drop-zone') {
+      state.voiceAnalysisFile = file;
+      const label = $('#voice-analysis-file-label');
+      if (label) label.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+    }
   }
 });
 
 const audio = $('#audio-player');
+document.addEventListener('play', (event) => {
+  if (event.target.matches?.('.analysis-source-player')) audio.pause();
+}, true);
 audio.addEventListener('timeupdate', () => {
   const ratio = audio.duration ? audio.currentTime / audio.duration : 0;
   $('#transport-progress').style.width = `${ratio * 100}%`;
@@ -4428,6 +5174,7 @@ audio.addEventListener('error', () => {
 window.addEventListener('hashchange', async () => {
   if ($('#modal-root .codex-login-modal')) closeModal();
   const route = parseRoute();
+  state.voiceAnalysisRequestId += 1;
   if (state.view === 'codex' && route.view !== 'codex') pauseCodexStudio({ invalidateRequest: true });
   if (['studio', 'codex'].includes(route.view) && route.id) {
     await loadProject(route.id).catch(() => {});
@@ -4435,6 +5182,20 @@ window.addEventListener('hashchange', async () => {
       state.selectedChapterId = route.chapterId;
     }
   }
+  if (route.view === 'voice-analysis') {
+    state.view = route.view;
+    if (route.id) {
+      const loaded = await loadVoiceAnalysis(route.id).catch((error) => toast('无法打开分析', error.message, 'error'));
+      if (!loaded) return;
+    }
+    else {
+      state.voiceAnalysisId = null;
+      state.voiceAnalysis = null;
+      state.voiceAnalysisJobId = null;
+    }
+    resetPlayback();
+  }
+  if (route.view === 'voice-design') await loadVoiceDesignDrafts().catch((error) => toast('无法读取音色候选', error.message, 'error'));
   state.view = route.view;
   if (state.view === 'codex') prepareCodexStudioState();
   renderView();
@@ -4471,6 +5232,13 @@ async function boot() {
         }
       } else state.view = 'projects';
     }
+    if (route.view === 'voice-analysis' && route.id) {
+      await loadVoiceAnalysis(route.id).catch(() => {
+        state.voiceAnalysisId = null;
+        state.voiceAnalysis = null;
+      });
+    }
+    if (route.view === 'voice-design') await loadVoiceDesignDrafts().catch(() => null);
     if (state.view === 'codex') prepareCodexStudioState();
     renderView();
     if (state.view === 'codex') {

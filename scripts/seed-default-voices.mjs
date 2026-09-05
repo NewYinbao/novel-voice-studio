@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { concatenateWavs } from '../src/lib/audio.js';
+import { OPEN_SOURCE_VOICE_PRESETS } from './voice-preset-catalog.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDir, '..');
@@ -20,7 +21,7 @@ const baseUrl = option('--base-url', 'http://127.0.0.1:4317').replace(/\/$/, '')
 const requestedProjectId = option('--project-id');
 const shouldRender = args.includes('--render');
 
-const samples = [
+const bindingSamples = [
   {
     key: 'narrator',
     marker: 'AISHELL-3/SSB0241',
@@ -57,6 +58,24 @@ const samples = [
     ]
   }
 ];
+
+const samples = [...bindingSamples, ...OPEN_SOURCE_VOICE_PRESETS];
+const bindingSampleKeys = new Set(bindingSamples.map((sample) => sample.key));
+
+function validateCatalog() {
+  const keys = new Set();
+  const markers = new Set();
+  for (const sample of samples) {
+    if (!sample.key || keys.has(sample.key)) throw new Error(`音色 key 重复或为空：${sample.key || '空'}`);
+    if (!sample.marker || markers.has(sample.marker)) throw new Error(`音色 marker 重复或为空：${sample.marker || '空'}`);
+    const tags = sample.tags?.includes(sample.marker) ? sample.tags : [...(sample.tags || []), sample.marker];
+    if (tags.length > 10) throw new Error(`${sample.name} 的标签超过 10 个，marker 可能被截断`);
+    keys.add(sample.key);
+    markers.add(sample.marker);
+  }
+}
+
+validateCatalog();
 
 async function api(route, options = {}) {
   const response = await fetch(`${baseUrl}${route}`, {
@@ -117,17 +136,23 @@ async function prepareReference(sample) {
 async function ensureVoices(bootstrap) {
   const voiceByKey = {};
   for (const sample of samples) {
-    let voice = bootstrap.voices.find((item) => item.tags?.includes(sample.marker) || item.name === sample.name);
-    if (!voice || voice.status !== 'ready') {
+    let voice = bootstrap.voices.find((item) => (
+      item.tags?.includes(sample.marker) || (bindingSampleKeys.has(sample.key) && item.name === sample.name)
+    ));
+    if (voice && voice.status !== 'ready') {
+      throw new Error(`预置音色“${voice.name}”已存在但未就绪，请在音色库删除该异常项后重试`);
+    }
+    if (!voice) {
       const referencePath = await prepareReference(sample);
       const audio = await fs.readFile(referencePath);
+      const tags = sample.tags?.includes(sample.marker) ? sample.tags : [...(sample.tags || []), sample.marker];
       voice = await api('/api/voices', {
         method: 'POST',
         body: {
           name: sample.name,
           kind: 'open-source',
           language: 'zh-CN',
-          tags: [...sample.tags, sample.marker],
+          tags,
           transcript: sample.transcript,
           consent: true,
           fileName: `${sample.key}.wav`,
@@ -208,11 +233,15 @@ async function renderSmoke(project) {
 }
 
 const bootstrap = await api('/api/bootstrap');
-const projectId = requestedProjectId || bootstrap.projects.find((item) => !item.isDemo)?.id || bootstrap.projects[0]?.id;
-if (!projectId) throw new Error('没有可绑定音色的项目，请先导入小说');
+const projectId = requestedProjectId;
+if (shouldRender && !projectId) throw new Error('`--render` 必须同时提供 `--project-id`');
 const voiceByKey = await ensureVoices(bootstrap);
-let project = await api(`/api/projects/${projectId}`);
-project = await bindProject(project, voiceByKey);
 process.stdout.write(`默认音色来源：AISHELL-3（Apache-2.0）· ${sourcePage}\n`);
-if (shouldRender) await renderSmoke(project);
-process.stdout.write(`完成：已为《${project.title}》导入并绑定 ${samples.length} 个默认测试音色${shouldRender ? '，真实生成与媒体文件校验通过' : ''}。\n`);
+if (projectId) {
+  let project = await api(`/api/projects/${projectId}`);
+  project = await bindProject(project, voiceByKey);
+  if (shouldRender) await renderSmoke(project);
+  process.stdout.write(`完成：已导入 ${samples.length} 个开源测试音色，并为《${project.title}》绑定基础默认音色${shouldRender ? '，真实生成与媒体文件校验通过' : ''}。\n`);
+} else {
+  process.stdout.write(`完成：已导入 ${samples.length} 个开源测试音色（其中 ${OPEN_SOURCE_VOICE_PRESETS.length} 个常用角色预置），未修改任何作品的角色绑定。\n`);
+}

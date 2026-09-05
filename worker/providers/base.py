@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 class TTSProvider(ABC):
@@ -44,4 +45,22 @@ def atomic_audio_target(output_path: str) -> tuple[Path, Path]:
     target = Path(output_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".partial")
+    return target, partial
+
+
+def exclusive_audio_target(output_path: str) -> tuple[Path, Path]:
+    """Reserve a new output path and return a request-unique partial path.
+
+    The empty target is an ownership marker.  Callers must delete it if writing
+    fails.  This deliberately refuses to replace a pre-existing user file.
+    """
+
+    target = Path(output_path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("xb"):
+            pass
+    except FileExistsError as error:
+        raise ValueError("输出文件已存在，拒绝覆盖") from error
+    partial = target.with_name(f".{target.name}.{uuid4().hex}.partial")
     return target, partial

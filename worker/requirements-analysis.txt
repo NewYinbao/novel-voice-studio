@@ -1,0 +1,10 @@
+-r requirements.txt
+
+# Local ASR, VAD, punctuation, speaker diarization and speech emotion analysis.
+funasr==1.4.1
+modelscope==1.39.1
+huggingface-hub>=0.34,<2
+
+# Optional overlap-aware diarization. community-1 also requires accepting its
+# Hugging Face conditions and either HF_TOKEN or NVS_PYANNOTE_MODEL.
+pyannote.audio==4.0.7
